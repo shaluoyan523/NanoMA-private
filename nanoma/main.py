@@ -19,6 +19,10 @@ def cli():
     parser.add_argument("--max-agents", type=int, default=100)
     parser.add_argument("--workspace", default="./workspace")
     parser.add_argument("--log-dir", default="./logs")
+    parser.add_argument("--sandbox-backend", default="codex", choices=["codex", "host"])
+    parser.add_argument("--sandbox-codex-bin", default="codex", help="Codex CLI executable used for the codex sandbox backend")
+    parser.add_argument("--sandbox-network", action="store_true", help="Allow network access inside Codex-sandboxed agent shell commands")
+    parser.add_argument("--no-sandbox", action="store_true", help="Run agent shell commands directly on the host")
     parser.add_argument("-v", "--verbose", action="store_true")
     args = parser.parse_args()
 
@@ -34,6 +38,9 @@ def cli():
         default_model=args.model,
         workspace_root=Path(args.workspace),
         log_dir=Path(args.log_dir),
+        sandbox_backend="host" if args.no_sandbox else args.sandbox_backend,
+        sandbox_codex_bin=args.sandbox_codex_bin,
+        sandbox_network=args.sandbox_network,
     )
 
     def on_event(e):

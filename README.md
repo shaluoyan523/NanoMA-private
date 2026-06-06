@@ -47,14 +47,21 @@ nanoma "Build a linked list in C with tests" --budget 5.0 --max-agents 20
 
 ## Security Notice
 
-**NanoMA has NO sandboxing.** Agents execute shell commands with the same privileges as the host process. This means agents can:
+NanoMA runs agent shell commands through `codex sandbox` by default. At task
+startup it probes that Codex-provided sandbox; if the sandbox command is missing
+or unusable, NanoMA refuses to run agent shell commands unsandboxed.
 
-- Read/write any file accessible to the user
-- Access environment variables (including API keys)
-- Make arbitrary network requests
-- Install packages, spawn processes, etc.
+All agents in one run share the same `workspace/`, so they can coordinate
+through private workspaces and `shared/` while command execution inherits the
+same OS-enforced boundaries that Codex exposes for local commands. Network
+access is disabled inside the sandbox unless `sandbox_network=True` or
+`--sandbox-network` is set.
 
-**Always run NanoMA in a disposable environment** (container, VM, or dedicated machine). Never run on a production system or with credentials you wouldn't give to an untrusted script. Set a tight budget to limit runaway costs.
+The Python host process still holds your LLM API key and performs LLM network
+calls. File tools are limited to `workspace_root`, but `--no-sandbox` or
+`sandbox_backend="host"` restores the old unsafe behavior where agent shell
+commands run directly on the host. For untrusted tasks, still prefer a
+disposable VM/container around NanoMA itself.
 
 ## Agent Primitives
 
@@ -62,17 +69,17 @@ Every agent has access to:
 
 | Primitive | What it does |
 |-----------|-------------|
-| `spawn(task)` | Create a new agent (runs in parallel immediately) |
-| `send(to, message)` | Send a message to any agent |
+| `spawn(task, role, create_type, workflow_prior)` | Create a new agent; peer metadata is only injected when `create_type="peer_agent"` |
+| `send(to, message, message_type, payload)` | Send plain or structured messages, including `stop_request` |
 | `wait(ids, mode)` | Block until agents finish (`mode="all"` or `"any"`) |
-| `query()` | Discover all agents and their status |
-| `kill(id)` | Terminate an agent |
+| `query()` | Discover all agents, their `action_state`/`state_board`, and `public_memory` |
+| `kill(id, emergency=True)` | Emergency-only termination for self/descendants |
 | `transfer(src, to)` | Copy files between workspaces |
-| `set_status("done")` | Finish and report result to parent |
-| `set_status("idle")` | Sleep until messaged |
+| `set_status(action=...)` | Update `action_state`, self-stop, or stop with optional `compact_before_stop` |
 | `set_bio(bio)` | Advertise your role to others |
-| `rebirth(summary)` | Reset context to save memory |
-| `submit(path)` | Mark a file as deliverable |
+| `rebirth(summary)` | Reset context and sync structured memory |
+| `compact(summary)` | Compact live history into public summary/experience cards |
+| `submit(path)` | Mark a file as deliverable and index it in memory |
 | `shell(cmd)` | Execute a shell command |
 | `file_read/write/list` | Filesystem operations |
 | `grep(pattern)` | Search files |
@@ -132,6 +139,9 @@ async def main():
         default_model="deepseek/deepseek-v4-flash",
         workspace_root=Path("./workspace"),
         log_dir=Path("./logs"),
+        sandbox_backend="codex",
+        sandbox_codex_bin="codex",
+        sandbox_network=False,
         # Truncation: set any to 0 for unlimited
         shell_max_output=10000,
         file_read_max_chars=50000,
@@ -172,6 +182,10 @@ RuntimeConfig(
     time_limit=0,             # seconds, 0 = unlimited
     max_turns=200,            # per agent
     default_model="deepseek-v4-flash",
+    # Shell sandbox
+    sandbox_backend="codex",   # codex or host
+    sandbox_codex_bin="codex",
+    sandbox_network=False,
     # Truncation (0 = unlimited for any of these)
     shell_max_output=10000,
     file_read_max_chars=50000,
@@ -196,4 +210,3 @@ If you use NanoMA in your research, please cite:
   url = {https://github.com/volltin/NanoMA}
 }
 ```
-

@@ -17,6 +17,8 @@ from nanoma.llm import (
     LLMResponse, Message, RetryConfig, ToolCall, ToolDef,
     count_message_tokens, estimate_tokens, openai_compatible_call, set_log_dir,
 )
+from nanoma.memory import ActiveTaskCard, ExperienceCard, MemoryBroker
+from nanoma.sandbox import SandboxConfig, SandboxSession
 from nanoma.scheduler import Scheduler
 from nanoma.tools import WORK_TOOLS
 
@@ -52,6 +54,10 @@ class Envelope:
     content: str
     tokens: int
     timestamp: float
+    message_type: str = "text"
+    payload: dict[str, Any] | None = None
+    requires_ack: bool = False
+    urgency: str = "normal"
     priority: int = 0
     mode: Literal["immediate", "steer", "queue"] = "queue"
 
@@ -81,6 +87,7 @@ class Artifact:
 class ToolContext:
     shared_dir: Path
     workspace_root: Path
+    sandbox: SandboxSession | None = None
     shell_max_output: int = 10000
     file_read_max_chars: int = 50000
     file_list_max_entries: int = 500
@@ -103,6 +110,9 @@ class RuntimeConfig:
     log_dir: Path | None = field(default_factory=lambda: Path("./logs"))
     workspace_root: Path = field(default_factory=lambda: Path("./workspace"))
     shared_dir: str = "shared"
+    sandbox_backend: str = "codex"          # codex, host
+    sandbox_codex_bin: str = "codex"
+    sandbox_network: bool = False
     retry: RetryConfig = field(default_factory=RetryConfig)
     # Resource notification thresholds (fraction consumed, e.g. 0.5 = 50%)
     notify_thresholds: list[float] = field(default_factory=lambda: [0.25, 0.50, 0.70, 0.80, 0.90, 0.95])
@@ -126,9 +136,18 @@ class Agent:
 
     # Identity
     bio: str = ""  # mutable self-description, visible to all via query()
+    role: str = ""
+    create_type: str = ""
+    relationship: str = ""
+    created_by: str | None = None
+    group_id: str = ""
+    workflow_prior: str = ""
 
     # State
     status: Literal["running", "idle", "done", "failed"] = "running"
+    action_state: Literal["create", "stop", "read", "message", "work", "compact"] = "create"
+    current_task_tags: list[str] = field(default_factory=list)
+    work_outline: str = ""
     history: list[Message] = field(default_factory=list)
     children: set[str] = field(default_factory=set)
     parent: str | None = None
@@ -156,7 +175,9 @@ class Agent:
     _turns: int = 0
     _last_active: float = field(default_factory=time.time)
     _rebirth_pending: dict | None = field(default=None, repr=False)
+    _compact_pending: dict | None = field(default=None, repr=False)
     _notified_thresholds: set = field(default_factory=set)  # resource thresholds already fired
+    memory: dict[str, Any] = field(default_factory=dict)
 
 
 # ─── Runtime ─────────────────────────────────────────────────────────────────
@@ -184,8 +205,19 @@ class Runtime:
         self.llm_call = llm_call or openai_compatible_call
         self.router = router
         self.scheduler = Scheduler(max_concurrent=self.config.max_concurrent_llm)
+        self.sandbox = SandboxSession(
+            SandboxConfig(
+                backend=self.config.sandbox_backend,
+                codex_bin=self.config.sandbox_codex_bin,
+                network=self.config.sandbox_network,
+            ),
+            self.config.workspace_root,
+        )
+        self._tool_context.sandbox = self.sandbox
         self.on_event = on_event or (lambda e: None)
         self._start_time = time.time()
+        self.memory = MemoryBroker()
+        self.state_board: dict[str, dict[str, Any]] = {}
         self._events: list[dict] = []  # all events for post-hoc analysis
         self._messages_sent: list[tuple[str, str, int]] = []  # (from, to, tokens) for comm graph
         self._emit_lock = threading.Lock()  # protects events.jsonl writes
@@ -204,6 +236,13 @@ class Runtime:
         quota: ResourceQuota | None = None,
         parent: str | None = None,
         depth: int = 0,
+        role: str = "",
+        create_type: str = "",
+        relationship: str = "",
+        created_by: str | None = None,
+        group_id: str = "",
+        workflow_prior: str = "",
+        current_task_tags: list[str] | None = None,
     ) -> Agent:
         agent_id = self._id_gen.next()
         model = model or self.config.default_model
@@ -234,6 +273,13 @@ class Runtime:
         agent = Agent(
             id=agent_id, task=task, model=model, quota=quota,
             parent=parent, depth=depth, workspace=workspace,
+            role=role,
+            create_type=create_type,
+            relationship=relationship,
+            created_by=created_by,
+            group_id=group_id,
+            workflow_prior=workflow_prior,
+            current_task_tags=list(current_task_tags or []),
             history=[{"role": "system", "content": system_prompt}],
         )
 
@@ -250,26 +296,88 @@ class Runtime:
         agent._created_at = time.time()
         if parent and parent in self.agents:
             self.agents[parent].children.add(agent_id)
+        self.memory.init_agent(agent_id, task=task, tags=agent.current_task_tags)
+        agent.memory = {"public_memory": self.memory.serialize(agent_id)}
+        self.state_board_sync(agent_id)
 
         self._emit(agent_id, "agent_new", {
             "task": task, "model": model, "budget": quota.budget if math.isfinite(quota.budget) else None,
             "parent": parent, "depth": depth,
+            "role": role,
+            "create_type": create_type,
+            "relationship": relationship,
+            "created_by": created_by,
+            "group_id": group_id,
+            "workflow_prior": workflow_prior,
         })
         return agent
 
     def start_agent(self, agent: Agent):
         agent._task = asyncio.ensure_future(self._agent_loop(agent))
 
+    def state_board_sync(self, agent_id: str) -> dict[str, Any]:
+        agent = self.agents[agent_id]
+        board = {
+            "action_state": agent.action_state,
+            "status": agent.status,
+            "current_task_tags": list(agent.current_task_tags),
+            "work_outline": agent.work_outline,
+        }
+        self.state_board[agent_id] = board
+        return board
+
+    def state_board_get(self, agent_id: str) -> dict[str, Any]:
+        return self.state_board_sync(agent_id)
+
+    def state_board_list(self) -> dict[str, dict[str, Any]]:
+        for agent_id in list(self.agents):
+            self.state_board_sync(agent_id)
+        return {agent_id: dict(board) for agent_id, board in sorted(self.state_board.items())}
+
+    def state_board_update(
+        self,
+        agent_id: str,
+        *,
+        action_state: str | None = None,
+        current_task_tags: list[str] | None = None,
+        work_outline: str | None = None,
+    ) -> dict[str, Any]:
+        agent = self.agents[agent_id]
+        if action_state is not None:
+            agent.action_state = action_state
+        if current_task_tags is not None:
+            agent.current_task_tags = list(current_task_tags)
+        if work_outline is not None:
+            agent.work_outline = work_outline
+        memory = self.memory.get(agent_id)
+        task_text = memory.active_task.task if memory and memory.active_task else agent.task
+        self.memory.update(
+            agent_id,
+            active_task=ActiveTaskCard(task=task_text, tags=list(agent.current_task_tags), work_outline=agent.work_outline),
+            tags=agent.current_task_tags,
+        )
+        agent.memory = {"public_memory": self.memory.serialize(agent_id)}
+        return self.state_board_sync(agent_id)
+
+
     async def run(self, task: str, model: str | None = None) -> str:
         """Run a single root agent to completion, then shut down all remaining agents."""
-        root = self.create_agent(task, model=model)
-        self.start_agent(root)
-        await root._task
-        # Clean up any still-running children
-        running = [a for a in self.agents.values() if a.status in ("running", "idle") and a.id != root.id]
-        if running:
-            await self.shutdown()
-        return root.result or ""
+        await self.sandbox.start()
+        try:
+            self._emit("system", "sandbox_start", {
+                "backend": self.sandbox.backend,
+                "workspace_root": str(self.config.workspace_root),
+            })
+            root = self.create_agent(task, model=model)
+            self.start_agent(root)
+            await root._task
+            # Clean up any still-running children
+            running = [a for a in self.agents.values() if a.status in ("running", "idle") and a.id != root.id]
+            if running:
+                await self.shutdown()
+            return root.result or ""
+        finally:
+            await self.sandbox.stop()
 
     # ─── Message delivery ────────────────────────────────────────────────
 
@@ -302,6 +410,12 @@ class Runtime:
             while agent.status == "running":
                 agent._turns += 1
                 agent._last_active = time.time()
+
+                if agent._compact_pending:
+                    self._execute_compact(agent)
+
+                if agent._rebirth_pending:
+                    self._execute_rebirth(agent)
 
                 # Turn limits
                 if agent._turns > agent.quota.max_turns:
@@ -437,6 +551,7 @@ class Runtime:
         finally:
             # Only notify parent and emit done event if actually finished (not just idle)
             if agent.status in ("done", "failed"):
+                self.state_board_sync(agent.id)
                 if agent.parent and agent.parent in self.agents:
                     result_preview = (agent.result or "")[:200]
                     death_msg = f"[Agent {agent.id} finished: {agent.status}] {result_preview}"
@@ -534,8 +649,57 @@ class Runtime:
                 break
         msgs.sort(key=lambda m: m.priority, reverse=True)
         for msg in msgs:
-            agent.history.append({"role": "user", "content": f"[Message from {msg.from_id}]: {msg.content}"})
+            header = f"[Message from {msg.from_id} | type={msg.message_type} | urgency={msg.urgency}]"
+            payload = f"\nPayload: {json.dumps(msg.payload, ensure_ascii=False)}" if msg.payload is not None else ""
+            ack = "\nAck requested." if msg.requires_ack else ""
+            agent.history.append({"role": "user", "content": f"{header}: {msg.content}{payload}{ack}"})
         return msgs
+
+    def _execute_compact(self, agent: Agent):
+        params = agent._compact_pending
+        agent._compact_pending = None
+        summary = params["summary"]
+        files = list(params.get("files", []))
+        tags = list(params.get("tags", []))
+        experience = params.get("experience")
+        new_task = params.get("new_task")
+        new_bio = params.get("new_bio")
+        work_outline = params.get("work_outline", agent.work_outline)
+        if new_bio:
+            agent.bio = new_bio
+        if new_task:
+            agent.task = new_task
+        self.state_board_update(
+            agent.id,
+            action_state="compact",
+            current_task_tags=tags or agent.current_task_tags,
+            work_outline=work_outline,
+        )
+        system_msg = agent.history[0] if agent.history else None
+        compact_message = f"[Compact summary]\n\n{summary}"
+        agent.history = ([system_msg] if system_msg else []) + [{"role": "system", "content": compact_message}]
+        agent.context_tokens = count_message_tokens(agent.history)
+        update_kwargs = {
+            "public_summary": summary,
+            "tags": tags or agent.current_task_tags,
+            "add_artifacts": files,
+            "active_task": ActiveTaskCard(task=new_task or agent.task, tags=tags or agent.current_task_tags, work_outline=work_outline),
+        }
+        if experience:
+            update_kwargs["add_experience"] = ExperienceCard(summary=experience, tags=tags or agent.current_task_tags, artifacts=files)
+        self.memory.update(agent.id, **update_kwargs)
+        agent.memory = {"public_memory": self.memory.serialize(agent.id)}
+        if params.get("stop_after"):
+            agent.action_state = "stop"
+            agent.status = "done"
+            agent.result = params.get("stop_result") or agent.result
+            stop_experience = None if experience else ExperienceCard(summary=summary, tags=tags or agent.current_task_tags, artifacts=files)
+            self.memory.update(
+                agent.id,
+                clear_active_task=True,
+                add_experience=stop_experience,
+            )
+        self.state_board_sync(agent.id)
 
     def _execute_rebirth(self, agent: Agent):
         params = agent._rebirth_pending
@@ -544,6 +708,8 @@ class Runtime:
         files = params.get("files", [])
         new_task = params.get("new_task")
         new_bio = params.get("new_bio")
+        tags = list(params.get("tags", []))
+        experience = params.get("experience")
 
         system_msg = agent.history[0] if agent.history else None
         agent.history = []
@@ -555,6 +721,8 @@ class Runtime:
             agent.history.append(system_msg)
         if new_bio:
             agent.bio = new_bio
+        if tags:
+            agent.current_task_tags = tags
 
         file_section = ""
         if files:
@@ -563,6 +731,16 @@ class Runtime:
             f"[Rebirth — context reset]\n\n## Progress\n{summary}{file_section}"
         )})
         agent.context_tokens = count_message_tokens(agent.history)
+        self.memory.update(
+            agent.id,
+            public_summary=summary,
+            active_task=ActiveTaskCard(task=new_task or agent.task, tags=agent.current_task_tags, work_outline=agent.work_outline),
+            tags=tags or agent.current_task_tags,
+            add_artifacts=files,
+            add_experience=ExperienceCard(summary=experience, tags=tags or agent.current_task_tags, artifacts=files) if experience else None,
+        )
+        agent.memory = {"public_memory": self.memory.serialize(agent.id)}
+        self.state_board_sync(agent.id)
 
     async def _execute_tool(self, tc: ToolCall, agent: Agent, tools: dict) -> Any:
         tool_info = tools.get(tc.name)
@@ -621,6 +799,7 @@ Task: {task}
 Workspace: {workspace} (private to you)
 Shared: {shared} (visible to all agents){time_info}
 {context_section}
+Workflow prior guidance: research_loop / critic_review_loop / synthesis_loop are prompt patterns only, not workflow engines.
 """
 
     def _emit(self, agent_id: str, event_type: str, data: dict | None = None):
@@ -649,11 +828,12 @@ Shared: {shared} (visible to all agents){time_info}
     def status(self) -> dict[str, Any]:
         return {
             "agents": {
-                aid: {"status": a.status, "task": a.task[:80], "bio": a.bio, "turns": a._turns}
+                aid: {"status": a.status, "task": a.task[:80], "bio": a.bio, "turns": a._turns, "action_state": a.action_state}
                 for aid, a in self.agents.items()
             },
             "cost": self.ledger.summary(),
             "scheduler": self.scheduler.stats,
+            "state_board": self.state_board_list(),
         }
 
     def stats(self) -> dict[str, Any]:
@@ -802,3 +982,4 @@ Shared: {shared} (visible to all agents){time_info}
         tasks = [a._task for a in self.agents.values() if a._task and not a._task.done()]
         if tasks:
             await asyncio.gather(*tasks, return_exceptions=True)
+        await self.sandbox.stop()

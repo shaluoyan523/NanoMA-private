@@ -17,7 +17,10 @@ async def tool_shell(args: dict[str, Any], workspace: Path, ctx: "ToolContext") 
     timeout = args.get("timeout", 30)
     max_output = ctx.shell_max_output
 
-    result = await shell_exec(cmd, workspace, ctx.shared_dir, timeout)
+    if ctx.sandbox is not None:
+        result = await ctx.sandbox.exec(cmd, workspace, ctx.shared_dir, timeout)
+    else:
+        result = await shell_exec(cmd, workspace, ctx.shared_dir, timeout)
 
     if max_output > 0:
         for key in ("stdout", "stderr"):

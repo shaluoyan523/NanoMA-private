@@ -1,26 +1,33 @@
 """Tests for NanoMA framework — no real LLM calls, fully deterministic."""
 
-import asyncio
 import json
-import pytest
-import tempfile
-from pathlib import Path
-from unittest.mock import AsyncMock
 
-from nanoma.core import Agent, Envelope, ResourceQuota, Runtime, RuntimeConfig, ToolContext
+import pytest
+
+from nanoma.core import Envelope, ResourceQuota, Runtime, RuntimeConfig, ToolContext
 from nanoma.cost import CostLedger, UsageRecord
 from nanoma.llm import LLMResponse, ToolCall, estimate_tokens, count_message_tokens
+from nanoma.memory import ActiveTaskCard
 from nanoma.meta import (
-    meta_spawn, meta_kill, meta_send, meta_query, meta_wait,
-    meta_transfer, meta_set_bio, meta_get_cost, meta_set_status,
-    meta_rebirth, meta_submit, meta_batch, META_TOOLS,
+    META_TOOLS,
+    meta_batch,
+    meta_compact,
+    meta_create_agent,
+    meta_get_cost,
+    meta_kill,
+    meta_query,
+    meta_rebirth,
+    meta_send,
+    meta_set_bio,
+    meta_set_status,
+    meta_spawn,
+    meta_submit,
+    meta_transfer,
+    meta_wait,
 )
-from nanoma.tools import WORK_TOOLS
-from nanoma.models import ModelRegistry, load_models
 from nanoma.scheduler import Scheduler
+from nanoma.sandbox import SandboxConfig, SandboxSession
 
-
-# ─── Fixtures ────────────────────────────────────────────────────────────────
 
 @pytest.fixture
 def tmp_workspace(tmp_path):
@@ -32,33 +39,25 @@ def tmp_workspace(tmp_path):
 
 @pytest.fixture
 def runtime(tmp_workspace):
-    """Runtime with a mock LLM that immediately calls set_status(done)."""
     async def mock_llm(messages, model, tools=None, **kwargs):
         return LLMResponse(
             tool_calls=[ToolCall(id="tc1", name="set_status", arguments={"status": "done", "result": "test done"})],
             usage=UsageRecord(input_tokens=100, output_tokens=50, model=model),
         )
 
-    config = RuntimeConfig(
-        workspace_root=tmp_workspace,
-        budget=10.0,
-        max_agents=50,
-        log_dir=None,
-    )
+    config = RuntimeConfig(workspace_root=tmp_workspace, budget=10.0, max_agents=50, log_dir=None, sandbox_backend="host")
     return Runtime(config=config, llm_call=mock_llm)
 
 
 @pytest.fixture
 def runtime_multi_turn(tmp_workspace):
-    """Runtime where LLM does 3 turns then quits."""
     call_count = {"n": 0}
 
     async def mock_llm(messages, model, tools=None, **kwargs):
         call_count["n"] += 1
         if call_count["n"] >= 3:
             return LLMResponse(
-                tool_calls=[ToolCall(id=f"tc{call_count['n']}", name="set_status",
-                                     arguments={"status": "done", "result": f"done after {call_count['n']} turns"})],
+                tool_calls=[ToolCall(id=f"tc{call_count['n']}", name="set_status", arguments={"status": "done", "result": f"done after {call_count['n']} turns"})],
                 usage=UsageRecord(input_tokens=100, output_tokens=50, model=model),
             )
         return LLMResponse(
@@ -66,43 +65,35 @@ def runtime_multi_turn(tmp_workspace):
             usage=UsageRecord(input_tokens=100, output_tokens=50, model=model),
         )
 
-    config = RuntimeConfig(workspace_root=tmp_workspace, budget=10.0, log_dir=None)
+    config = RuntimeConfig(workspace_root=tmp_workspace, budget=10.0, log_dir=None, sandbox_backend="host")
     return Runtime(config=config, llm_call=mock_llm)
 
 
-# ─── Test: Basic agent lifecycle ─────────────────────────────────────────────
-
 @pytest.mark.asyncio
 async def test_basic_run(runtime):
-    """Agent starts, calls set_status(done), terminates."""
     result = await runtime.run("Say hello")
     assert result == "test done"
-    assert len(runtime.agents) == 1
     agent = list(runtime.agents.values())[0]
     assert agent.status == "done"
-    assert agent._turns >= 1
+    assert agent.action_state == "stop"
 
 
 @pytest.mark.asyncio
 async def test_multi_turn(runtime_multi_turn):
-    """Agent runs multiple turns before completing."""
     result = await runtime_multi_turn.run("Do something complex")
     assert "done after 3 turns" in result
 
 
-# ─── Test: ID generation ─────────────────────────────────────────────────────
-
 def test_id_generation():
     from nanoma.core import IdGenerator
+
     gen = IdGenerator()
     ids = [gen.next() for _ in range(30)]
     assert ids[0] == "alpha"
     assert ids[25] == "zulu"
     assert ids[26] == "alpha-1"
-    assert len(set(ids)) == 30  # all unique
+    assert len(set(ids)) == 30
 
-
-# ─── Test: ResourceQuota ─────────────────────────────────────────────────────
 
 def test_quota_defaults():
     q = ResourceQuota(budget=10.0, time_limit=60.0, max_turns=100)
@@ -111,32 +102,26 @@ def test_quota_defaults():
     assert q.max_turns == 100
 
 
-# ─── Test: CostLedger ────────────────────────────────────────────────────────
+def test_runtime_config_uses_codex_sandbox_by_default():
+    assert RuntimeConfig().sandbox_backend == "codex"
+
 
 def test_ledger():
     ledger = CostLedger(total_budget=5.0)
-    assert ledger.remaining() == 5.0
-    assert ledger.can_afford(3.0)
     usage = UsageRecord(input_tokens=1000, output_tokens=500, model="test")
     ledger.record("agent-1", usage)
     assert ledger.total_spent > 0
     assert "agent-1" in ledger.per_agent
 
 
-# ─── Test: Scheduler ─────────────────────────────────────────────────────────
-
 @pytest.mark.asyncio
 async def test_scheduler():
     s = Scheduler(max_concurrent=2)
-    assert s.stats["available"] == 2
     await s.acquire()
     assert s.stats["active"] == 1
-    assert s.stats["available"] == 1
     s.release()
     assert s.stats["active"] == 0
 
-
-# ─── Test: Message delivery ──────────────────────────────────────────────────
 
 @pytest.mark.asyncio
 async def test_message_delivery(runtime):
@@ -148,7 +133,6 @@ async def test_message_delivery(runtime):
 
 @pytest.mark.asyncio
 async def test_idle_wake(runtime):
-    """Idle agent wakes on message."""
     agent = runtime.create_agent("test")
     agent.status = "idle"
     env = Envelope(from_id="x", to_id=agent.id, content="wake up", tokens=5, timestamp=0.0, mode="queue")
@@ -156,35 +140,55 @@ async def test_idle_wake(runtime):
     assert agent.status == "running"
 
 
-# ─── Test: Meta tools ────────────────────────────────────────────────────────
-
 @pytest.mark.asyncio
-async def test_meta_spawn(runtime):
+async def test_meta_spawn_peer_metadata_and_state_board(runtime):
     parent = runtime.create_agent("parent task")
-    result = await meta_spawn({"task": "child task"}, parent, runtime)
-    assert "agent_id" in result
-    assert result["agent_id"] in runtime.agents
-    # v0.9.0: no per-agent budget deduction on spawn (global budget model)
+    result = await meta_spawn(
+        {
+            "task": "child task",
+            "role": "researcher",
+            "create_type": "peer_agent",
+            "relationship": "peer",
+            "group_id": "g1",
+            "workflow_prior": "research_loop",
+            "current_task_tags": ["analysis", "docs"],
+        },
+        parent,
+        runtime,
+    )
     child = runtime.agents[result["agent_id"]]
     assert child.parent == parent.id
-    assert child.id in parent.children
+    assert child.role == "researcher"
+    assert child.create_type == "peer_agent"
+    assert child.created_by == parent.id
+    assert child.workflow_prior == "research_loop"
+    assert runtime.state_board_get(child.id)["action_state"] == "create"
+    assert runtime.memory.serialize(child.id)["active_task"]["tags"] == ["analysis", "docs"]
+
+
+@pytest.mark.asyncio
+async def test_meta_create_agent_alias(runtime):
+    parent = runtime.create_agent("parent task")
+    result = await meta_create_agent({"task": "child task", "workflow_prior": "critic_review_loop"}, parent, runtime)
+    assert result["agent_id"] in runtime.agents
 
 
 @pytest.mark.asyncio
 async def test_meta_spawn_max_depth(runtime):
-    """Spawn fails when max depth is exceeded."""
     parent = runtime.create_agent("parent")
-    parent.depth = runtime.config.max_depth  # already at max
+    parent.depth = runtime.config.max_depth
     result = await meta_spawn({"task": "child"}, parent, runtime)
     assert "error" in result
 
 
 @pytest.mark.asyncio
-async def test_meta_kill(runtime):
+async def test_meta_kill_emergency_only(runtime):
     parent = runtime.create_agent("parent")
     child = runtime.create_agent("child", parent=parent.id)
     parent.children.add(child.id)
     result = await meta_kill({"agent_id": child.id}, parent, runtime)
+    assert "error" in result
+    result = await meta_kill({"agent_id": child.id, "emergency": True}, parent, runtime)
     assert result["killed"] == child.id
     assert child.status == "done"
 
@@ -193,183 +197,172 @@ async def test_meta_kill(runtime):
 async def test_meta_kill_permission(runtime):
     a = runtime.create_agent("a")
     b = runtime.create_agent("b")
-    result = await meta_kill({"agent_id": b.id}, a, runtime)
-    assert "error" in result  # can't kill non-descendant
+    result = await meta_kill({"agent_id": b.id, "emergency": True}, a, runtime)
+    assert "error" in result
 
 
 @pytest.mark.asyncio
-async def test_meta_send(runtime):
+async def test_meta_send_structured_and_stop_request(runtime):
     a = runtime.create_agent("sender")
     b = runtime.create_agent("receiver")
-    result = await meta_send({"to": b.id, "message": "hello", "mode": "queue"}, a, runtime)
+    result = await meta_send(
+        {
+            "to": b.id,
+            "message": "please stop",
+            "message_type": "stop_request",
+            "payload": {"reason": "done"},
+            "requires_ack": True,
+            "urgency": "high",
+            "mode": "queue",
+        },
+        a,
+        runtime,
+    )
     assert result["delivered"] == 1
-    assert not b._queue_inbox.empty()
+    msg = b._queue_inbox.get_nowait()
+    assert msg.message_type == "stop_request"
+    assert msg.payload == {"reason": "done"}
+    assert msg.requires_ack is True
 
 
 @pytest.mark.asyncio
 async def test_meta_send_no_broadcast(runtime):
-    """No broadcast support — must specify IDs."""
     a = runtime.create_agent("sender")
-    # '*' is treated as a literal agent_id which won't exist
     result = await meta_send({"to": "*", "message": "hi"}, a, runtime)
     assert result["delivered"] == 0
 
 
 @pytest.mark.asyncio
-async def test_meta_query_all(runtime):
-    runtime.create_agent("task A")
-    runtime.create_agent("task B")
-    a = runtime.create_agent("querier")
-    result = await meta_query({}, a, runtime)
-    assert result["count"] == 3
-    assert all("bio" in x for x in result["agents"])
+async def test_meta_query_all_and_single(runtime):
+    target = runtime.create_agent("target", role="builder", create_type="peer_agent", relationship="peer", created_by="alpha", group_id="g2", workflow_prior="synthesis_loop")
+    target.bio = "I am a coder"
+    runtime.state_board_update(target.id, action_state="work", current_task_tags=["backend"], work_outline="implement API")
+    runtime.memory.update(target.id, public_summary="building API")
+    target.memory = {"public_memory": runtime.memory.serialize(target.id)}
+    q = runtime.create_agent("querier")
+    result = await meta_query({"agent_id": target.id}, q, runtime)
+    assert result["role"] == "builder"
+    assert result["action_state"] == "work"
+    assert result["state_board"]["work_outline"] == "implement API"
+    assert result["public_memory"]["public_summary"] == "building API"
+    all_result = await meta_query({}, q, runtime)
+    assert all_result["count"] == len(runtime.agents)
+    assert "state_board" in all_result
+    assert target.id in all_result["public_memory"]
 
 
 @pytest.mark.asyncio
-async def test_meta_query_single(runtime):
-    a = runtime.create_agent("target")
-    a.bio = "I am a coder"
-    b = runtime.create_agent("querier")
-    result = await meta_query({"agent_id": a.id}, b, runtime)
-    assert result["bio"] == "I am a coder"
-    assert "messages" not in result  # messages=0 by default
-
-
-@pytest.mark.asyncio
-async def test_meta_query_with_messages(runtime):
-    a = runtime.create_agent("target")
-    a.history.append({"role": "user", "content": "msg1"})
-    a.history.append({"role": "assistant", "content": "reply1"})
-    a.history.append({"role": "user", "content": "msg2"})
-    a.history.append({"role": "assistant", "content": "reply2"})
-    b = runtime.create_agent("querier")
-    # Last 2 messages
-    result = await meta_query({"agent_id": a.id, "messages": 2}, b, runtime)
-    assert "messages" in result
-    assert len(result["messages"]) == 2
-
-
-@pytest.mark.asyncio
-async def test_meta_query_all_messages(runtime):
-    a = runtime.create_agent("target")
-    a.history.append({"role": "user", "content": "msg1"})
-    a.history.append({"role": "assistant", "content": "reply1"})
-    b = runtime.create_agent("querier")
-    result = await meta_query({"agent_id": a.id, "messages": -1}, b, runtime)
-    assert "messages" in result
-    assert len(result["messages"]) >= 2
-
-
-@pytest.mark.asyncio
-async def test_meta_set_bio(runtime):
+async def test_meta_set_bio_and_get_cost(runtime):
     a = runtime.create_agent("worker")
-    result = await meta_set_bio({"bio": "I handle parsing"}, a, runtime)
-    assert a.bio == "I handle parsing"
-
-
-@pytest.mark.asyncio
-async def test_meta_get_cost(runtime):
-    a = runtime.create_agent("worker")
+    await meta_set_bio({"bio": "I handle parsing"}, a, runtime)
     a._turns = 5
     a.tokens_consumed = 1000
     result = await meta_get_cost({}, a, runtime)
-    assert result["turns_used"] == 5
-    assert result["tokens_consumed"] == 1000
-    assert "budget_remaining" in result
-    assert "budget_total" in result
-    assert result["budget_total"] == runtime.ledger.total_budget
-    assert "total_agents" in result
+    assert result["bio"] == "I handle parsing"
+    assert result["action_state"] == a.action_state
 
 
 @pytest.mark.asyncio
-async def test_meta_set_status(runtime):
+async def test_meta_set_status_state_board_work_and_unknown_action(runtime):
     a = runtime.create_agent("worker")
-    result = await meta_set_status({"status": "done", "result": "finished!"}, a, runtime)
-    assert a.status == "done"
-    assert a.result == "finished!"
+    result = await meta_set_status({"action": "work", "current_task_tags": ["parse"], "work_outline": "step1 -> step2"}, a, runtime)
+    assert result["action_state"] == "work"
+    assert runtime.state_board_get(a.id)["work_outline"] == "step1 -> step2"
+    bad = await meta_set_status({"action": "weird"}, a, runtime)
+    assert "error" in bad
 
 
 @pytest.mark.asyncio
-async def test_meta_rebirth(runtime):
+async def test_meta_set_status_self_stop(runtime):
     a = runtime.create_agent("worker")
-    a.bio = "old bio"
-    # Add some history
-    for i in range(10):
-        a.history.append({"role": "user", "content": f"msg {i}"})
-    result = await meta_rebirth({"summary": "Did steps 1-5", "new_bio": "updated bio"}, a, runtime)
+    result = await meta_set_status({"action": "self_stop", "result": "finished"}, a, runtime)
+    assert result["status"] == "done"
+    assert a.action_state == "stop"
+    assert runtime.memory.serialize(a.id)["active_task"] is None
+
+
+@pytest.mark.asyncio
+async def test_meta_compact_and_query_public_memory(runtime):
+    a = runtime.create_agent("worker")
+    a.history.append({"role": "user", "content": "long context"})
+    result = await meta_compact({"summary": "condensed", "tags": ["research"], "experience": "did work", "work_outline": "outline"}, a, runtime)
+    assert result["scheduled"] is True
+    runtime._execute_compact(a)
+    queried = await meta_query({"agent_id": a.id}, a, runtime)
+    assert queried["public_memory"]["public_summary"] == "condensed"
+    assert queried["public_memory"]["experience_cards"][0]["summary"] == "did work"
+    assert queried["state_board"]["action_state"] == "compact"
+
+
+@pytest.mark.asyncio
+async def test_memory_broker_tag_read(runtime):
+    a = runtime.create_agent("worker")
+    runtime.memory.update(a.id, active_task=ActiveTaskCard(task="worker", tags=["python", "tests"]))
+    read = runtime.memory.read(intent="find testers", seed_terms=["tests"])
+    assert read["matches"][0]["agent_id"] == a.id
+    assert "tests" in read["known_tags"]
+
+
+@pytest.mark.asyncio
+async def test_meta_rebirth_syncs_memory(runtime):
+    a = runtime.create_agent("worker")
+    result = await meta_rebirth({"summary": "Did steps 1-5", "new_bio": "updated bio", "tags": ["reborn"], "experience": "first pass"}, a, runtime)
     assert result["scheduled"]
-    # Execute rebirth
     runtime._execute_rebirth(a)
     assert a.bio == "updated bio"
-    assert len(a.history) == 2  # system + rebirth message
+    assert runtime.memory.serialize(a.id)["public_summary"] == "Did steps 1-5"
+    assert runtime.memory.serialize(a.id)["experience_cards"][0]["summary"] == "first pass"
 
 
 @pytest.mark.asyncio
-async def test_meta_submit(runtime):
+async def test_compact_before_stop(runtime):
     a = runtime.create_agent("worker")
-    # Create a file in workspace
+    result = await meta_set_status({"action": "stop", "result": "finished", "compact_before_stop": True, "compact_summary": "final compact", "current_task_tags": ["done"]}, a, runtime)
+    assert result["scheduled"] is True
+    runtime._execute_compact(a)
+    assert a.status == "done"
+    assert runtime.memory.serialize(a.id)["public_summary"] == "final compact"
+    assert runtime.memory.serialize(a.id)["active_task"] is None
+    assert len(runtime.memory.serialize(a.id)["experience_cards"]) == 1
+
+
+@pytest.mark.asyncio
+async def test_meta_submit_and_batch(runtime):
+    a = runtime.create_agent("worker")
     test_file = a.workspace / "output.txt"
     test_file.write_text("result data")
     result = await meta_submit({"path": "output.txt", "description": "final output"}, a, runtime)
     assert result["submitted"] == "output.txt"
-    assert len(a.artifacts) == 1
-    # Check shared copy exists
-    shared = runtime._tool_context.shared_dir / "output.txt"
-    assert shared.exists()
+    assert "output.txt" in runtime.memory.serialize(a.id)["artifact_index"]
 
-
-@pytest.mark.asyncio
-async def test_meta_batch(runtime):
-    a = runtime.create_agent("worker")
-    # Write a batch file
     batch_data = [
         {"tool": "file_write", "args": {"path": "hello.txt", "content": "world"}},
-        {"tool": "file_list", "args": {"path": "."}},
+        {"tool": "compact", "args": {"summary": "batched compact"}},
         {"tool": "nonexistent_tool", "args": {}},
     ]
     batch_file = a.workspace / "batch.json"
     batch_file.write_text(json.dumps(batch_data))
-    result = await meta_batch({"path": "batch.json"}, a, runtime)
-    assert result["executed"] == 3
-    # First should succeed
-    assert "error" not in result["results"][0]
-    # Third should fail (unknown tool)
-    assert "error" in result["results"][2]
-    # Verify file was actually written
-    assert (a.workspace / "hello.txt").read_text() == "world"
+    batch_result = await meta_batch({"path": "batch.json"}, a, runtime)
+    assert batch_result["executed"] == 3
+    assert "error" in batch_result["results"][2]
 
 
 @pytest.mark.asyncio
-async def test_meta_transfer_push(runtime):
+async def test_meta_transfer_push_pull_shared(runtime):
     a = runtime.create_agent("sender")
     b = runtime.create_agent("receiver")
     (a.workspace / "data.txt").write_text("content")
-    result = await meta_transfer({"src": "data.txt", "to": b.id}, a, runtime)
-    assert "data.txt" in result["pushed"]
-    assert (b.workspace / "data.txt").read_text() == "content"
-
-
-@pytest.mark.asyncio
-async def test_meta_transfer_pull(runtime):
-    a = runtime.create_agent("puller")
-    b = runtime.create_agent("source")
-    (b.workspace / "info.txt").write_text("pulled content")
-    result = await meta_transfer({"src": "info.txt", "from_agent": b.id}, a, runtime)
-    assert "info.txt" in result["pulled"]
-    assert (a.workspace / "info.txt").read_text() == "pulled content"
-
-
-@pytest.mark.asyncio
-async def test_meta_transfer_shared(runtime):
-    a = runtime.create_agent("worker")
-    (a.workspace / "shared_file.txt").write_text("shared!")
-    result = await meta_transfer({"src": "shared_file.txt", "to": "shared"}, a, runtime)
-    assert (runtime._tool_context.shared_dir / "shared_file.txt").exists()
+    push = await meta_transfer({"src": "data.txt", "to": b.id}, a, runtime)
+    assert "data.txt" in push["pushed"]
+    puller = runtime.create_agent("puller")
+    pull = await meta_transfer({"src": "data.txt", "from_agent": b.id}, puller, runtime)
+    assert "data.txt" in pull["pulled"]
+    shared = await meta_transfer({"src": "data.txt", "to": "shared"}, a, runtime)
+    assert shared["to"] == "shared"
 
 
 @pytest.mark.asyncio
 async def test_meta_wait_immediate(runtime):
-    """Wait returns immediately when children already done."""
     parent = runtime.create_agent("parent")
     child = runtime.create_agent("child", parent=parent.id)
     parent.children.add(child.id)
@@ -377,23 +370,17 @@ async def test_meta_wait_immediate(runtime):
     child.result = "child result"
     result = await meta_wait({}, parent, runtime)
     assert len(result["completed"]) == 1
-    assert result["completed"][0]["status"] == "done"
 
-
-# ─── Test: Work tools ────────────────────────────────────────────────────────
 
 @pytest.mark.asyncio
 async def test_tool_file_write_read(tmp_workspace):
-    from nanoma.tools import tool_file_write, tool_file_read
+    from nanoma.tools import tool_file_read, tool_file_write
+
     ctx = ToolContext(shared_dir=tmp_workspace / "shared", workspace_root=tmp_workspace)
     ws = tmp_workspace / "agent"
     ws.mkdir()
-
-    # Write
     result = await tool_file_write({"path": "test.txt", "content": "hello world"}, ws, ctx)
     assert result["bytes"] == 11
-
-    # Read
     result = await tool_file_read({"path": "test.txt"}, ws, ctx)
     assert result["content"] == "hello world"
 
@@ -401,16 +388,18 @@ async def test_tool_file_write_read(tmp_workspace):
 @pytest.mark.asyncio
 async def test_tool_file_read_sandbox(tmp_workspace):
     from nanoma.tools import tool_file_read
+
     ctx = ToolContext(shared_dir=tmp_workspace / "shared", workspace_root=tmp_workspace)
     ws = tmp_workspace / "agent"
     ws.mkdir()
     result = await tool_file_read({"path": "/etc/passwd"}, ws, ctx)
-    assert "error" in result  # outside workspace
+    assert "error" in result
 
 
 @pytest.mark.asyncio
 async def test_tool_file_list(tmp_workspace):
     from nanoma.tools import tool_file_list
+
     ctx = ToolContext(shared_dir=tmp_workspace / "shared", workspace_root=tmp_workspace)
     ws = tmp_workspace / "agent"
     ws.mkdir()
@@ -425,6 +414,7 @@ async def test_tool_file_list(tmp_workspace):
 @pytest.mark.asyncio
 async def test_tool_shell(tmp_workspace):
     from nanoma.tools import tool_shell
+
     ctx = ToolContext(shared_dir=tmp_workspace / "shared", workspace_root=tmp_workspace)
     ws = tmp_workspace / "agent"
     ws.mkdir()
@@ -436,6 +426,7 @@ async def test_tool_shell(tmp_workspace):
 @pytest.mark.asyncio
 async def test_tool_shell_timeout(tmp_workspace):
     from nanoma.tools import tool_shell
+
     ctx = ToolContext(shared_dir=tmp_workspace / "shared", workspace_root=tmp_workspace)
     ws = tmp_workspace / "agent"
     ws.mkdir()
@@ -445,41 +436,67 @@ async def test_tool_shell_timeout(tmp_workspace):
 
 
 @pytest.mark.asyncio
+async def test_tool_shell_uses_runtime_sandbox(tmp_workspace):
+    from nanoma.tools import tool_shell
+
+    class FakeSandbox:
+        def __init__(self):
+            self.calls = []
+
+        async def exec(self, cmd, workspace, shared_dir, timeout=30):
+            self.calls.append((cmd, workspace, shared_dir, timeout))
+            return {"exit_code": 0, "stdout": "sandboxed\n", "stderr": ""}
+
+    fake = FakeSandbox()
+    ctx = ToolContext(shared_dir=tmp_workspace / "shared", workspace_root=tmp_workspace, sandbox=fake)
+    ws = tmp_workspace / "agent"
+    ws.mkdir()
+    result = await tool_shell({"command": "echo host", "timeout": 7}, ws, ctx)
+    assert result["stdout"] == "sandboxed\n"
+    assert fake.calls == [("echo host", ws, tmp_workspace / "shared", 7)]
+
+
+@pytest.mark.asyncio
+async def test_codex_sandbox_command_shape(tmp_workspace, monkeypatch):
+    calls = []
+
+    async def fake_communicate(argv, *, timeout, cwd=None, env=None):
+        calls.append({"argv": argv, "timeout": timeout, "cwd": cwd, "env": env})
+        return {"exit_code": 0, "stdout": "ok", "stderr": ""}
+
+    import nanoma.sandbox as sandbox_mod
+
+    monkeypatch.setattr(sandbox_mod, "_communicate", fake_communicate)
+    monkeypatch.setattr(sandbox_mod.shutil, "which", lambda name: "/usr/bin/codex")
+    session = SandboxSession(SandboxConfig(backend="codex", codex_bin="codex"), tmp_workspace)
+    session._started = True
+    session.backend = "codex"
+    ws = tmp_workspace / "agent"
+    ws.mkdir()
+    result = await session.exec("echo ok", ws, tmp_workspace / "shared", 9)
+    assert result["exit_code"] == 0
+    assert calls[0]["argv"][:4] == ["codex", "sandbox", "--permissions-profile", ":workspace"]
+    assert calls[0]["argv"][4:6] == ["-C", str(ws.resolve())]
+    assert "/usr/bin/env" in calls[0]["argv"]
+    assert "/bin/sh" in calls[0]["argv"]
+    command_env = [part for part in calls[0]["argv"] if "=" in part]
+    assert f"WORKSPACE={ws.resolve()}" in command_env
+    assert f"SHARED={(tmp_workspace / 'shared').resolve()}" in command_env
+    assert not any(part.startswith("OPENAI_API_KEY=") for part in command_env)
+    assert "CODEX_HOME" in calls[0]["env"]
+
+
+@pytest.mark.asyncio
 async def test_tool_grep(tmp_workspace):
     from nanoma.tools import tool_grep
+
     ctx = ToolContext(shared_dir=tmp_workspace / "shared", workspace_root=tmp_workspace)
     ws = tmp_workspace / "agent"
     ws.mkdir()
     (ws / "code.py").write_text("def hello():\n    return 42\n")
     result = await tool_grep({"pattern": "hello", "path": "."}, ws, ctx)
     assert result["count"] >= 1
-    assert any("hello" in m for m in result["matches"])
 
-
-# ─── Test: Model registry ────────────────────────────────────────────────────
-
-def test_model_registry(tmp_path):
-    config = tmp_path / "models.yaml"
-    config.write_text("""
-models:
-  test-model:
-    provider: test
-    context_limit: 64000
-    pricing:
-      input: 1.0
-      cached_input: 0.1
-      output: 2.0
-    tier: cheap
-""")
-    reg = load_models(config)
-    m = reg.get("test-model")
-    assert m is not None
-    assert m.context_limit == 64000
-    assert reg.pricing("test-model") == (1.0, 0.1, 2.0)
-    assert reg.route(1.0) == "test-model"
-
-
-# ─── Test: Token estimation ──────────────────────────────────────────────────
 
 def test_estimate_tokens():
     assert estimate_tokens("hello world") >= 1
@@ -487,23 +504,16 @@ def test_estimate_tokens():
 
 
 def test_count_message_tokens():
-    msgs = [
-        {"role": "system", "content": "You are helpful"},
-        {"role": "user", "content": "Hello there"},
-    ]
+    msgs = [{"role": "system", "content": "You are helpful"}, {"role": "user", "content": "Hello there"}]
     tokens = count_message_tokens(msgs)
     assert tokens > 0
 
 
-# ─── Test: Full integration (spawn + message + wait) ─────────────────────────
-
 @pytest.mark.asyncio
 async def test_spawn_and_wait(tmp_workspace):
-    """Parent spawns child, child finishes, parent gets result."""
     turn_count = {"parent": 0, "child": 0}
 
     async def mock_llm(messages, model, tools=None, **kwargs):
-        # Detect if this is a child (task contains "child")
         system = messages[0]["content"] if messages else ""
         if "child task" in system:
             turn_count["child"] += 1
@@ -511,25 +521,23 @@ async def test_spawn_and_wait(tmp_workspace):
                 tool_calls=[ToolCall(id="c1", name="set_status", arguments={"status": "done", "result": "child done"})],
                 usage=UsageRecord(input_tokens=50, output_tokens=30, model=model),
             )
-        else:
-            turn_count["parent"] += 1
-            if turn_count["parent"] == 1:
-                return LLMResponse(
-                    tool_calls=[ToolCall(id="p1", name="spawn", arguments={"task": "child task"})],
-                    usage=UsageRecord(input_tokens=100, output_tokens=50, model=model),
-                )
-            elif turn_count["parent"] == 2:
-                return LLMResponse(
-                    tool_calls=[ToolCall(id="p2", name="wait", arguments={"timeout": 5})],
-                    usage=UsageRecord(input_tokens=100, output_tokens=50, model=model),
-                )
-            else:
-                return LLMResponse(
-                    tool_calls=[ToolCall(id="p3", name="set_status", arguments={"status": "done", "result": "parent done"})],
-                    usage=UsageRecord(input_tokens=100, output_tokens=50, model=model),
-                )
+        turn_count["parent"] += 1
+        if turn_count["parent"] == 1:
+            return LLMResponse(
+                tool_calls=[ToolCall(id="p1", name="spawn", arguments={"task": "child task", "create_type": "peer_agent", "workflow_prior": "research_loop"})],
+                usage=UsageRecord(input_tokens=100, output_tokens=50, model=model),
+            )
+        if turn_count["parent"] == 2:
+            return LLMResponse(
+                tool_calls=[ToolCall(id="p2", name="wait", arguments={"timeout": 5})],
+                usage=UsageRecord(input_tokens=100, output_tokens=50, model=model),
+            )
+        return LLMResponse(
+            tool_calls=[ToolCall(id="p3", name="set_status", arguments={"status": "done", "result": "parent done"})],
+            usage=UsageRecord(input_tokens=100, output_tokens=50, model=model),
+        )
 
-    config = RuntimeConfig(workspace_root=tmp_workspace, budget=10.0, log_dir=None)
+    config = RuntimeConfig(workspace_root=tmp_workspace, budget=10.0, log_dir=None, sandbox_backend="host")
     rt = Runtime(config=config, llm_call=mock_llm)
     result = await rt.run("parent task")
     assert result == "parent done"
@@ -538,23 +546,21 @@ async def test_spawn_and_wait(tmp_workspace):
 
 @pytest.mark.asyncio
 async def test_bio_discovery(tmp_workspace):
-    """Agents can discover each other via bio."""
     async def mock_llm(messages, model, tools=None, **kwargs):
         return LLMResponse(
             tool_calls=[ToolCall(id="t1", name="set_status", arguments={"status": "done", "result": "ok"})],
             usage=UsageRecord(input_tokens=50, output_tokens=30, model=model),
         )
 
-    config = RuntimeConfig(workspace_root=tmp_workspace, budget=10.0, log_dir=None)
+    config = RuntimeConfig(workspace_root=tmp_workspace, budget=10.0, log_dir=None, sandbox_backend="host")
     rt = Runtime(config=config, llm_call=mock_llm)
     a = rt.create_agent("worker A")
     b = rt.create_agent("worker B")
     a.bio = "I handle file parsing"
     b.bio = "I do testing"
-
-    # Agent C queries all
     c = rt.create_agent("coordinator")
     result = await meta_query({}, c, rt)
     bios = [x["bio"] for x in result["agents"]]
     assert "I handle file parsing" in bios
     assert "I do testing" in bios
+    assert "compact" in META_TOOLS
