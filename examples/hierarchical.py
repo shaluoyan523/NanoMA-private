@@ -16,7 +16,10 @@ from pathlib import Path
 import shutil
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
+from nanoma.env import load_dotenv
 from nanoma.core import Runtime, RuntimeConfig
+
+load_dotenv()
 
 TASK = """You are the TOP-LEVEL ARCHITECT. Build a Shopping Mall E-Commerce app.
 
@@ -74,7 +77,7 @@ async def main():
         max_turns=30,
         max_concurrent_llm=8,
         time_limit=180,
-        default_model=os.environ.get("NANOMA_MODEL", "deepseek/deepseek-v4-flash"),
+        default_model=os.environ.get("NANOMA_MODEL", "deepseek-v4-flash"),
         workspace_root=workspace,
         log_dir=logs,
     )

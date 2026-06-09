@@ -165,8 +165,8 @@ def _agent_env(workspace: Path, shared_dir: Path, *, inherit_host: bool) -> dict
     base.update({
         "HOME": "/tmp",
         "PATH": os.environ.get("PATH", "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"),
-        "WORKSPACE": str(workspace),
-        "SHARED": str(shared_dir),
+        "WORKSPACE": str(workspace.resolve()),
+        "SHARED": str(shared_dir.resolve()),
     })
     return base
 

@@ -2,7 +2,7 @@
 Example: Run any preset pattern with a task.
 
 Usage:
-    python examples/run_preset.py <preset_file> "<task>" [--budget 2.0] [--model deepseek/deepseek-v4-flash]
+    python examples/run_preset.py <preset_file> "<task>" [--budget 2.0] [--model deepseek-v4-flash]
     python examples/run_preset.py presets/06_debate.md "Is TDD worth the overhead?"
     python examples/run_preset.py presets/13_mixture_of_agents.md "Best database for time-series data?"
 """
@@ -14,7 +14,10 @@ import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
+from nanoma.env import load_dotenv
 from nanoma.core import Runtime, RuntimeConfig
+
+load_dotenv()
 
 
 def parse_args():
@@ -23,7 +26,7 @@ def parse_args():
     p.add_argument("preset", help="Path to preset .md file")
     p.add_argument("task", help="Task to inject into {task} placeholder")
     p.add_argument("--budget", type=float, default=2.0)
-    p.add_argument("--model", default="deepseek/deepseek-v4-flash")
+    p.add_argument("--model", default=os.environ.get("NANOMA_MODEL", "deepseek-v4-flash"))
     p.add_argument("--max-agents", type=int, default=20)
     p.add_argument("--time-limit", type=int, default=180)
     p.add_argument("--viewer-port", type=int, default=8900)

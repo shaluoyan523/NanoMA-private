@@ -14,7 +14,7 @@ if (!window.location.pathname.endsWith('/')) {
   --bg-0: #0a0e14; --bg-1: #0f1419; --bg-2: #1a1f26; --bg-3: #242b33;
   --border: #2d353e; --text: #bfc7d5; --text-dim: #6e7681; --text-bright: #f0f6fc;
   --blue: #58a6ff; --green: #3fb950; --yellow: #d29922; --red: #f85149;
-  --purple: #bc8cff; --pink: #f778ba; --cyan: #79c0ff; --orange: #d18616;
+  --purple: #bc8cff; --pink: #f778ba; --cyan: #79c0ff; --teal: #56d4dd; --orange: #d18616;
 }
 * { box-sizing: border-box; margin: 0; padding: 0; }
 body { font-family: 'JetBrains Mono','SF Mono','Fira Code',monospace; background: var(--bg-0); color: var(--text); font-size: 12px; line-height: 1.5; overflow: hidden; height: 100vh; }
@@ -72,6 +72,7 @@ body { font-family: 'JetBrains Mono','SF Mono','Fira Code',monospace; background
 .ev-llm_done { border-left-color: var(--green); } .ev-llm_done .et { background: #23883530; color: var(--green); }
 .ev-tool_call { border-left-color: var(--yellow); } .ev-tool_call .et { background: #9e6a0330; color: var(--yellow); }
 .ev-spawn { border-left-color: var(--purple); background: #8957e508; } .ev-spawn .et { background: #8957e530; color: var(--purple); }
+.ev-query { border-left-color: var(--teal); background: #56d4dd08; } .ev-query .et { background: #56d4dd30; color: var(--teal); }
 .ev-send { border-left-color: var(--pink); border-left-width: 4px; background: #f778ba08; } .ev-send .et { background: #f778ba30; color: var(--pink); }
 .ev-interrupt { border-left-color: var(--orange); border-left-width: 4px; background: #d1861608; } .ev-interrupt .et { background: #d1861630; color: var(--orange); }
 .ev-kill { border-left-color: var(--red); } .ev-kill .et { background: #f8514930; color: var(--red); }
@@ -138,6 +139,8 @@ body { font-family: 'JetBrains Mono','SF Mono','Fira Code',monospace; background
     <span class="pill">Cache: <b id="s-cache">0%</b></span>
     <span class="pill">Cost: <b id="s-cost">$0</b></span>
     <span class="pill">Wall: <b id="s-wall">0s</b></span>
+    <span class="pill">Live: <b id="s-live">starting</b></span>
+    <span class="pill">Log: <b id="s-log">?</b></span>
   </div>
 </div>
 <div class="layout">
@@ -149,6 +152,7 @@ body { font-family: 'JetBrains Mono','SF Mono','Fira Code',monospace; background
     <button class="btn" data-f="llm_done" onclick="filt(this)">LLM</button>
     <button class="btn" data-f="tool_call" onclick="filt(this)">Tools</button>
     <button class="btn" data-f="spawn,agent_new" onclick="filt(this)">Spawn</button>
+    <button class="btn" data-f="query" onclick="filt(this)">Query</button>
     <button class="btn" data-f="send,interrupt" onclick="filt(this)">Msgs</button>
     <button class="btn" data-f="done,failed" onclick="filt(this)">End</button>
     <select id="af" onchange="filterAgent=this.value;render()"><option value="">All agents</option></select>
@@ -165,6 +169,8 @@ body { font-family: 'JetBrains Mono','SF Mono','Fira Code',monospace; background
 let events=[],agents={},agOrder=[],lastLen=0,filterType='all',filterAgent='';
 let totTok=0,totCached=0,totCost=0,totLLM=0,llmN=0,wallT=0,startTs=0;
 let llmLogs=[],activeEvIdx=-1;
+let eventStream=null,pollTimer=null,lastEventAt=0;
+let eventGeneration=null,metaTimer=null;
 
 function $(id){return document.getElementById(id)}
 function esc(s){return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;')}
@@ -211,6 +217,12 @@ function fmtDt(ev){
     case 'llm_done': return `tok=<b>${d.tokens}</b> cache=<b>${d.cached||0}</b> $<b>${(d.cost||0).toFixed(5)}</b> <b>${(d.elapsed_ms||0).toFixed(0)}ms</b>`;
     case 'tool_call': return `<b>${d.tool}</b>(${esc(Object.values(d.args||{}).join(', ').slice(0,60))}) ${(d.elapsed_ms||0).toFixed(0)}ms`;
     case 'spawn': return `&#8594; <b>${d.child}</b> "${esc((d.task||'').slice(0,50))}"`;
+    case 'query': {
+      const targets=d.target?d.target:`${d.result_count||0} agents`;
+      const tags=(d.tags||[]).join(',');
+      const filt=d.filter&&Object.keys(d.filter).length?JSON.stringify(d.filter):'';
+      return `&#128269; <b>${esc(targets)}</b>${tags?` tags=<b>${esc(tags)}</b>`:''}${filt?` filter=<b>${esc(filt.slice(0,80))}</b>`:''}`;
+    }
     case 'send': {
       const msg=(d.message||'').slice(0,50);
       const from=d.from||ev.agent||'?';
@@ -255,6 +267,25 @@ function updateStats(){
   $('s-wall').textContent=wallT.toFixed(1)+'s';
 }
 
+function resetTrace(reason){
+  events=[];agents={};agOrder=[];lastLen=0;filterAgent='';
+  totTok=0;totCached=0;totCost=0;totLLM=0;llmN=0;wallT=0;startTs=0;
+  llmLogs=[];activeEvIdx=-1;commMapVersion++;
+  if(commSim){commSim.stop();commSim=null;}
+  const container=document.getElementById('commContainer');
+  if(container){container.dataset.nodeCount='0';container.dataset.mapVersion='0';container.innerHTML='';}
+  closeDP();
+  renderAgents();render();updateStats();updateCommMapIfOpen();
+  setLiveStatus(reason||'reset','var(--orange)');
+}
+
+function setLiveStatus(text,color){
+  const el=$('s-live');
+  if(!el)return;
+  el.textContent=text;
+  el.style.color=color||'var(--text-bright)';
+}
+
 function processEvent(ev){
   if(ev.type==='start'){startTs=ev.ts;return}
   events.push(ev);
@@ -282,6 +313,19 @@ async function showDetail(idx){
     const log=await findLLMLog(ev);
     if(log) renderLLMDetail(log);
     else dp.innerHTML=`<div class="dp-hdr"><h2>LLM Call</h2><span class="dp-close" onclick="closeDP()">&#x2715;</span></div><div class="dp-section"><p>Log file not found. Data from event:</p><pre>${esc(JSON.stringify(ev.data,null,2))}</pre></div>`;
+  } else if(ev.type==='query'){
+    const d=ev.data;
+    let h=`<div class="dp-hdr"><h2>&#128269; Query</h2><span class="dp-close" onclick="closeDP()">&#x2715;</span></div>`;
+    h+=`<div class="dp-section"><h3>Query</h3><div class="dp-kv">
+      <span class="k">from</span><span class="v">${esc(ev.agent)}</span>
+      <span class="k">scope</span><span class="v">${esc(d.scope||'')}</span>
+      <span class="k">target</span><span class="v">${esc(d.target||'')}</span>
+      <span class="k">result_count</span><span class="v">${d.result_count??0}</span>
+      <span class="k">memory_intent</span><span class="v">${esc(d.memory_intent||'')}</span>
+    </div></div>`;
+    h+=`<div class="dp-section"><h3>Filters</h3><pre style="white-space:pre-wrap;color:var(--text)">${esc(JSON.stringify({filter:d.filter||{},tags:d.tags||[]},null,2))}</pre></div>`;
+    h+=`<div class="dp-section"><h3>Targets</h3><pre style="white-space:pre-wrap;color:var(--teal);max-height:400px;overflow:auto">${esc(JSON.stringify(d.targets||[],null,2))}</pre></div>`;
+    dp.innerHTML=h;
   } else if(ev.type==='send'){
     const d=ev.data;
     const args=d.args||{};
@@ -432,23 +476,90 @@ function renderLLMDetail(log){
 
 async function poll(){
   try{
-    const r=await fetch('./api/events?offset='+lastLen);
+    const gen=eventGeneration===null?'':'&generation='+eventGeneration;
+    const r=await fetch('./api/events?offset='+lastLen+gen+'&_='+Date.now());
     if(!r.ok)return;
     const d=await r.json();
-    if(d.events&&d.events.length>0){
-      for(const ev of d.events)processEvent(ev);
-      lastLen=d.total;
-      renderAgents();render();updateStats();updateCommMapIfOpen();
+    handleEventBatch(d,'poll');
+  }catch(e){console.error(e)}
+}
+
+function handleEventBatch(d,source){
+  const generationChanged=typeof d.generation==='number' && eventGeneration!==null && d.generation!==eventGeneration;
+  if(d.reset || generationChanged){
+    resetTrace('log reset');
+    if(generationChanged && !d.reset){
+      eventGeneration=d.generation;
+      if(eventStream){eventStream.close();eventStream=null;}
+      setTimeout(()=>{poll();startEventStream();},0);
+      return;
+    }
+  }
+  if(typeof d.generation==='number') eventGeneration=d.generation;
+  const batch=d.events||[];
+  if(batch.length>0){
+    for(const ev of batch)processEvent(ev);
+    lastEventAt=Date.now();
+    renderAgents();render();updateStats();updateCommMapIfOpen();
+  }
+  if(typeof d.offset==='number') lastLen=Math.max(lastLen,d.offset);
+  else if(typeof d.total==='number') lastLen=Math.max(lastLen,d.total);
+  else lastLen+=batch.length;
+  if(source==='sse') setLiveStatus(`live ${lastLen}`,'var(--green)');
+  else if(source==='poll') setLiveStatus(`poll ${lastLen}`,'var(--yellow)');
+}
+
+async function loadMeta(){
+  try{
+    const r=await fetch('./api/meta?_='+Date.now());
+    if(!r.ok)return;
+    const d=await r.json();
+    const logEl=$('s-log');
+    if(logEl) logEl.textContent=(d.log_dir||'?').split('/').filter(Boolean).slice(-1)[0]||d.log_dir||'?';
+    if(typeof d.generation==='number'){
+      if(eventGeneration!==null && d.generation!==eventGeneration){
+        resetTrace('log reset');
+        if(eventStream){eventStream.close();eventStream=null;}
+        startEventStream();
+      }
+      eventGeneration=d.generation;
     }
   }catch(e){console.error(e)}
 }
 
+function startPolling(){
+  if(pollTimer)return;
+  setLiveStatus('polling','var(--yellow)');
+  pollTimer=setInterval(poll,800);
+  poll();
+}
+
+function startEventStream(){
+  if(!window.EventSource){startPolling();return;}
+  setLiveStatus('connecting','var(--yellow)');
+  const gen=eventGeneration===null?'':'&generation='+eventGeneration;
+  eventStream=new EventSource('./api/stream?offset='+lastLen+gen);
+  eventStream.onopen=()=>setLiveStatus(`live ${lastLen}`,'var(--green)');
+  eventStream.onmessage=(msg)=>{
+    try{handleEventBatch(JSON.parse(msg.data),'sse');}
+    catch(e){console.error('bad SSE event',e);}
+  };
+  eventStream.onerror=()=>{
+    setLiveStatus('reconnecting','var(--orange)');
+    setTimeout(()=>{
+      if(eventStream&&eventStream.readyState===EventSource.CLOSED){
+        startPolling();
+      }
+    },3000);
+  };
+}
+
 // === Data Loading Strategy ===
-// Use polling only. Simple, reliable, no SSE edge cases.
-// Poll every 800ms — fast enough for real-time feel, no dedup issues.
+// Prefer SSE for real-time updates; fall back to 800ms polling if unavailable.
 // On first load, offset=0 fetches ALL historical events.
-setInterval(poll, 800);
-poll(); // immediate first fetch
+loadMeta();
+metaTimer=setInterval(loadMeta,2000);
+startEventStream();
 
 // ─── Communication Map (D3.js force graph) ──────────────────────────
 let commInterval=null;
@@ -456,7 +567,7 @@ let commMapVersion=0; // bumped on every event batch to detect changes
 function showCommMap(){
   document.getElementById('commOverlay').classList.add('show');
   renderCommMapD3();
-  // Auto-refresh every 2s
+  // Safety refresh in case the browser throttles stream callbacks while hidden.
   commInterval=setInterval(renderCommMapD3,2000);
 }
 function hideCommMap(){
@@ -476,7 +587,8 @@ function renderCommMapD3(){
   const rect=container.getBoundingClientRect();
   const W=rect.width||900, H=rect.height||600;
 
-  // Build graph data from events
+  // Build graph data from events. Send edges and query edges are distinct:
+  // send = direct communication, query = observed state/memory lookup.
   const edgeMap={};
   const nodeSet=new Set();
   for(const ev of events){
@@ -485,10 +597,22 @@ function renderCommMapD3(){
       const to=ev.data.to||'';
       if(!from||!to)continue;
       nodeSet.add(from); nodeSet.add(to);
-      const key=from+'→'+to;
-      if(!edgeMap[key])edgeMap[key]={source:from,target:to,count:0,tokens:0};
+      const key='send:'+from+'→'+to;
+      if(!edgeMap[key])edgeMap[key]={source:from,target:to,count:0,tokens:0,kind:'send'};
       edgeMap[key].count++;
       edgeMap[key].tokens+=(ev.data.tokens||0);
+    }
+    if(ev.type==='query'){
+      const from=ev.agent;
+      const targets=ev.data.target?[ev.data.target]:(ev.data.targets||[]);
+      nodeSet.add(from);
+      for(const to of targets){
+        if(!to||to===from)continue;
+        nodeSet.add(to);
+        const key='query:'+from+'→'+to;
+        if(!edgeMap[key])edgeMap[key]={source:from,target:to,count:0,tokens:0,kind:'query'};
+        edgeMap[key].count++;
+      }
     }
     if(ev.type==='agent_new') nodeSet.add(ev.agent);
   }
@@ -516,11 +640,15 @@ function renderCommMapD3(){
   // Stats
   const totalMsgs=allLinks.reduce((s,l)=>s+l.count,0);
   const totalTok=allLinks.reduce((s,l)=>s+l.tokens,0);
-  const sysMsgCount=allLinks.filter(l=>l.source==='system'||l.target==='system').reduce((s,l)=>s+l.count,0);
+  const sysMsgCount=allLinks.filter(l=>l.kind==='send'&&(l.source==='system'||l.target==='system')).reduce((s,l)=>s+l.count,0);
+  const sendEdgeCount=links.filter(l=>l.kind==='send').length;
+  const queryEdgeCount=links.filter(l=>l.kind==='query').length;
+  const queryCount=allLinks.filter(l=>l.kind==='query').reduce((s,l)=>s+l.count,0);
   document.getElementById('commStats').innerHTML=`
     <span>🤖 Agents: <b>${nodes.length}</b></span>
-    <span>🔗 Edges: <b>${links.length}</b> (peer-to-peer)</span>
-    <span>💬 Messages: <b>${totalMsgs}</b> (sys: ${sysMsgCount})</span>
+    <span>🔗 Edges: <b>${links.length}</b> (send: ${sendEdgeCount}, query: ${queryEdgeCount})</span>
+    <span>💬 Sends: <b>${totalMsgs-queryCount}</b> (sys: ${sysMsgCount})</span>
+    <span>🔎 Queries: <b>${queryCount}</b></span>
     <span>📊 Tokens: <b>${totalTok.toLocaleString()}</b></span>
     <span>📐 Density: <b>${(links.length/(nodes.length*(nodes.length-1)||1)*100).toFixed(1)}%</b></span>
   `;
@@ -552,6 +680,9 @@ function renderCommMapD3(){
   defs.append('marker').attr('id','arr-sys').attr('viewBox','0 -5 10 10')
     .attr('refX',30).attr('refY',0).attr('markerWidth',5).attr('markerHeight',5).attr('orient','auto')
     .append('path').attr('d','M0,-5L10,0L0,5').attr('fill','#f8514980');
+  defs.append('marker').attr('id','arr-query').attr('viewBox','0 -5 10 10')
+    .attr('refX',30).attr('refY',0).attr('markerWidth',5).attr('markerHeight',5).attr('orient','auto')
+    .append('path').attr('d','M0,-5L10,0L0,5').attr('fill','#56d4dd');
 
   const maxCount=Math.max(...links.map(l=>l.count),1);
   const nodeRadius=Math.max(16, Math.min(28, 300/nodes.length));
@@ -572,10 +703,11 @@ function renderCommMapD3(){
 
   // Edges
   const link=gRoot.append('g').attr('class','links').selectAll('line').data(links).enter().append('line')
-    .attr('stroke',d=>{const s=typeof d.source==='object'?d.source.id:d.source;return s==='system'?'#f8514960':'#bc8cff';})
-    .attr('stroke-width',d=>Math.max(1,(d.count/maxCount)*6))
+    .attr('stroke',d=>d.kind==='query'?'#56d4dd':((typeof d.source==='object'?d.source.id:d.source)==='system'?'#f8514960':'#bc8cff'))
+    .attr('stroke-width',d=>Math.max(1,(d.count/maxCount)*(d.kind==='query'?4:6)))
+    .attr('stroke-dasharray',d=>d.kind==='query'?'4 3':'')
     .attr('opacity',d=>0.3+0.6*(d.count/maxCount))
-    .attr('marker-end',d=>{const s=typeof d.source==='object'?d.source.id:d.source;return s==='system'?'url(#arr-sys)':'url(#arr-peer)';});
+    .attr('marker-end',d=>d.kind==='query'?'url(#arr-query)':(((typeof d.source==='object'?d.source.id:d.source)==='system')?'url(#arr-sys)':'url(#arr-peer)'));
 
   // Edge labels — prominent with background
   const linkLabel=gRoot.append('g').selectAll('g').data(links.filter(l=>l.count>0)).enter().append('g');
@@ -585,7 +717,7 @@ function renderCommMapD3(){
     .attr('height',14).attr('x',d=>-(d.count>1?`${d.count}×${d.tokens}t`:`${d.tokens}t`).length*3-4).attr('y',-10);
   linkLabel.append('text')
     .attr('font-size',9).attr('fill','#c9d1d9').attr('text-anchor','middle').attr('dy',1)
-    .text(d=>d.count>1?`${d.count}× ${d.tokens}t`:`${d.tokens}t`);
+    .text(d=>d.kind==='query'?(d.count>1?`q×${d.count}`:'q'):(d.count>1?`${d.count}× ${d.tokens}t`:`${d.tokens}t`));
 
   // Nodes
   const colors=['#58a6ff','#3fb950','#d29922','#bc8cff','#f778ba','#79c0ff','#d18616','#a5d6ff','#7ee787','#ffa657'];
@@ -623,12 +755,17 @@ function renderCommMapD3(){
     .text(d=>`⚡${d.sysMsg.recv}`);
 
   // Message count badges on nodes
-  const msgSent={}, msgRecv={};
+  const msgSent={}, msgRecv={}, queryOut={}, queryIn={};
   for(const l of links){
     const s=typeof l.source==='object'?l.source.id:l.source;
     const t=typeof l.target==='object'?l.target.id:l.target;
-    msgSent[s]=(msgSent[s]||0)+l.count;
-    msgRecv[t]=(msgRecv[t]||0)+l.count;
+    if(l.kind==='query'){
+      queryOut[s]=(queryOut[s]||0)+l.count;
+      queryIn[t]=(queryIn[t]||0)+l.count;
+    }else{
+      msgSent[s]=(msgSent[s]||0)+l.count;
+      msgRecv[t]=(msgRecv[t]||0)+l.count;
+    }
   }
   // Sent badge (top-left, purple)
   node.filter(d=>(msgSent[d.id]||0)>0).append('text')
@@ -640,6 +777,11 @@ function renderCommMapD3(){
     .attr('x',nodeRadius+2).attr('y',-nodeRadius+2)
     .attr('font-size',8).attr('fill','#79c0ff')
     .text(d=>`↓${msgRecv[d.id]||0}`);
+  // Query badges (bottom: out/in)
+  node.filter(d=>(queryOut[d.id]||0)>0 || (queryIn[d.id]||0)>0).append('text')
+    .attr('x',0).attr('y',nodeRadius+18)
+    .attr('font-size',8).attr('fill','#56d4dd').attr('text-anchor','middle')
+    .text(d=>`q ${queryOut[d.id]||0}/${queryIn[d.id]||0}`);
 
   commSim.on('tick',()=>{
     link.attr('x1',d=>d.source.x).attr('y1',d=>d.source.y).attr('x2',d=>d.target.x).attr('y2',d=>d.target.y);
@@ -651,9 +793,9 @@ function renderCommMapD3(){
 <script src="https://d3js.org/d3.v7.min.js"></script>
 <div class="comm-overlay" id="commOverlay">
   <span class="close-btn" onclick="hideCommMap()">&#x2715;</span>
-  <h2>&#9993; Communication Map <span style="font-size:11px;color:var(--text-dim);font-weight:normal">(auto-refreshes every 3s)</span></h2>
+  <h2>&#9993; Communication Map <span style="font-size:11px;color:var(--text-dim);font-weight:normal">(live: SSE updates, 2s safety refresh)</span></h2>
   <div id="commContainer"></div>
-  <div class="legend">🖱️ Drag nodes to rearrange · 🟣 Purple arrows = agent→agent · 🔴 Red arrows = system→agent · Thickness = frequency · Hover for details</div>
+  <div class="legend">🖱️ Drag nodes to rearrange · 🟣 Purple arrows = send · 🔎 Cyan dashed arrows = query/observe · 🔴 Red arrows = system→agent · Thickness = frequency · Hover for details</div>
   <div class="stats-row" id="commStats"></div>
 </div>
 </body>

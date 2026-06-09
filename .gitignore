@@ -30,8 +30,13 @@ coverage.xml
 
 # NanoMA runtime output
 logs/
+logs-*/
 workspace/
+workspace-*/
 shared/
+alpha/
+--help/
+.zgent/
 
 # OS and editor noise
 .DS_Store

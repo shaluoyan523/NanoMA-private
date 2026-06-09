@@ -6,14 +6,18 @@ import argparse
 import asyncio
 import json
 import logging
+import os
 import sys
 from pathlib import Path
 
 
 def cli():
+    from nanoma.env import load_dotenv
+
+    load_dotenv()
     parser = argparse.ArgumentParser(prog="nanoma", description="NanoMA multi-agent harness")
     parser.add_argument("task", help="Task for the root agent")
-    parser.add_argument("--model", default="deepseek-v4-flash")
+    parser.add_argument("--model", default=os.environ.get("NANOMA_MODEL", "deepseek-v4-flash"))
     parser.add_argument("--budget", type=float, default=10.0)
     parser.add_argument("--time-limit", type=float, default=0)
     parser.add_argument("--max-agents", type=int, default=100)
@@ -23,6 +27,8 @@ def cli():
     parser.add_argument("--sandbox-codex-bin", default="codex", help="Codex CLI executable used for the codex sandbox backend")
     parser.add_argument("--sandbox-network", action="store_true", help="Allow network access inside Codex-sandboxed agent shell commands")
     parser.add_argument("--no-sandbox", action="store_true", help="Run agent shell commands directly on the host")
+    parser.add_argument("--shell-mode", choices=["disabled", "controlled", "unrestricted"], default="controlled", help="Agent shell policy")
+    parser.add_argument("--notify-parent-on-done", action="store_true", help="Send automatic system completion notifications to parent agents")
     parser.add_argument("-v", "--verbose", action="store_true")
     args = parser.parse_args()
 
@@ -41,6 +47,8 @@ def cli():
         sandbox_backend="host" if args.no_sandbox else args.sandbox_backend,
         sandbox_codex_bin=args.sandbox_codex_bin,
         sandbox_network=args.sandbox_network,
+        shell_mode=args.shell_mode,
+        notify_parent_on_done=args.notify_parent_on_done,
     )
 
     def on_event(e):

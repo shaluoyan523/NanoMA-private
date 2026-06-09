@@ -8,9 +8,10 @@ import sys
 import time
 import threading
 from pathlib import Path
+from urllib.parse import unquote
 
-LOG_DIR = Path(sys.argv[1]) if len(sys.argv) > 1 else Path("./logs")
-PORT = int(sys.argv[2]) if len(sys.argv) > 2 else 8899
+LOG_DIR = Path("./logs")
+PORT = 8899
 HTML_PATH = Path(__file__).parent / "viewer.html"
 
 
@@ -22,36 +23,67 @@ class EventCache:
         self.events: list[dict] = []
         self._lock = threading.Lock()
         self._last_size = 0
+        self._last_sig: tuple[int, int, int] | None = None
+        self._last_raw: bytes | None = None
+        self._generation = 0
         self._reload()
 
     def _reload(self):
-        """Reload events from file if it has grown."""
+        """Reload events from file and bump generation on non-append rewrites."""
         events_file = self.log_dir / "events.jsonl"
         if not events_file.exists():
             return
-        current_size = events_file.stat().st_size
-        if current_size == self._last_size:
-            return
-        # Read only new bytes
-        with self._lock:
-            with open(events_file) as f:
-                f.seek(0)
-                new_events = []
-                for line in f:
-                    line = line.strip()
-                    if line:
-                        try:
-                            new_events.append(json.loads(line))
-                        except json.JSONDecodeError:
-                            pass
-                self.events = new_events
-            self._last_size = current_size
+        stat = events_file.stat()
+        current_size = stat.st_size
+        current_sig = (stat.st_ino, current_size, stat.st_mtime_ns)
 
-    def get_since(self, offset: int) -> tuple[list[dict], int]:
+        raw = events_file.read_bytes()
+        with self._lock:
+            if self._last_raw == raw and self._last_sig == current_sig:
+                return
+            if self._last_raw is not None:
+                inode_changed = self._last_sig is not None and stat.st_ino != self._last_sig[0]
+                rewritten = inode_changed or not raw.startswith(self._last_raw)
+                if rewritten:
+                    self._generation += 1
+
+            new_events = []
+            for line in raw.decode(errors="replace").splitlines():
+                line = line.strip()
+                if line:
+                    try:
+                        new_events.append(json.loads(line))
+                    except json.JSONDecodeError:
+                        pass
+            self.events = new_events
+            self._last_raw = raw
+            self._last_size = current_size
+            self._last_sig = current_sig
+
+    def get_since(self, offset: int, client_generation: int | None = None) -> tuple[list[dict], int, int, bool]:
         """Return events since offset and total count."""
         self._reload()
         with self._lock:
-            return self.events[offset:], len(self.events)
+            reset = False
+            if client_generation is not None and client_generation != self._generation:
+                offset = 0
+                reset = True
+            elif offset > len(self.events):
+                offset = 0
+                reset = True
+            return self.events[offset:], len(self.events), self._generation, reset
+
+    def meta(self) -> dict:
+        self._reload()
+        events_file = self.log_dir / "events.jsonl"
+        with self._lock:
+            return {
+                "log_dir": str(self.log_dir),
+                "events_file": str(events_file),
+                "events": len(self.events),
+                "generation": self._generation,
+                "exists": events_file.exists(),
+            }
 
 
 _cache: EventCache | None = None
@@ -73,6 +105,26 @@ def _safe_json(obj):
     return json.dumps(obj, ensure_ascii=False, default=_default, allow_nan=False)
 
 
+def _query_int(query: str, name: str) -> int | None:
+    for part in query.split("&"):
+        key, _, value = part.partition("=")
+        if key != name or not value:
+            continue
+        try:
+            return int(value)
+        except ValueError:
+            return None
+    return None
+
+
+def _query_str(query: str, name: str) -> str:
+    for part in query.split("&"):
+        key, _, value = part.partition("=")
+        if key == name:
+            return unquote(value)
+    return ""
+
+
 class ViewerHandler(http.server.BaseHTTPRequestHandler):
     def log_message(self, format, *args):
         pass
@@ -86,6 +138,8 @@ class ViewerHandler(http.server.BaseHTTPRequestHandler):
             self._serve_sse(query)
         elif "api/events" in path:
             self._serve_events(query)
+        elif "api/meta" in path:
+            self._serve_meta()
         elif "api/llm-logs" in path:
             self._serve_llm_list()
         elif "api/llm-log" in path:
@@ -101,12 +155,8 @@ class ViewerHandler(http.server.BaseHTTPRequestHandler):
 
     def _serve_sse(self, query):
         """Server-Sent Events endpoint — streams new events in real-time."""
-        offset = 0
-        if "offset=" in query:
-            try:
-                offset = int(query.split("offset=")[1].split("&")[0])
-            except ValueError:
-                pass
+        offset = _query_int(query, "offset") or 0
+        client_generation = _query_int(query, "generation")
 
         # Support Last-Event-ID for auto-reconnect
         last_id = self.headers.get("Last-Event-ID")
@@ -122,19 +172,31 @@ class ViewerHandler(http.server.BaseHTTPRequestHandler):
         self.send_header("Connection", "keep-alive")
         self.send_header("Access-Control-Allow-Origin", "*")
         self.end_headers()
+        self.wfile.flush()
 
         cache = get_cache()
         BATCH_SIZE = 30  # send at most 30 events per SSE message
         try:
             while True:
-                new_events, total = cache.get_since(offset)
+                new_events, total, generation, reset = cache.get_since(offset, client_generation)
+                if reset:
+                    offset = 0
+                    client_generation = generation
                 if new_events:
                     # Send in batches to avoid giant single messages
+                    first_batch = True
                     while new_events:
                         batch = new_events[:BATCH_SIZE]
                         new_events = new_events[BATCH_SIZE:]
                         offset += len(batch)
-                        data = _safe_json({"events": batch, "total": total, "offset": offset})
+                        data = _safe_json({
+                            "events": batch,
+                            "total": total,
+                            "offset": offset,
+                            "generation": generation,
+                            "reset": reset and first_batch,
+                        })
+                        first_batch = False
                         # SSE spec: split on newlines, prefix each line with "data:"
                         lines = data.split("\n")
                         sse_data = "\n".join(f"data: {line}" for line in lines)
@@ -146,15 +208,21 @@ class ViewerHandler(http.server.BaseHTTPRequestHandler):
 
     def _serve_events(self, query):
         """Polling fallback — returns events since offset."""
-        offset = 0
-        if "offset=" in query:
-            try:
-                offset = int(query.split("offset=")[1].split("&")[0])
-            except ValueError:
-                pass
+        offset = _query_int(query, "offset") or 0
+        client_generation = _query_int(query, "generation")
         cache = get_cache()
-        new_events, total = cache.get_since(offset)
-        self._json_response({"events": new_events, "total": total})
+        new_events, total, generation, reset = cache.get_since(offset, client_generation)
+        response_offset = len(new_events) if reset else offset + len(new_events)
+        self._json_response({
+            "events": new_events,
+            "total": total,
+            "offset": response_offset,
+            "generation": generation,
+            "reset": reset,
+        })
+
+    def _serve_meta(self):
+        self._json_response(get_cache().meta())
 
     def _serve_llm_list(self):
         logs = []
@@ -165,9 +233,7 @@ class ViewerHandler(http.server.BaseHTTPRequestHandler):
         self._json_response({"logs": logs, "count": len(logs)})
 
     def _serve_llm_log(self, query):
-        filename = ""
-        if "file=" in query:
-            filename = query.split("file=")[1].split("&")[0]
+        filename = _query_str(query, "file")
         if not filename or ".." in filename or "/" in filename:
             self.send_response(400)
             self.end_headers()
@@ -213,8 +279,14 @@ class ThreadedHTTPServer(http.server.HTTPServer):
 
 
 def main():
+    global LOG_DIR, PORT, _cache
+    LOG_DIR = Path(sys.argv[1]) if len(sys.argv) > 1 else Path("./logs")
+    PORT = int(sys.argv[2]) if len(sys.argv) > 2 else 8899
+    _cache = None
+    LOG_DIR.mkdir(parents=True, exist_ok=True)
     print(f"NanoMA Trace Viewer")
     print(f"  Log dir:  {LOG_DIR}")
+    print(f"  Events:   {LOG_DIR / 'events.jsonl'}")
     print(f"  HTML:     {HTML_PATH}")
     print(f"  Serving:  http://localhost:{PORT}")
     server = ThreadedHTTPServer(("0.0.0.0", PORT), ViewerHandler)

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import shutil
 import time
 from pathlib import Path
@@ -27,6 +28,17 @@ def _normalize_workflow_prior(value: str | None) -> str:
 
 
 def _agent_snapshot(target: "Agent", runtime: "Runtime") -> dict[str, Any]:
+    expected_outputs = runtime.expected_outputs(target)
+    missing_outputs = runtime.missing_expected_outputs(target)
+    progress = {
+        "turns": target._turns,
+        "tool_calls": target._tool_calls,
+        "artifacts_count": len(target.artifacts),
+        "expected_outputs": expected_outputs[:20],
+        "missing_outputs": missing_outputs[:20],
+        "outputs_complete": bool(expected_outputs) and not missing_outputs,
+        "completion_score": _completion_score(target, expected_outputs, missing_outputs),
+    }
     return {
         "id": target.id,
         "status": target.status,
@@ -43,9 +55,127 @@ def _agent_snapshot(target: "Agent", runtime: "Runtime") -> dict[str, Any]:
         "group_id": target.group_id,
         "workflow_prior": target.workflow_prior,
         "action_state": target.action_state,
+        "progress": progress,
         "state_board": runtime.state_board_get(target.id),
         "public_memory": runtime.memory.serialize(target.id),
         "memory": target.memory,
+    }
+
+
+def _completion_score(target: "Agent", expected_outputs: list[str], missing_outputs: list[str]) -> float:
+    score = 0.0
+    if target.status == "done":
+        score += 3.0
+    elif target.status in {"running", "idle"}:
+        score += 1.0
+    score += min(len(target.artifacts), 5) * 0.5
+    if expected_outputs:
+        score += (len(expected_outputs) - len(missing_outputs)) / max(1, len(expected_outputs)) * 3.0
+    score += min(target._turns, 20) * 0.05
+    return round(score, 3)
+
+
+def _normalize_string_list(value: Any) -> list[str]:
+    if value in (None, ""):
+        return []
+    if isinstance(value, str):
+        return [part.strip() for part in value.split(",") if part.strip()]
+    if isinstance(value, list):
+        return [str(part).strip() for part in value if str(part).strip()]
+    return [str(value).strip()] if str(value).strip() else []
+
+
+def _parse_json_string(value: Any) -> Any:
+    if not isinstance(value, str):
+        return value
+    stripped = value.strip()
+    if not stripped or stripped[0] not in "[{":
+        return value
+    try:
+        return json.loads(stripped)
+    except json.JSONDecodeError:
+        return value
+
+
+def _looks_like_placeholder_task(task: Any) -> bool:
+    text = str(task or "").strip().lower()
+    if not text:
+        return True
+    placeholder_terms = (
+        "i'm sorry",
+        "i cannot provide",
+        "cannot provide the content",
+        "placeholder",
+        "no task",
+    )
+    return any(term in text for term in placeholder_terms)
+
+
+def _matches_query_filter(snapshot: dict[str, Any], filters: dict[str, Any]) -> bool:
+    for key, expected in filters.items():
+        if expected in (None, "", [], {}):
+            continue
+        memory_tags = set((snapshot.get("public_memory") or {}).get("tags") or [])
+        board_tags = set((snapshot.get("state_board") or {}).get("current_task_tags") or [])
+        all_tags = memory_tags.union(board_tags)
+        if key in {"tags", "current_task_tags"}:
+            expected_tags = set(_normalize_string_list(expected))
+            if not expected_tags.intersection(all_tags):
+                return False
+            continue
+        if key == "has_artifacts":
+            has_artifacts = bool(snapshot.get("artifacts"))
+            if bool(expected) != has_artifacts:
+                return False
+            continue
+        actual = snapshot.get(key)
+        if key == "status" and expected == "active":
+            expected = ["running", "idle"]
+        if key == "role" and expected == "agent":
+            continue
+        if key == "role" and expected == "peer_agent":
+            actual = snapshot.get("create_type")
+        elif key == "role" and isinstance(expected, str):
+            role_tag = f"role:{expected}"
+            if snapshot.get("role") == expected or role_tag in all_tags:
+                continue
+        if key == "group_id" and isinstance(expected, str):
+            actual_text = str(actual or "")
+            if actual_text and (
+                actual_text == expected
+                or actual_text.endswith(expected)
+                or expected.endswith(actual_text)
+            ):
+                continue
+        if isinstance(expected, list):
+            if actual not in expected:
+                return False
+        elif actual != expected:
+            return False
+    return True
+
+
+def _query_help(snapshots: list[dict[str, Any]]) -> dict[str, Any]:
+    roles = sorted({snap.get("role") for snap in snapshots if snap.get("role")})
+    groups = sorted({snap.get("group_id") for snap in snapshots if snap.get("group_id")})
+    tags = sorted({
+        tag
+        for snap in snapshots
+        for tag in (
+            ((snap.get("public_memory") or {}).get("tags") or [])
+            + ((snap.get("state_board") or {}).get("current_task_tags") or [])
+        )
+    })
+    return {
+        "available_roles": roles[:30],
+        "available_group_ids": groups[:30],
+        "available_tags": tags[:50],
+        "tips": [
+            "Use filter.group_id with the exact group_id shown here to query a wave of peer agents.",
+            "Use tags=['feature:N'] or filter.tags=['feature:N'] for feature-scoped lookup.",
+            "Use filter.status='running' or 'active'; active matches running and idle.",
+            "create_type='peer_agent' is not a role; query filter.role='peer_agent' is treated as create_type for compatibility.",
+        ],
     }
 
 
@@ -61,9 +191,12 @@ async def meta_spawn(args: dict[str, Any], agent: "Agent", runtime: "Runtime") -
     group_id = args.get("group_id", "")
     workflow_prior = _normalize_workflow_prior(args.get("workflow_prior"))
     current_task_tags = list(args.get("current_task_tags", []))
+    orchestration_preference = args.get("orchestration_preference")
 
     if not task:
         return {"error": "task is required"}
+    if _looks_like_placeholder_task(task):
+        return {"error": "task appears to be a placeholder/refusal, not a concrete child task"}
     if agent.depth + 1 > runtime.config.max_depth:
         return {"error": f"Max depth ({runtime.config.max_depth}) exceeded"}
     if len(runtime.agents) >= runtime.config.max_agents:
@@ -97,6 +230,7 @@ async def meta_spawn(args: dict[str, Any], agent: "Agent", runtime: "Runtime") -
         group_id=group_id,
         workflow_prior=workflow_prior,
         current_task_tags=current_task_tags,
+        orchestration_preference=orchestration_preference,
     )
     runtime.start_agent(child)
     runtime.state_board_update(child.id, action_state="create", current_task_tags=current_task_tags)
@@ -111,6 +245,8 @@ async def meta_spawn(args: dict[str, Any], agent: "Agent", runtime: "Runtime") -
         "created_by": created_by,
         "group_id": group_id,
         "workflow_prior": workflow_prior,
+        "requested_orchestration_preference": orchestration_preference,
+        "orchestration_preference": child.orchestration_preference,
     })
 
     if delegate:
@@ -128,11 +264,52 @@ async def meta_spawn(args: dict[str, Any], agent: "Agent", runtime: "Runtime") -
         "created_by": created_by,
         "group_id": group_id,
         "workflow_prior": workflow_prior,
+        "requested_orchestration_preference": orchestration_preference,
+        "orchestration_preference": child.orchestration_preference,
     }
 
 
 async def meta_create_agent(args: dict[str, Any], agent: "Agent", runtime: "Runtime") -> dict[str, Any]:
     return await meta_spawn(args, agent, runtime)
+
+
+async def meta_spawn_many(args: dict[str, Any], agent: "Agent", runtime: "Runtime") -> dict[str, Any]:
+    items = _parse_json_string(args.get("agents") or args.get("tasks") or [])
+    defaults = _parse_json_string(args.get("defaults") or {})
+    if not isinstance(defaults, dict):
+        defaults = {}
+    for key in (
+        "model",
+        "delegate",
+        "role",
+        "create_type",
+        "relationship",
+        "group_id",
+        "workflow_prior",
+        "current_task_tags",
+        "orchestration_preference",
+    ):
+        if key in args and key not in defaults:
+            defaults[key] = args[key]
+    if not isinstance(items, list):
+        return {"error": "agents/tasks must be a list"}
+    if not items:
+        return {"error": "agents/tasks must not be empty"}
+
+    results = []
+    for i, item in enumerate(items):
+        if isinstance(item, str):
+            spawn_args = {**defaults, "task": item}
+        elif isinstance(item, dict):
+            spawn_args = {**defaults, **item}
+        else:
+            results.append({"index": i, "error": "agent item must be a task string or object"})
+            continue
+        result = await meta_spawn(spawn_args, agent, runtime)
+        results.append({"index": i, "result": result})
+        if "error" in result and "Max agents" in result["error"]:
+            break
+    return {"created": sum(1 for r in results if "error" not in r.get("result", {})), "results": results}
 
 
 async def meta_kill(args: dict[str, Any], agent: "Agent", runtime: "Runtime") -> dict[str, Any]:
@@ -225,13 +402,35 @@ async def meta_send(args: dict[str, Any], agent: "Agent", runtime: "Runtime") ->
 
 
 async def meta_query(args: dict[str, Any], agent: "Agent", runtime: "Runtime") -> dict[str, Any]:
+    agent._last_query_turn = max(agent._last_query_turn, agent._turns or 1)
     target_id = args.get("agent_id")
     messages_n = args.get("messages", 0)
+    filters = args.get("filter") or {}
+    tags = _normalize_string_list(args.get("tags"))
+    memory_intent = args.get("memory_intent", "")
+    include_memory = bool(args.get("include_memory", True))
+    limit = args.get("limit", 0)
+    if not isinstance(filters, dict):
+        return {"error": "filter must be an object"}
+    try:
+        limit = int(limit or 0)
+    except (TypeError, ValueError):
+        return {"error": "limit must be an integer"}
+
     if target_id:
         target = runtime.agents.get(target_id)
         if not target:
             return {"error": f"Agent '{target_id}' not found"}
         result = _agent_snapshot(target, runtime)
+        runtime._emit(agent.id, "query", {
+            "scope": "agent",
+            "target": target_id,
+            "targets": [target_id],
+            "filter": filters,
+            "tags": tags,
+            "memory_intent": memory_intent,
+            "result_count": 1,
+        })
         if messages_n != 0:
             history = target.history[1:]
             if messages_n > 0:
@@ -242,20 +441,60 @@ async def meta_query(args: dict[str, Any], agent: "Agent", runtime: "Runtime") -
             ]
         return result
 
+    all_snapshots = [_agent_snapshot(a, runtime) for a in runtime.agents.values()]
+    snapshots = list(all_snapshots)
+    if tags:
+        filters = {**filters, "tags": tags}
+    if filters:
+        snapshots = [snap for snap in snapshots if _matches_query_filter(snap, filters)]
+    snapshots.sort(key=lambda snap: (
+        -snap.get("progress", {}).get("completion_score", 0),
+        snap["id"],
+    ))
+    if limit > 0:
+        snapshots = snapshots[:limit]
+
+    memory_read = None
+    if tags or memory_intent:
+        memory_read = runtime.memory.read(intent=memory_intent, seed_terms=tags)
+
+    targets = [snap["id"] for snap in snapshots]
+    runtime._emit(agent.id, "query", {
+        "scope": "agents",
+        "target": None,
+        "targets": targets[:100],
+        "filter": filters,
+        "tags": tags,
+        "memory_intent": memory_intent,
+        "result_count": len(snapshots),
+        "limited": limit > 0,
+    })
+
     return {
-        "agents": [_agent_snapshot(a, runtime) for a in runtime.agents.values()],
-        "count": len(runtime.agents),
+        "agents": snapshots,
+        "count": len(snapshots),
+        "total_agents": len(runtime.agents),
         "state_board": runtime.state_board_list(),
-        "public_memory": runtime.memory.list(),
+        "public_memory": runtime.memory.list() if include_memory else None,
+        "memory_read": memory_read,
+        "query_help": _query_help(all_snapshots) if not snapshots else None,
     }
 
 
 async def meta_wait(args: dict[str, Any], agent: "Agent", runtime: "Runtime") -> dict[str, Any]:
-    target_ids = args.get("agent_ids", [])
+    target_ids = _parse_json_string(args.get("agent_ids", []))
     timeout = args.get("timeout", 120.0)
     mode = args.get("mode", "all")
     if mode not in ("all", "any"):
         return {"error": "mode must be 'all' or 'any'"}
+    if isinstance(target_ids, str):
+        target_ids = _normalize_string_list(target_ids)
+    if not isinstance(target_ids, list):
+        return {"error": "agent_ids must be a list or comma-separated string"}
+    try:
+        timeout = float(timeout)
+    except (TypeError, ValueError):
+        return {"error": "timeout must be a number"}
     if not target_ids:
         target_ids = list(agent.children)
     if not target_ids:
@@ -399,12 +638,40 @@ async def meta_set_status(args: dict[str, Any], agent: "Agent", runtime: "Runtim
     if action in {"create", "read", "message", "work", "compact"}:
         return {"status": agent.status, "action_state": agent.action_state, "state_board": runtime.state_board_get(agent.id)}
 
+    blockers = runtime.stop_blockers(agent) if action in {"done", "self_stop", "stop"} else []
+    if blockers and not runtime.can_stop_with_active_dependencies(agent, blockers):
+        runtime.state_board_update(agent.id, action_state="work", current_task_tags=current_task_tags, work_outline=work_outline)
+        return {
+            "blocked": "active_children",
+            "message": (
+                "Cannot stop blindly while dependent agents are still active. Use query() or wait() first, "
+                "then stop if your summary can explicitly record which dependencies are still running."
+            ),
+            "active_children": blockers,
+        }
+
+    completion_blockers = (
+        runtime.completion_blockers(agent, tags=list(current_task_tags or agent.current_task_tags))
+        if action in {"done", "self_stop", "stop"}
+        else []
+    )
+    if completion_blockers:
+        runtime.state_board_update(agent.id, action_state="work", current_task_tags=current_task_tags, work_outline=work_outline)
+        return {
+            "blocked": "completion_evidence",
+            "message": (
+                "Cannot stop yet because required deliverable evidence is missing. Continue with the indicated work action, "
+                "then retry stop/compact after source changes, tests, and explicit outputs are complete."
+            ),
+            "blockers": completion_blockers,
+        }
+
     if compact_before_stop:
         if not compact_summary:
             return {"error": "compact_summary required when compact_before_stop=true"}
         agent._compact_pending = {
             "summary": compact_summary,
-            "files": args.get("files", []),
+            "files": _normalize_string_list(args.get("files", [])),
             "tags": list(current_task_tags or agent.current_task_tags),
             "experience": args.get("experience") or result or compact_summary,
             "new_task": args.get("new_task"),
@@ -451,18 +718,44 @@ async def meta_compact(args: dict[str, Any], agent: "Agent", runtime: "Runtime")
     summary = args.get("summary", "")
     if not summary:
         return {"error": "summary required"}
+    stop_after = bool(args.get("stop_after", False) or args.get("done", False))
+    stop_result = args.get("result") or args.get("stop_result") or ""
+    tags = _normalize_string_list(args.get("tags", agent.current_task_tags)) or list(agent.current_task_tags)
+    blockers = runtime.stop_blockers(agent) if stop_after else []
+    if blockers and not runtime.can_stop_with_active_dependencies(agent, blockers):
+        runtime.state_board_update(agent.id, action_state="work", current_task_tags=tags, work_outline=args.get("work_outline"))
+        return {
+            "blocked": "active_children",
+            "message": (
+                "Cannot compact-and-stop blindly while dependent agents are still active. Use query() or wait() first, "
+                "then compact with stop_after=true if your summary records active dependencies and remaining gaps."
+            ),
+            "active_children": blockers,
+        }
+    completion_blockers = runtime.completion_blockers(agent, tags=tags) if stop_after else []
+    if completion_blockers:
+        runtime.state_board_update(agent.id, action_state="work", current_task_tags=tags, work_outline=args.get("work_outline"))
+        return {
+            "blocked": "completion_evidence",
+            "message": (
+                "Cannot compact-and-stop yet because required deliverable evidence is missing. Continue the task, "
+                "then compact with stop_after=true after the blockers are resolved."
+            ),
+            "blockers": completion_blockers,
+        }
     agent._compact_pending = {
         "summary": summary,
-        "files": args.get("files", []),
-        "tags": list(args.get("tags", agent.current_task_tags)),
-        "experience": args.get("experience"),
+        "files": _normalize_string_list(args.get("files", [])),
+        "tags": tags,
+        "experience": args.get("experience") or (stop_result if stop_after else None),
         "new_task": args.get("new_task"),
         "new_bio": args.get("new_bio"),
         "work_outline": args.get("work_outline", agent.work_outline),
-        "stop_after": False,
+        "stop_after": stop_after,
+        "stop_result": stop_result,
     }
-    runtime.state_board_update(agent.id, action_state="compact", current_task_tags=args.get("tags"), work_outline=args.get("work_outline"))
-    return {"scheduled": True, "action_state": "compact"}
+    runtime.state_board_update(agent.id, action_state="compact", current_task_tags=tags, work_outline=args.get("work_outline"))
+    return {"scheduled": True, "action_state": "compact", "stop_after": stop_after}
 
 
 async def meta_submit(args: dict[str, Any], agent: "Agent", runtime: "Runtime") -> dict[str, Any]:
@@ -471,32 +764,41 @@ async def meta_submit(args: dict[str, Any], agent: "Agent", runtime: "Runtime") 
     path_str = args.get("path", "")
     if not path_str:
         return {"error": "path required"}
-    path = Path(path_str)
-    if not path.is_absolute():
-        path = agent.workspace / path
+    path = _resolve_workspace_path(path_str, agent.workspace, runtime)
+    if path is None:
+        return {"error": "Access denied: outside workspace"}
     if not path.exists():
         return {"error": f"Not found: {path}"}
+    if not path.is_file():
+        return {"error": f"Not a file: {path}"}
 
     shared = runtime._tool_context.shared_dir
     shared.mkdir(parents=True, exist_ok=True)
-    shutil.copy2(path, shared / path.name)
+    shared_copy = path
+    try:
+        path.resolve().relative_to(shared.resolve())
+    except ValueError:
+        shared_copy = shared / path.name
+        shutil.copy2(path, shared_copy)
 
     artifact = Artifact(path=path_str, absolute_path=path, description=args.get("description", ""), agent_id=agent.id)
     agent.artifacts.append(artifact)
     runtime.memory.update(agent.id, add_artifacts=[path_str])
     agent.memory = {"public_memory": runtime.memory.serialize(agent.id)}
-    return {"submitted": path_str, "shared_copy": str(shared / path.name)}
+    return {"submitted": path_str, "shared_copy": str(shared_copy)}
 
 
 async def meta_batch(args: dict[str, Any], agent: "Agent", runtime: "Runtime") -> dict[str, Any]:
     path_str = args.get("path", "")
     if not path_str:
         return {"error": "path required"}
-    path = Path(path_str)
-    if not path.is_absolute():
-        path = agent.workspace / path
+    path = _resolve_workspace_path(path_str, agent.workspace, runtime)
+    if path is None:
+        return {"error": "Access denied: outside workspace"}
     if not path.exists():
         return {"error": f"Not found: {path}"}
+    if not path.is_file():
+        return {"error": f"Not a file: {path}"}
     try:
         calls = json.loads(path.read_text())
     except Exception as e:
@@ -504,12 +806,13 @@ async def meta_batch(args: dict[str, Any], agent: "Agent", runtime: "Runtime") -
     if not isinstance(calls, list):
         return {"error": "File must contain a JSON array of {tool, args} objects"}
 
-    from nanoma.tools import WORK_TOOLS
-    all_tools = {**WORK_TOOLS, **META_TOOLS}
+    all_tools = {**runtime._available_work_tools(), **META_TOOLS}
     results = []
     for i, call in enumerate(calls):
-        tool_name = call.get("tool", "")
-        tool_args = call.get("args", {})
+        tool_name, tool_args, normalize_error = _normalize_batch_call(call)
+        if normalize_error:
+            results.append({"index": i, "error": normalize_error})
+            continue
         tool_info = all_tools.get(tool_name)
         if not tool_info:
             results.append({"index": i, "error": f"Unknown tool: {tool_name}"})
@@ -524,6 +827,37 @@ async def meta_batch(args: dict[str, Any], agent: "Agent", runtime: "Runtime") -
         except Exception as e:
             results.append({"index": i, "error": str(e)})
     return {"executed": len(results), "results": results}
+
+
+def _normalize_batch_call(call: Any) -> tuple[str, dict[str, Any], str | None]:
+    if not isinstance(call, dict):
+        return "", {}, "Batch item must be an object"
+
+    fn = call.get("function")
+    if isinstance(fn, dict):
+        tool_name = fn.get("name") or call.get("tool") or call.get("name") or ""
+        tool_args = fn.get("arguments", call.get("arguments", call.get("args", call.get("params", {}))))
+    else:
+        tool_name = call.get("tool") or call.get("name") or (fn if isinstance(fn, str) else "")
+        tool_args = call.get("args", call.get("params", call.get("arguments", {})))
+
+    if not tool_name:
+        return "", {}, "Batch item missing tool/name/function.name"
+
+    if isinstance(tool_args, str):
+        if not tool_args.strip():
+            tool_args = {}
+        else:
+            try:
+                tool_args = json.loads(tool_args)
+            except Exception as e:
+                return str(tool_name), {}, f"Arguments parse error: {e}"
+
+    if tool_args is None:
+        tool_args = {}
+    if not isinstance(tool_args, dict):
+        return str(tool_name), {}, "Arguments must be an object"
+    return str(tool_name), tool_args, None
 
 
 def _copy_files(patterns: list[str], src_dir: Path, dest_dir: Path) -> list[str]:
@@ -560,6 +894,27 @@ def _is_descendant(target_id: str, ancestor_id: str, runtime: "Runtime") -> bool
     return False
 
 
+def _resolve_workspace_path(path_str: str, workspace: Path, runtime: "Runtime") -> Path | None:
+    shared_dir = runtime._tool_context.shared_dir
+    raw = str(path_str or ".")
+    raw = raw.replace("$SHARED", str(shared_dir)).replace("${SHARED}", str(shared_dir))
+    raw = raw.replace("$WORKSPACE", str(workspace)).replace("${WORKSPACE}", str(workspace))
+    raw = os.path.expandvars(raw)
+    path = Path(raw)
+    if not path.is_absolute() and path.parts and path.parts[0] == shared_dir.name:
+        path = shared_dir.joinpath(*path.parts[1:])
+    elif not path.is_absolute() and path.parts and path.parts[0] == runtime._tool_context.workspace_root.name:
+        path = runtime._tool_context.workspace_root.joinpath(*path.parts[1:])
+    elif not path.is_absolute():
+        path = workspace / path
+    try:
+        resolved = path.resolve()
+        resolved.relative_to(runtime._tool_context.workspace_root.resolve())
+        return resolved
+    except ValueError:
+        return None
+
+
 META_TOOLS: dict[str, dict[str, Any]] = {
     "spawn": {"handler": meta_spawn, "is_meta": True, "schema": {"type": "function", "function": {
         "name": "spawn",
@@ -574,6 +929,7 @@ META_TOOLS: dict[str, dict[str, Any]] = {
             "group_id": {"type": "string"},
             "workflow_prior": {"type": "string"},
             "current_task_tags": {"type": "array", "items": {"type": "string"}},
+            "orchestration_preference": {"type": "string", "enum": ["solo", "balanced", "parallel", "aggressive"]},
         }, "required": ["task"]},
     }}} ,
     "create_agent": {"handler": meta_create_agent, "is_meta": True, "schema": {"type": "function", "function": {
@@ -589,7 +945,17 @@ META_TOOLS: dict[str, dict[str, Any]] = {
             "group_id": {"type": "string"},
             "workflow_prior": {"type": "string"},
             "current_task_tags": {"type": "array", "items": {"type": "string"}},
+            "orchestration_preference": {"type": "string", "enum": ["solo", "balanced", "parallel", "aggressive"]},
         }, "required": ["task"]},
+    }}} ,
+    "spawn_many": {"handler": meta_spawn_many, "is_meta": True, "schema": {"type": "function", "function": {
+        "name": "spawn_many",
+        "description": "Create a peer wave of multiple agents in one tool call. Use this early for tasks with independent evidence checks, implementation/test/review tracks, or linear+parallel benchmark-like stages. Each child starts immediately. Put shared metadata in defaults and per-agent task/role/tags in agents.",
+        "parameters": {"type": "object", "properties": {
+            "defaults": {"type": "object", "description": "Optional fields applied to every spawn, such as create_type='peer_agent', relationship='peer', group_id, workflow_prior, orchestration_preference, or model."},
+            "agents": {"type": "array", "items": {"type": "object"}, "description": "Agent definitions. Each object may include task, role, create_type, relationship, group_id, workflow_prior, orchestration_preference, current_task_tags, model, or delegate."},
+            "tasks": {"type": "array", "items": {"type": "string"}, "description": "Shortcut list of task strings; defaults are applied to each."},
+        }},
     }}} ,
     "kill": {"handler": meta_kill, "is_meta": True, "schema": {"type": "function", "function": {
         "name": "kill",
@@ -614,10 +980,15 @@ META_TOOLS: dict[str, dict[str, Any]] = {
     }}} ,
     "query": {"handler": meta_query, "is_meta": True, "schema": {"type": "function", "function": {
         "name": "query",
-        "description": "Query one agent or list all agents. Returns action_state/state_board and structured public_memory in addition to identity and artifacts.",
+        "description": "Query one agent or discover agents by status, role, group_id, parent, tags, or public memory. Use this to inspect peer state_board/public_memory and summarize from observed agent state instead of relying on parent-directed reports.",
         "parameters": {"type": "object", "properties": {
             "agent_id": {"type": "string"},
             "messages": {"type": "integer", "default": 0},
+            "filter": {"type": "object", "description": "Optional filters such as status, action_state, role, group_id, parent, created_by, relationship, workflow_prior, tags, current_task_tags, or has_artifacts."},
+            "tags": {"type": "array", "items": {"type": "string"}, "description": "Match agents whose public memory or state_board contains any of these tags."},
+            "memory_intent": {"type": "string", "description": "Intent label for tag-based memory discovery."},
+            "include_memory": {"type": "boolean", "default": True},
+            "limit": {"type": "integer", "default": 0},
         }},
     }}} ,
     "wait": {"handler": meta_wait, "is_meta": True, "schema": {"type": "function", "function": {
@@ -653,7 +1024,7 @@ META_TOOLS: dict[str, dict[str, Any]] = {
     }}} ,
     "set_status": {"handler": meta_set_status, "is_meta": True, "schema": {"type": "function", "function": {
         "name": "set_status",
-        "description": "Update action_state through the state board or stop/self-stop. Unknown actions are errors. compact_before_stop can compact first when compact_summary is provided.",
+        "description": "Update action_state through the state board or stop/self-stop. Unknown actions are errors. compact_before_stop can compact first when compact_summary is provided. If peer query shows your lane is redundant, stop with tags such as status:pruned and reason:peer_ahead via compact_before_stop or compact(..., stop_after=true).",
         "parameters": {"type": "object", "properties": {
             "action": {"type": "string"},
             "status": {"type": "string"},
@@ -683,7 +1054,7 @@ META_TOOLS: dict[str, dict[str, Any]] = {
     }}} ,
     "compact": {"handler": meta_compact, "is_meta": True, "schema": {"type": "function", "function": {
         "name": "compact",
-        "description": "Immediately compact live history into a compact summary and update public memory. summary is required; files/tags/experience/new_task/new_bio/work_outline are optional.",
+        "description": "Compact live history into a compact summary and update public memory. summary is required. Use stop_after=true or done=true with result when compaction is the final step; plain compact means continue next turn. When pruning yourself after peer query, include tags like status:pruned, reason:peer_ahead, and task tags so peers can discover the summary.",
         "parameters": {"type": "object", "properties": {
             "summary": {"type": "string"},
             "files": {"type": "array", "items": {"type": "string"}},
@@ -692,6 +1063,10 @@ META_TOOLS: dict[str, dict[str, Any]] = {
             "new_task": {"type": "string"},
             "new_bio": {"type": "string"},
             "work_outline": {"type": "string"},
+            "stop_after": {"type": "boolean", "default": False},
+            "done": {"type": "boolean", "default": False},
+            "result": {"type": "string"},
+            "stop_result": {"type": "string"},
         }, "required": ["summary"]},
     }}} ,
     "submit": {"handler": meta_submit, "is_meta": True, "schema": {"type": "function", "function": {
@@ -704,7 +1079,7 @@ META_TOOLS: dict[str, dict[str, Any]] = {
     }}} ,
     "batch": {"handler": meta_batch, "is_meta": True, "schema": {"type": "function", "function": {
         "name": "batch",
-        "description": "Execute multiple tool calls from a JSON file.",
+        "description": "Execute multiple tool calls from a JSON array file. Items may use {tool,args}, {name,params}, or {function:{name,arguments}}.",
         "parameters": {"type": "object", "properties": {
             "path": {"type": "string"},
         }, "required": ["path"]},

@@ -1,0 +1,134 @@
+[
+  {
+    "tool": "spawn",
+    "args": {
+      "role": "implementer_feature1",
+      "create_type": "peer_agent",
+      "relationship": "peer",
+      "group_id": "cooperbench-click2068",
+      "current_task_tags": ["benchmark:cooperbench", "repo:click", "task:2068", "feature:1", "area:click_edit", "file:_termui_impl", "file:termui"],
+      "task": "Implement CooperBench Click task2068 feature 1. Read shared/cooperbench_task2068_features/feature1.md, then work only in shared/source and shared/cooperbench_task2068_notes. Do not read feature.patch/tests.patch/combined.patch. This feature adds multi-file support to click.edit. Coordinate by query() with peers when touching click.edit signatures, Editor methods, or command construction. Keep public memory/status tags current. Write notes to shared/cooperbench_task2068_notes/feature1.md and submit changed files/tests or mark blocked with evidence."
+    }
+  },
+  {
+    "tool": "spawn",
+    "args": {
+      "role": "implementer_feature2",
+      "create_type": "peer_agent",
+      "relationship": "peer",
+      "group_id": "cooperbench-click2068",
+      "current_task_tags": ["benchmark:cooperbench", "repo:click", "task:2068", "feature:2", "area:click_edit", "file:_termui_impl", "file:termui"],
+      "task": "Implement CooperBench Click task2068 feature 2. Read shared/cooperbench_task2068_features/feature2.md, then work only in shared/source and shared/cooperbench_task2068_notes. Do not read feature.patch/tests.patch/combined.patch. This feature adds an editor session timeout to click.edit. Coordinate by query() with peers when touching click.edit signatures, Editor methods, subprocess wait logic, or error behavior. Keep public memory/status tags current. Write notes to shared/cooperbench_task2068_notes/feature2.md and submit changed files/tests or mark blocked with evidence."
+    }
+  },
+  {
+    "tool": "spawn",
+    "args": {
+      "role": "implementer_feature3",
+      "create_type": "peer_agent",
+      "relationship": "peer",
+      "group_id": "cooperbench-click2068",
+      "current_task_tags": ["benchmark:cooperbench", "repo:click", "task:2068", "feature:3", "area:click_edit", "file:_termui_impl", "file:termui"],
+      "task": "Implement CooperBench Click task2068 feature 3. Read shared/cooperbench_task2068_features/feature3.md, then work only in shared/source and shared/cooperbench_task2068_notes. Do not read feature.patch/tests.patch/combined.patch. This feature adds auto_backup support to click.edit. Coordinate by query() with peers when touching click.edit signatures, Editor initialization, file handling, or editor launch order. Keep public memory/status tags current. Write notes to shared/cooperbench_task2068_notes/feature3.md and submit changed files/tests or mark blocked with evidence."
+    }
+  },
+  {
+    "tool": "spawn",
+    "args": {
+      "role": "implementer_feature4",
+      "create_type": "peer_agent",
+      "relationship": "peer",
+      "group_id": "cooperbench-click2068",
+      "current_task_tags": ["benchmark:cooperbench", "repo:click", "task:2068", "feature:4", "area:click_edit", "file:_termui_impl", "file:termui"],
+      "task": "Implement CooperBench Click task2068 feature 4. Read shared/cooperbench_task2068_features/feature4.md, then work only in shared/source and shared/cooperbench_task2068_notes. Do not read feature.patch/tests.patch/combined.patch. This feature adds editor_args support to click.edit. Coordinate by query() with peers when touching click.edit signatures, Editor constructor, or command construction. Keep public memory/status tags current. Write notes to shared/cooperbench_task2068_notes/feature4.md and submit changed files/tests or mark blocked with evidence."
+    }
+  },
+  {
+    "tool": "spawn",
+    "args": {
+      "role": "implementer_feature5",
+      "create_type": "peer_agent",
+      "relationship": "peer",
+      "group_id": "cooperbench-click2068",
+      "current_task_tags": ["benchmark:cooperbench", "repo:click", "task:2068", "feature:5", "area:click_edit", "file:_termui_impl", "file:termui"],
+      "task": "Implement CooperBench Click task2068 feature 5. Read shared/cooperbench_task2068_features/feature5.md, then work only in shared/source and shared/cooperbench_task2068_notes. Do not read feature.patch/tests.patch/combined.patch. This feature adds concurrent edit protection with lock files. Coordinate by query() with peers when touching click.edit signatures, Editor cleanup, file handling, or exception flow. Keep public memory/status tags current. Write notes to shared/cooperbench_task2068_notes/feature5.md and submit changed files/tests or mark blocked with evidence."
+    }
+  },
+  {
+    "tool": "spawn",
+    "args": {
+      "role": "implementer_feature6",
+      "create_type": "peer_agent",
+      "relationship": "peer",
+      "group_id": "cooperbench-click2068",
+      "current_task_tags": ["benchmark:cooperbench", "repo:click", "task:2068", "feature:6", "area:click_edit", "file:_termui_impl", "file:termui"],
+      "task": "Implement CooperBench Click task2068 feature 6. Read shared/cooperbench_task2068_features/feature6.md, then work only in shared/source and shared/cooperbench_task2068_notes. Do not read feature.patch/tests.patch/combined.patch. This feature adds process_priority support to click.edit. Coordinate by query() with peers when touching click.edit signatures, Editor launch behavior, subprocess options, or platform-specific code. Keep public memory/status tags current. Write notes to shared/cooperbench_task2068_notes/feature6.md and submit changed files/tests or mark blocked with evidence."
+    }
+  },
+  {
+    "tool": "spawn",
+    "args": {
+      "role": "implementer_feature7",
+      "create_type": "peer_agent",
+      "relationship": "peer",
+      "group_id": "cooperbench-click2068",
+      "current_task_tags": ["benchmark:cooperbench", "repo:click", "task:2068", "feature:7", "area:click_edit", "file:_termui_impl", "file:termui"],
+      "task": "Implement CooperBench Click task2068 feature 7. Read shared/cooperbench_task2068_features/feature7.md, then work only in shared/source and shared/cooperbench_task2068_notes. Do not read feature.patch/tests.patch/combined.patch. This feature adds escape_shell support to click.edit. Coordinate by query() with peers when touching command construction, quoting, editor_args, filename handling, or shell execution. Keep public memory/status tags current. Write notes to shared/cooperbench_task2068_notes/feature7.md and submit changed files/tests or mark blocked with evidence."
+    }
+  },
+  {
+    "tool": "spawn",
+    "args": {
+      "role": "implementer_feature8",
+      "create_type": "peer_agent",
+      "relationship": "peer",
+      "group_id": "cooperbench-click2068",
+      "current_task_tags": ["benchmark:cooperbench", "repo:click", "task:2068", "feature:8", "area:click_edit", "file:_termui_impl", "file:termui"],
+      "task": "Implement CooperBench Click task2068 feature 8. Read shared/cooperbench_task2068_features/feature8.md, then work only in shared/source and shared/cooperbench_task2068_notes. Do not read feature.patch/tests.patch/combined.patch. This feature adds process_group support to click.edit. Coordinate by query() with peers when touching click.edit signatures, Editor subprocess launch options, or platform-specific process behavior. Keep public memory/status tags current. Write notes to shared/cooperbench_task2068_notes/feature8.md and submit changed files/tests or mark blocked with evidence."
+    }
+  },
+  {
+    "tool": "spawn",
+    "args": {
+      "role": "implementer_feature9",
+      "create_type": "peer_agent",
+      "relationship": "peer",
+      "group_id": "cooperbench-click2068",
+      "current_task_tags": ["benchmark:cooperbench", "repo:click", "task:2068", "feature:9", "area:click_edit", "file:_termui_impl", "file:termui"],
+      "task": "Implement CooperBench Click task2068 feature 9. Read shared/cooperbench_task2068_features/feature9.md, then work only in shared/source and shared/cooperbench_task2068_notes. Do not read feature.patch/tests.patch/combined.patch. This feature adds isolate_env support to click.edit. Coordinate by query() with peers when touching click.edit signatures, environment handling, subprocess launch options, or security-sensitive filtering. Keep public memory/status tags current. Write notes to shared/cooperbench_task2068_notes/feature9.md and submit changed files/tests or mark blocked with evidence."
+    }
+  },
+  {
+    "tool": "spawn",
+    "args": {
+      "role": "implementer_feature10",
+      "create_type": "peer_agent",
+      "relationship": "peer",
+      "group_id": "cooperbench-click2068",
+      "current_task_tags": ["benchmark:cooperbench", "repo:click", "task:2068", "feature:10", "area:click_edit", "file:_termui_impl", "file:termui"],
+      "task": "Implement CooperBench Click task2068 feature 10. Read shared/cooperbench_task2068_features/feature10.md, then work only in shared/source and shared/cooperbench_task2068_notes. Do not read feature.patch/tests.patch/combined.patch. This feature adds working_dir support to click.edit. Coordinate by query() with peers when touching click.edit signatures, Editor launch behavior, subprocess cwd handling, or relative filename behavior. Keep public memory/status tags current. Write notes to shared/cooperbench_task2068_notes/feature10.md and submit changed files/tests or mark blocked with evidence."
+    }
+  },
+  {
+    "tool": "spawn",
+    "args": {
+      "role": "implementer_feature11",
+      "create_type": "peer_agent",
+      "relationship": "peer",
+      "group_id": "cooperbench-click2068",
+      "current_task_tags": ["benchmark:cooperbench", "repo:click", "task:2068", "feature:11", "area:click_edit", "file:_termui_impl", "file:termui"],
+      "task": "Implement CooperBench Click task2068 feature 11. Read shared/cooperbench_task2068_features/feature11.md, then work only in shared/source and shared/cooperbench_task2068_notes. Do not read feature.patch/tests.patch/combined.patch. This feature adds monitor_process support to click.edit. Coordinate by query() with peers when touching click.edit signatures, Editor process lifecycle, subprocess behavior, or callbacks. Keep public memory/status tags current. Write notes to shared/cooperbench_task2068_notes/feature11.md and submit changed files/tests or mark blocked with evidence."
+    }
+  },
+  {
+    "tool": "spawn",
+    "args": {
+      "role": "implementer_feature12",
+      "create_type": "peer_agent",
+      "relationship": "peer",
+      "group_id": "cooperbench-click2068",
+      "current_task_tags": ["benchmark:cooperbench", "repo:click", "task:2068", "feature:12", "area:click_edit", "file:_termui_impl", "file:termui"],
+      "task": "Implement CooperBench Click task2068 feature 12. Read shared/cooperbench_task2068_features/feature12.md, then work only in shared/source and shared/cooperbench_task2068_notes. Do not read feature.patch/tests.patch/combined.patch. This feature adds handle_exit_codes support to click.edit. Coordinate by query() with peers when touching click.edit signatures, Editor subprocess result handling, exceptions, or callback behavior. Keep public memory/status tags current. Write notes to shared/cooperbench_task2068_notes/feature12.md and submit changed files/tests or mark blocked with evidence."
+    }
+  }
+]

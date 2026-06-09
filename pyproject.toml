@@ -9,6 +9,12 @@ dependencies = [
     "pyyaml>=6.0",
 ]
 
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.4",
+    "pytest-asyncio>=1.4",
+]
+
 [project.scripts]
 nanoma = "nanoma.main:cli"
 

@@ -14,7 +14,10 @@ import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
+from nanoma.env import load_dotenv
 from nanoma import Runtime, RuntimeConfig
+
+load_dotenv()
 
 
 async def main():
@@ -24,7 +27,7 @@ async def main():
         budget=1.0,
         max_agents=10,
         max_turns=30,
-        default_model=os.environ.get("NANOMA_MODEL", "deepseek/deepseek-v4-flash"),
+        default_model=os.environ.get("NANOMA_MODEL", "deepseek-v4-flash"),
         workspace_root=Path("./workspace"),
         log_dir=Path("./logs"),
     )
