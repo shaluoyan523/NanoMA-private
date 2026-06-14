@@ -22,6 +22,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--model", default=None)
     parser.add_argument("--budget", type=float, default=20.0)
     parser.add_argument("--max-agents", type=int, default=60)
+    parser.add_argument("--allow-agent-model-override", action="store_true", help="Allow agents to request child models instead of inheriting the runner model")
     parser.add_argument("--max-concurrent-llm", type=int, default=32)
     parser.add_argument("--max-turns", type=int, default=80)
     parser.add_argument("--llm-max-tokens", type=int, default=None, help="Set NANOMA_MAX_TOKENS for each LLM response")
@@ -52,6 +53,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--spawn-before-turn", type=int, default=None, help="Turn threshold for orchestration nudges when no children exist")
     parser.add_argument("--max-solo-tool-calls-before-spawn", type=int, default=None, help="Tool-call threshold for orchestration nudges when no children exist")
     parser.add_argument("--min-spawnable-workstreams", type=int, default=None, help="Workstream count referenced by orchestration guidance")
+    parser.add_argument("--loop-action-policy", choices=["rule", "constraint"], default=os.environ.get("NANOMA_LOOP_ACTION_POLICY", "rule"), help="Loop planner policy")
+    parser.add_argument("--disable-loop-constraint", action="append", default=[], help="Disable one constraint metric for the constraint loop planner")
     parser.add_argument("--viewer-port", type=int, default=8900, help="Port for the live trace viewer")
     parser.add_argument("--no-viewer", action="store_true", help="Do not start or rebind the live trace viewer")
     parser.add_argument("--fresh", action="store_true", help="Remove workspace and log directory before running")
@@ -141,9 +144,13 @@ async def main() -> None:
     shell_mode = args.shell_mode or ("unrestricted" if args.enable_shell else "controlled")
 
     task = Path(args.task_file).read_text()
+    disabled_loop_constraints = set(args.disable_loop_constraint or [])
+    if env_disabled := os.environ.get("NANOMA_DISABLED_LOOP_CONSTRAINTS"):
+        disabled_loop_constraints.update(item.strip() for item in env_disabled.split(",") if item.strip())
     config = RuntimeConfig(
         budget=args.budget,
         max_agents=args.max_agents,
+        allow_agent_model_override=args.allow_agent_model_override,
         max_concurrent_llm=args.max_concurrent_llm,
         max_turns=args.max_turns,
         time_limit=args.time_limit,
@@ -164,6 +171,8 @@ async def main() -> None:
             args.max_solo_tool_calls_before_spawn if args.max_solo_tool_calls_before_spawn is not None else 5
         ),
         min_spawnable_workstreams=args.min_spawnable_workstreams if args.min_spawnable_workstreams is not None else 3,
+        loop_action_policy=args.loop_action_policy,
+        disabled_loop_constraints=disabled_loop_constraints,
         enabled_work_tools=(
             None
             if shell_mode in {"controlled", "unrestricted"}

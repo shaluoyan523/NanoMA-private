@@ -429,21 +429,35 @@ def _path_arg(args: dict[str, Any], default: str = "") -> Any:
 
 def _resolve_workspace_path(raw_path: str | Path, workspace: Path, ctx: "ToolContext") -> Path | None:
     raw = str(raw_path or ".")
-    raw = raw.replace("$SHARED", str(ctx.shared_dir)).replace("${SHARED}", str(ctx.shared_dir))
-    raw = raw.replace("$WORKSPACE", str(workspace)).replace("${WORKSPACE}", str(workspace))
-    raw = os.path.expandvars(raw)
-    path = Path(raw)
-    if path.is_absolute() and path.parts and path.parts[1:2] == (ctx.workspace_root.name,):
-        path = ctx.workspace_root.joinpath(*path.parts[2:])
-    if not path.is_absolute() and path.parts and path.parts[0] == ctx.shared_dir.name:
-        path = ctx.shared_dir.joinpath(*path.parts[1:])
-    elif not path.is_absolute() and path.parts and path.parts[0] == ctx.workspace_root.name:
-        path = ctx.workspace_root.joinpath(*path.parts[1:])
-    elif not path.is_absolute():
-        path = workspace / path
+    workspace_root = ctx.workspace_root.resolve()
+    shared_dir = ctx.shared_dir.resolve()
+    workspace_dir = workspace.resolve()
+    if raw == "$SHARED" or raw == "${SHARED}":
+        path = shared_dir
+    elif raw.startswith("$SHARED/"):
+        path = shared_dir / raw[len("$SHARED/"):]
+    elif raw.startswith("${SHARED}/"):
+        path = shared_dir / raw[len("${SHARED}/"):]
+    elif raw == "$WORKSPACE" or raw == "${WORKSPACE}":
+        path = workspace_dir
+    elif raw.startswith("$WORKSPACE/"):
+        path = workspace_dir / raw[len("$WORKSPACE/"):]
+    elif raw.startswith("${WORKSPACE}/"):
+        path = workspace_dir / raw[len("${WORKSPACE}/"):]
+    else:
+        raw = os.path.expandvars(raw)
+        path = Path(raw)
+        if path.is_absolute() and path.parts and path.parts[1:2] == (workspace_root.name,):
+            path = workspace_root.joinpath(*path.parts[2:])
+        if not path.is_absolute() and path.parts and path.parts[0] == shared_dir.name:
+            path = shared_dir.joinpath(*path.parts[1:])
+        elif not path.is_absolute() and path.parts and path.parts[0] == workspace_root.name:
+            path = workspace_root.joinpath(*path.parts[1:])
+        elif not path.is_absolute():
+            path = workspace_dir / path
     try:
         resolved = path.resolve()
-        resolved.relative_to(ctx.workspace_root.resolve())
+        resolved.relative_to(workspace_root)
         return resolved
     except ValueError:
         return None
@@ -666,7 +680,7 @@ WORK_TOOLS: dict[str, dict[str, Any]] = {
         "handler": tool_bt_aggregate,
         "schema": {"type": "function", "function": {
             "name": "bt_aggregate",
-            "description": "Aggregate pairwise comparison JSON files with a Bradley-Terry model. Inputs may be files containing {winner, loser}, a list of such records, or nested pairwise_results/comparisons/results/judgments. Use this after parallel judge agents produce winner/loser decisions.",
+            "description": "Aggregate pairwise comparison JSON files with a Bradley-Terry model. Provide directory for the comparison JSON directory; use pattern/recursive to control discovery. Inputs may be files containing {winner, loser}, a list of such records, or nested pairwise_results/comparisons/results/judgments. Use this after parallel judge agents produce winner/loser decisions.",
             "parameters": {"type": "object", "properties": {
                 "comparisons": {"type": "array", "items": {"type": "string"}, "description": "Optional explicit JSON comparison file paths"},
                 "files": {"type": "array", "items": {"type": "string"}, "description": "Alias for comparisons"},

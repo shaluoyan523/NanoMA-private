@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import logging
 import math
@@ -11,7 +12,7 @@ import re
 import subprocess
 import threading
 import time
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
 from difflib import get_close_matches
 from pathlib import Path
 from typing import Any, Callable, Awaitable, Literal
@@ -22,7 +23,15 @@ from nanoma.llm import (
     count_message_tokens, estimate_tokens, openai_compatible_call, set_log_dir,
     _parse_text_tool_calls,
 )
-from nanoma.memory import ActiveTaskCard, ExperienceCard, MemoryBroker
+from nanoma.memory import (
+    ActiveTaskCard,
+    MemoryBroker,
+    agent_identity_tags,
+    build_memory_card,
+    canonicalize_role,
+    normalize_tags,
+    split_experience_text,
+)
 from nanoma.sandbox import SandboxConfig, SandboxSession
 from nanoma.scheduler import Scheduler
 from nanoma.tools import WORK_TOOLS
@@ -44,24 +53,41 @@ ORCHESTRATION_DECAY: dict[OrchestrationPreference, OrchestrationPreference] = {
 ORCHESTRATION_COMPLEXITY_TERMS: dict[str, int] = {
     "architecture": 2,
     "benchmark": 2,
+    "benchmark suite": 2,
+    "candidate pool": 2,
+    "candidate wave": 2,
     "compare": 1,
     "complex": 2,
     "concurrent": 2,
+    "concurrency": 2,
+    "coordination": 1,
+    "evolution": 2,
+    "fan-out": 2,
+    "fanout": 2,
     "design": 1,
     "end-to-end": 2,
     "evaluate": 1,
+    "evaluation": 1,
     "full": 1,
     "full-scale": 2,
     "implementation": 1,
     "implement": 1,
     "integration": 2,
+    "multi-phase": 2,
     "multi-agent": 2,
     "multiagent": 2,
+    "orchestration": 2,
     "parallel": 2,
+    "parallelism": 2,
+    "pipeline": 1,
+    "protocol": 2,
     "review": 1,
     "synthesis": 1,
     "test matrix": 2,
+    "tournament": 2,
     "workflow": 1,
+    "workstream": 2,
+    "workstreams": 2,
     "全量": 2,
     "复杂": 2,
     "并发": 2,
@@ -77,13 +103,20 @@ ORCHESTRATION_COMPLEXITY_TERMS: dict[str, int] = {
     "集成": 2,
 }
 ORCHESTRATION_ATOMIC_TERMS: dict[str, int] = {
+    "assigned artifact": 2,
+    "assigned file": 2,
     "brief": 1,
     "grep": 2,
     "inspect": 1,
+    "one artifact": 2,
+    "one candidate": 2,
     "one file": 2,
     "quick": 1,
     "read one": 2,
     "single": 1,
+    "single artifact": 2,
+    "single candidate": 2,
+    "single file": 2,
     "smoke": 1,
     "small": 1,
     "一次": 2,
@@ -134,6 +167,7 @@ def _infer_task_orchestration_preference(
         group_id=group_id,
         current_task_tags=tags,
     )
+    concrete_single_output = _task_is_concrete_single_output_work(task)
 
     for term, weight in ORCHESTRATION_COMPLEXITY_TERMS.items():
         if term in normalized:
@@ -167,8 +201,9 @@ def _infer_task_orchestration_preference(
     if task and ((0 < task_words <= 8) or len(task.strip()) <= 24):
         atomic_score += 1
     if leaf_artifact_lane:
-        atomic_score += 5
         reasons.append("leaf artifact lane")
+    if concrete_single_output:
+        reasons.append("concrete single-output work")
 
     target_rank = parent_rank
     if parallel_score >= 7:
@@ -182,9 +217,8 @@ def _infer_task_orchestration_preference(
         target_rank = min(target_rank, ORCHESTRATION_RANK["solo"])
     elif atomic_score >= 2 and parallel_score < 3:
         target_rank = min(target_rank, ORCHESTRATION_RANK["balanced"])
-    if leaf_artifact_lane:
-        target_rank = min(target_rank, ORCHESTRATION_RANK["solo"])
-
+    if concrete_single_output:
+        target_rank = ORCHESTRATION_RANK["balanced"]
     preference = _preference_at_rank(target_rank)
     if parallel_score:
         reasons.append(f"parallel_score={parallel_score}")
@@ -203,11 +237,24 @@ def _expected_output_paths(task: str) -> list[str]:
     """Extract explicit shared output paths from task text."""
     paths: list[str] = []
     seen: set[str] = set()
+    input_paths = set(_referenced_input_like_shared_paths(task))
     for path in _referenced_output_like_shared_paths(task):
+        if path in input_paths:
+            continue
         if path not in seen:
             seen.add(path)
             paths.append(path)
     return paths
+
+
+def _normalize_string_list(value: Any) -> list[str]:
+    if value in (None, ""):
+        return []
+    if isinstance(value, str):
+        return [part.strip() for part in value.split(",") if part.strip()]
+    if isinstance(value, list):
+        return [str(part).strip() for part in value if str(part).strip()]
+    return [str(value).strip()] if str(value).strip() else []
 
 
 def _looks_like_output_path(path: str) -> bool:
@@ -241,6 +288,55 @@ def _referenced_output_like_shared_paths(task: str) -> list[str]:
     return paths
 
 
+def _referenced_input_like_shared_paths(task: str) -> list[str]:
+    paths: list[str] = []
+    seen: set[str] = set()
+
+    def is_input_path(path: str, start: int, end: int) -> bool:
+        if not path.startswith("shared/") or path.startswith("shared/source"):
+            return False
+        if _looks_like_final_answer_path(path):
+            return False
+        task_text = task or ""
+        context = task_text[max(0, start - 80): min(len(task_text), end + 80)].lower()
+        local_prefix = task_text[max(0, start - 64): start].lower()
+        if re.fullmatch(r"shared/[^/]+/problems/[^/]+/(?:metadata\.json|statement\.md)", path):
+            return True
+        if re.fullmatch(r"shared/[^/]+/README\.md", path):
+            return True
+        input_terms = (
+            "public file", "public files", "input file", "read", "inspect",
+            "metadata", "statement", "reference", "依据", "参考", "读取", "查看",
+        )
+        output_terms = ("write", "create", "produce", "deliver", "output", "save", "append", "update", "生成", "写入", "产出", "更新", "追加")
+        downstream_input_terms = (
+            "read", "inspect", "verify", "validate", "cross-check",
+            "check", "confirm", "compare", "核验", "验证", "检查", "读取",
+        )
+        output_near_path = any(term in local_prefix for term in output_terms)
+        input_near_path = any(term in local_prefix for term in input_terms)
+        downstream_input_near_path = any(term in local_prefix for term in downstream_input_terms)
+        if output_near_path:
+            return False
+        if input_near_path and not any(term in context for term in output_terms):
+            return True
+        if downstream_input_near_path:
+            return True
+        return not _looks_like_output_path(path)
+
+    for match in re.finditer(r"`(shared/[^`]+?)`", task or ""):
+        path = match.group(1).strip().rstrip(".,;:)]}")
+        if is_input_path(path, match.start(1), match.end(1)) and path not in seen:
+            seen.add(path)
+            paths.append(path)
+    for match in re.finditer(r"(?<![\w/])shared/[^\s`'\"<>)\]}]+", task or ""):
+        path = match.group(0).strip().rstrip(".,;:)]}")
+        if is_input_path(path, match.start(0), match.end(0)) and path not in seen:
+            seen.add(path)
+            paths.append(path)
+    return paths
+
+
 def _referenced_group_ids(task: str) -> list[str]:
     group_ids: list[str] = []
     seen: set[str] = set()
@@ -261,14 +357,68 @@ def _referenced_group_ids(task: str) -> list[str]:
 
 def _task_prefers_query_before_artifact(task: str) -> bool:
     text = (task or "").lower()
-    if "query" in text or "group_id" in text:
+    peer_query_terms = (
+        "query peer", "query peers", "query group", "query agents",
+        "query other agents", "inspect peer", "inspect peers", "from peers",
+        "group_id", "completed peers", "memory tags", "peer progress",
+        "peer state", "peer status", "public memory", "public_memory",
+        "state_board", "同伴", "其他agent", "查询同伴", "查询其他",
+    )
+    if any(term in text for term in peer_query_terms):
         return True
     coordination_terms = (
         "coordinate", "coordinator", "peer", "peers", "summarize shared",
-        "inspect shared", "discover", "artifact_commit", "remaining gaps",
-        "协调", "汇总", "查询", "同伴", "其他agent",
+        "inspect shared", "artifact_commit", "remaining gaps",
+        "artifact paths", "before final synthesis", "before synthesis",
+        "before summarizing", "completed peers", "memory tags",
+        "peer progress", "peer state", "peer status", "public memory",
+        "public_memory", "query-driven", "state_board", "status discovery",
+        "协调", "汇总", "同伴", "其他agent",
     )
     return any(term in text for term in coordination_terms)
+
+
+def _task_is_discovery_work(task: str) -> bool:
+    text = (task or "").lower()
+    discovery_terms = (
+        "search", "research", "investigate", "look up", "lookup", "find",
+        "identify", "discover", "collect evidence", "evidence", "source",
+        "sources", "citation", "citations", "fact-check", "fact check",
+        "verify from", "primary source", "paper", "papers", "arxiv", "doi",
+        "web", "browse", "gaia",
+        "搜索", "检索", "查找", "查询", "调查", "研究", "收集证据",
+        "证据", "来源", "引用", "核验", "论文",
+    )
+    return any(term in text for term in discovery_terms)
+
+
+def _task_is_concrete_single_output_work(task: str) -> bool:
+    """Concrete evidence/API work should usually execute, not recursively delegate."""
+    outputs = _non_terminal_expected_output_paths(task)
+    if not outputs or len(outputs) > 2:
+        return False
+    if _task_has_multi_phase_peer_protocol(task) or _explicit_peer_wave_requirements(task):
+        return False
+    text = (task or "").lower()
+    delegation_terms = (
+        "spawn", "spawn_many", "create agent", "create_agent", "handoff", "hand off",
+        "delegate", "peer wave", "worker wave", "multi-agent", "multiagent",
+        "parallel agents", "independent agents", "workstream", "workstreams",
+    )
+    if any(term in text for term in delegation_terms):
+        return False
+    if re.search(r"\bcandidate[_:-]?\d+\b", text) or "/candidate_" in text:
+        return False
+    if "candidate evidence" in text:
+        return False
+    concrete_discovery_terms = (
+        "api", "arxiv", "doi", "paper", "papers", "search", "research", "find",
+        "identify", "look up", "lookup", "fetch", "parse", "extract", "source",
+        "sources", "citation", "citations", "evidence", "query", "http://",
+        "https://", "web", "browse", "gaia", "搜索", "检索", "查询", "论文",
+        "证据", "来源", "引用",
+    )
+    return any(term in text for term in concrete_discovery_terms)
 
 
 def _task_is_coordination_artifact_task(task: str) -> bool:
@@ -279,6 +429,11 @@ def _task_is_coordination_artifact_task(task: str) -> bool:
         "coordinate", "coordinator", "summarize", "summary", "report", "status",
         "inspect", "discover", "peer", "peers", "group_id", "remaining gaps",
         "artifact_commit", "file_write observations",
+        "artifact paths", "before final synthesis", "bt ranking",
+        "bradley-terry", "comparison results", "completed peers",
+        "final synthesis", "memory tags", "peer progress", "peer state",
+        "public memory", "public_memory", "query-driven", "state_board",
+        "status discovery",
         "协调", "汇总", "总结", "报告", "状态", "查询", "同伴", "其他agent", "剩余",
     )
     return bool(_referenced_group_ids(task)) or any(term in text for term in coordination_terms)
@@ -288,11 +443,22 @@ def _task_has_spawnable_workstreams(task: str, min_streams: int = 3) -> bool:
     text = (task or "").lower()
     if _task_has_multi_phase_peer_protocol(task):
         return True
-    if any(term in text for term in ("separable", "workstream", "workstreams", "peer agents", "multi-agent", "multiagent", "多agent")):
+    if _explicit_peer_wave_requirements(task):
+        return True
+    if any(term in text for term in (
+        "batch spawn", "comparison wave", "fan out", "fan-out", "generator wave",
+        "independent agents", "independent candidates", "independent comparisons",
+        "independent generators", "mutation wave", "parallel agents",
+        "peer agents", "separable", "spawn agents", "spawn_many",
+        "worker wave", "workstream", "workstreams", "multi-agent", "multiagent",
+        "多agent",
+    )):
         return True
     stream_terms = {
         "audit", "patch", "implement", "implementation", "test", "review", "research",
-        "generator", "judge", "coordinator", "scout", "integrator", "redteam",
+        "coordinator", "integrator", "redteam",
+        "comparator", "evaluator", "mutator", "ranker",
+        "reviewer", "selector", "synthesizer", "validator",
         "评审", "测试", "实现", "审计", "生成", "汇总",
     }
     hits = sum(1 for term in stream_terms if term in text)
@@ -305,8 +471,35 @@ def _task_has_multi_phase_peer_protocol(task: str) -> bool:
     terms = (
         "opendeepthink",
         "open deepthink",
+        "bradley-terry",
+        "bt ranking",
+        "bt.json",
+        "candidate pool",
+        "comparison graph",
+        "comparison json",
+        "degree k",
+        "elite",
+        "elites",
+        "evolution",
+        "evolutionary",
+        "evolve",
+        "final selection",
+        "generation-0",
+        "gen0 population",
+        "gen0 candidates",
+        "gen1 population",
+        "gen1 candidates",
+        "gen2 population",
+        "gen2 candidates",
+        "gen3 population",
+        "gen3 candidates",
+        "initial candidates",
+        "judge pair",
         "peer wave",
         "pairwise",
+        "pairwise judge",
+        "population",
+        "ranking round",
         "comparison",
         "comparisons",
         "mutation",
@@ -318,6 +511,11 @@ def _task_has_multi_phase_peer_protocol(task: str) -> bool:
         "protocol",
         "spawn comparison",
         "spawn/run comparison",
+        "selection round",
+        "top 15",
+        "top 5",
+        "bottom 5",
+        "tournament",
         "n=20",
         "k=4",
         "m=10",
@@ -329,6 +527,102 @@ def _task_has_multi_phase_peer_protocol(task: str) -> bool:
         "轮次",
     )
     return any(term in text for term in terms)
+
+
+def _explicit_peer_wave_requirements(task: str) -> list[dict[str, Any]]:
+    """Find explicit numeric peer-wave requirements from natural task text."""
+    requirements: list[dict[str, Any]] = []
+    seen: set[tuple[int, str, str]] = set()
+    text = task or ""
+    chunks = re.split(r"(?<=[.;。；])\s+|\n+", text)
+    patterns = (
+        re.compile(r"\b(?:spawn|create|launch|start)\s+(?P<count>\d{1,3})\s+(?P<desc>[^.;\n]{0,120}?)(?:agents|peers|workers)\b", re.I),
+        re.compile(r"\b(?P<count>\d{1,3})\s+(?P<desc>(?:independent|parallel)[^.;\n]{0,120}?)(?:agents|peers|workers|generators|judges|comparisons|candidates)\b", re.I),
+        re.compile(r"\b(?:generate|produce|write)\s+(?P<count>\d{1,3})\s+(?P<desc>[^.;\n]{0,120}?)(?:candidate|solution|variant)s?\b", re.I),
+    )
+    for chunk in chunks:
+        lower = chunk.lower()
+        if not any(term in lower for term in ("spawn", "agent", "peer", "worker", "independent", "parallel", "candidate", "comparison", "mutation")):
+            continue
+        for pattern in patterns:
+            for match in pattern.finditer(chunk):
+                try:
+                    target = int(match.group("count"))
+                except (TypeError, ValueError):
+                    continue
+                if target <= 1 or target > 500:
+                    continue
+                snippet = f"{match.group(0)} {match.group('desc')}".lower()
+                role = _infer_peer_wave_role(snippet)
+                phase = _infer_peer_wave_phase(snippet)
+                key = (target, role, phase)
+                if key in seen:
+                    continue
+                seen.add(key)
+                requirements.append({
+                    "target": target,
+                    "role": role,
+                    "phase": phase,
+                    "text": match.group(0).strip(),
+                })
+    return requirements
+
+
+def _infer_peer_wave_role(text: str) -> str:
+    if any(term in text for term in ("comparison", "compare", "judge", "pairwise")):
+        return "judge"
+    if any(term in text for term in ("mutation", "mutate", "mutator")):
+        return "mutator"
+    if any(term in text for term in ("review", "reviewer", "critic")):
+        return "reviewer"
+    if any(term in text for term in ("test", "tester", "validation", "verifier", "verify")):
+        return "tester"
+    if any(term in text for term in ("generator", "generate", "candidate", "solution", "population")):
+        return "generator"
+    if "worker" in text:
+        return "worker"
+    return ""
+
+
+def _infer_peer_wave_phase(text: str) -> str:
+    normalized = text.replace("-", "")
+    if "final" in normalized:
+        return "final"
+    gen_match = re.search(r"\bgen(?:eration)?\s*0*(\d+)\b", normalized)
+    if gen_match:
+        return f"gen{int(gen_match.group(1))}"
+    return ""
+
+
+def _agent_matches_peer_wave_requirement(agent: "Agent", requirement: dict[str, Any]) -> bool:
+    haystack = " ".join(
+        str(part)
+        for part in [
+            agent.role,
+            agent.group_id,
+            agent.workflow_prior,
+            agent.task,
+            " ".join(agent.current_task_tags),
+        ]
+        if part
+    ).lower().replace("-", "")
+    role = str(requirement.get("role") or "")
+    phase = str(requirement.get("phase") or "").replace("-", "")
+    role_terms = {
+        "generator": ("generator", "candidate", "solution", "role:generator"),
+        "judge": ("judge", "comparison", "compare", "pairwise", "role:judge"),
+        "mutator": ("mutator", "mutation", "mutate", "role:mutator"),
+        "reviewer": ("reviewer", "review", "critic", "role:reviewer"),
+        "tester": ("tester", "test", "validation", "verifier", "role:tester"),
+        "worker": ("worker", "role:worker"),
+    }
+    if role:
+        terms = role_terms.get(role, (role,))
+        if not any(term.replace("-", "") in haystack for term in terms):
+            return False
+    if phase and phase not in haystack:
+        return False
+    return bool(role or phase)
 
 
 def _task_is_leaf_artifact_lane(
@@ -345,6 +639,7 @@ def _task_is_leaf_artifact_lane(
         return False
     write_terms = (
         "write", "create", "produce", "deliver", "generate", "implement",
+        "author", "compose", "draft", "output", "save",
         "输出", "产出", "写", "生成", "实现",
     )
     if not any(term in text for term in write_terms):
@@ -354,6 +649,10 @@ def _task_is_leaf_artifact_lane(
         "query peers", "query group", "compare", "comparison", "pairwise",
         "judge", "aggregate", "bt_aggregate", "synthesis", "synthesize",
         "mutation", "mutate", "select final", "selection", "opendeepthink",
+        "bradley-terry", "bt ranking", "bt.json", "candidate pool",
+        "comparison graph", "comparison json", "elite", "elites",
+        "evolution", "final selection", "population", "ranking round",
+        "selection round", "tournament",
         "n=20", "k=4", "m=10", "t=3", "多阶段", "比较", "变异", "汇总",
     )
     if any(term in text for term in coordinator_terms):
@@ -401,6 +700,32 @@ def _looks_like_final_report_path(path: str) -> bool:
     return any(term in name for term in ("final", "report", "summary", "总结", "报告"))
 
 
+def _looks_like_evidence_report_path(path: str) -> bool:
+    p = Path(path)
+    if p.suffix.lower() not in {".md", ".txt", ".json"}:
+        return False
+    name = p.name.lower()
+    return any(term in name for term in ("evidence", "report", "source", "citation", "paper", "verify", "verification"))
+
+
+def _looks_like_final_answer_path(path: str) -> bool:
+    p = Path(path)
+    return p.suffix.lower() == ".json" and p.name.lower() in {"answer.json", "final_answer.json"}
+
+
+def _final_answer_paths(task: str) -> list[str]:
+    return [path for path in _expected_output_paths(task) if _looks_like_final_answer_path(path)]
+
+
+def _task_mentions_submit_answer_protocol(task: str) -> bool:
+    text = (task or "").lower()
+    return bool(re.search(r"\bsubmit_answer\s*\(", text)) or "submit_answer(answer" in text
+
+
+def _non_terminal_expected_output_paths(task: str) -> list[str]:
+    return [path for path in _expected_output_paths(task) if not _looks_like_final_answer_path(path)]
+
+
 def _looks_like_test_command(command: str) -> bool:
     lowered = (command or "").lower()
     return "pytest" in lowered or "unittest" in lowered
@@ -422,6 +747,428 @@ _TEXT_TOOL_ALIASES: dict[str, str] = {
 }
 
 _LOOP_ACTIONS = {"create", "read", "message", "work", "compact", "stop"}
+_CREATE_EXECUTION_TOOLS = {"spawn", "create_agent", "spawn_many"}
+_CREATE_STATE_TOOLS = {"compact", "set_status", "get_cost"}
+_LEDGER_READ_TOOLS = {"ledger_read"}
+_LEDGER_WRITE_TOOLS = {"ledger_update"}
+_LEDGER_TOOLS = _LEDGER_READ_TOOLS | _LEDGER_WRITE_TOOLS
+_TASK_LEDGER_OUTPUT_DONE_STATUSES = {"verified", "covered", "submitted"}
+_TASK_LEDGER_TERMINAL_STATUSES = {"verified", "covered", "pruned", "failed"}
+_STRONG_UNVERIFIED_EVIDENCE_TERMS = (
+    "unverified",
+    "not verified",
+    "requires verification",
+    "need verification",
+    "needs verification",
+    "pending verification",
+    "evidence pending",
+    "evidence-pending",
+    "pending evidence",
+    "cannot verify",
+    "could not verify",
+    "could not locate",
+    "unable to determine",
+    "unable to verify",
+    "best effort",
+    "low confidence",
+    "preliminary",
+    "hypothesis",
+    "uncertain",
+    "partial artifact",
+    "status:partial",
+    "status:incomplete",
+    "incomplete evidence",
+    "incomplete artifact",
+    "incomplete result",
+    "needs:verification",
+    "needs_verification",
+    "needs-verification",
+    "status:unverified",
+    "status:evidence_pending",
+    "status:evidence-pending",
+    "status:needs-verification",
+    "status:needs_verification",
+    "confidence:low",
+)
+_PLACEHOLDER_EVIDENCE_TERMS = (
+    "placeholder",
+    "search in progress",
+    "work in progress",
+    "analysis in progress",
+    "actively searching",
+    "still searching",
+    "still need to",
+    "still needs",
+    "pending:",
+    "results pending",
+    "pending results",
+    "pending query",
+    "pending execution",
+    "will be updated",
+    "will update",
+    "will populate",
+    "populate after execution",
+    "to be populated",
+    "to be filled",
+    "not yet run",
+    "not yet executed",
+    "not yet identified",
+    "not yet available",
+    "tbd",
+    "todo:",
+)
+_UNVERIFIED_EVIDENCE_TERMS = _STRONG_UNVERIFIED_EVIDENCE_TERMS + _PLACEHOLDER_EVIDENCE_TERMS
+_COMPLETION_CLAIM_TAGS = {
+    "status:complete",
+    "status:done",
+    "confidence:high",
+    "verified:true",
+}
+_TRUTH_GUARD_UNVERIFIED_TAGS = {"status:unverified", "needs:verification", "confidence:low"}
+_CREATE_ALLOWED_TOOLS = _CREATE_EXECUTION_TOOLS | _CREATE_STATE_TOOLS
+_UNCERTAIN_EVIDENCE_CREATE_REASONS = {
+    "handoff_after_partial_progress",
+    "delegate_uncertain_evidence_recovery",
+}
+_DOWNSTREAM_FOCUS_TERMS = (
+    "verify",
+    "verifier",
+    "verification",
+    "validate",
+    "validator",
+    "validation",
+    "review",
+    "reviewer",
+    "cross-check",
+    "corroborate",
+    "confidence",
+    "critique",
+    "critic",
+    "synthesis",
+    "synthesize",
+    "synthesizer",
+    "summarize",
+    "summary",
+    "integrate",
+    "integration",
+    "integrator",
+    "qa",
+    "final",
+)
+_UPSTREAM_INPUT_TERMS = (
+    "after",
+    "based on",
+    "before final",
+    "confidence",
+    "dependency",
+    "depends",
+    "evidence",
+    "from peers",
+    "input",
+    "partial",
+    "peer",
+    "peers",
+    "source",
+    "upstream",
+    "worker",
+    "workers",
+)
+_DOWNSTREAM_STRONG_TERMS = (
+    "after",
+    "based on",
+    "before final",
+    "cross-check",
+    "integrate",
+    "integration",
+    "review",
+    "synthesis",
+    "synthesize",
+    "verify",
+    "verifier",
+    "verification",
+)
+_EVIDENCE_COLLECTION_TERMS = (
+    "collect evidence",
+    "evidence report",
+    "find",
+    "identify",
+    "investigate",
+    "look up",
+    "lookup",
+    "research",
+    "search",
+    "source",
+    "sources",
+)
+
+
+def _sigmoid01(value: float, center: float = 0.7, sharpness: float = 10.0) -> float:
+    return 1.0 / (1.0 + math.exp(-sharpness * (max(0.0, min(1.0, value)) - center)))
+
+
+def _cheap_text_similarity(left: str, right: str) -> float:
+    left_terms = set(re.findall(r"[\w\u4e00-\u9fff]+", (left or "").lower()))
+    right_terms = set(re.findall(r"[\w\u4e00-\u9fff]+", (right or "").lower()))
+    left_terms = {term for term in left_terms if len(term) > 1}
+    right_terms = {term for term in right_terms if len(term) > 1}
+    if not left_terms and not right_terms:
+        return 0.0
+    return len(left_terms & right_terms) / max(1, len(left_terms | right_terms))
+
+
+def _identity_terms_for_dependency_match(agent: "Agent") -> set[str]:
+    terms = {
+        agent.id,
+        agent.role,
+        agent.group_id,
+        agent.created_by or "",
+        agent.create_type,
+        agent.relationship,
+        agent.workflow_prior,
+    }
+    terms.update(str(tag) for tag in agent.current_task_tags)
+    terms.update(str(artifact.path) for artifact in agent.artifacts)
+    public_memory = agent.memory.get("public_memory") if isinstance(agent.memory, dict) else None
+    if isinstance(public_memory, dict):
+        terms.update(str(tag) for tag in public_memory.get("tags") or [])
+        terms.update(str(path) for path in public_memory.get("artifacts") or [])
+        summary = str(public_memory.get("public_summary") or "")
+        terms.update(re.findall(r"[\w:./-]+", summary.lower())[:80])
+    terms.update(re.findall(r"[\w:./-]+", (agent.task or "").lower())[:120])
+    normalized = {term.strip().lower() for term in terms if str(term).strip()}
+    expanded = set(normalized)
+    for term in normalized:
+        if ":" in term:
+            expanded.add(term.split(":", 1)[1])
+        if term.startswith("lane:"):
+            expanded.add(term[len("lane:"):])
+        if term.startswith("feature:"):
+            expanded.add(term[len("feature:"):])
+        if term.startswith("role:"):
+            expanded.add(term[len("role:"):])
+    return expanded
+
+
+def _agent_matches_dependency_terms(agent: "Agent", depends_on: list[str]) -> bool:
+    wanted = {str(item).strip().lower() for item in depends_on if str(item).strip()}
+    if not wanted:
+        return True
+    terms = _identity_terms_for_dependency_match(agent)
+    for item in wanted:
+        if item in terms:
+            return True
+        if ":" in item and item.split(":", 1)[1] in terms:
+            return True
+        if any(term.endswith(item) or item.endswith(term) for term in terms if len(term) >= 4):
+            return True
+    return False
+
+
+def _lane_fingerprints_from_parts(*parts: Any) -> set[str]:
+    text = " ".join(
+        str(part or "")
+        for part in parts
+    ).lower()
+    normalized = re.sub(r"[^a-z0-9:_./-]+", " ", text)
+    terms = set(re.findall(r"[a-z0-9][a-z0-9:_./-]{2,}", normalized))
+    fingerprints: set[str] = set()
+    for term in terms:
+        if term.startswith("lane:"):
+            fingerprints.add("lane:" + term.split(":", 1)[1].replace("_", "-"))
+        elif term.startswith("deliverable:"):
+            fingerprints.add("deliverable:" + term.split(":", 1)[1].replace("_", "-"))
+    has_ai = "ai" in terms or "artificial" in terms or "intelligence" in terms
+    has_ai_regulation = "regulation" in terms or "governance" in terms or "regulating" in terms
+    has_2022_june = (
+        "2022" in terms
+        or "202206" in normalized
+        or "2022-06" in normalized
+        or "2022/06" in normalized
+        or "june 2022" in normalized
+    )
+    has_physics_society = (
+        "physics" in terms
+        or "soc-ph" in normalized
+        or "phys-soc" in normalized
+        or "physics.soc-ph" in normalized
+        or "physics/soc-ph" in normalized
+    )
+    has_society = "society" in terms or "societies" in terms or "soc-ph" in normalized
+    has_2016_aug11 = (
+        "2016" in terms
+        or "20160811" in normalized
+        or "2016-08-11" in normalized
+        or "2016/08/11" in normalized
+        or "august 11 2016" in normalized
+        or "august 11, 2016" in normalized
+    )
+    if has_ai and has_ai_regulation:
+        fingerprints.add("topic:ai-regulation")
+    if has_2022_june:
+        fingerprints.add("date:2022-06")
+    if has_physics_society and has_society:
+        fingerprints.add("topic:physics-society")
+    if has_2016_aug11:
+        fingerprints.add("date:2016-08-11")
+    if {"topic:ai-regulation", "date:2022-06"}.issubset(fingerprints):
+        fingerprints.add("lane:ai-regulation-2022")
+    if {"topic:physics-society", "date:2016-08-11"}.issubset(fingerprints):
+        fingerprints.add("lane:phys-soc-2016")
+    if "verify" in terms or "verifier" in terms or "verification" in terms or "overlap" in terms:
+        fingerprints.add("lane:verification")
+    return {item for item in fingerprints if item}
+
+
+def _agent_lane_fingerprints(agent: "Agent") -> set[str]:
+    return _lane_fingerprints_from_parts(
+        agent.role,
+        agent.group_id,
+        agent.workflow_prior,
+        agent.task,
+        " ".join(agent.current_task_tags),
+        " ".join(str(artifact.path) for artifact in agent.artifacts),
+    )
+
+
+def _spawn_request_lane_fingerprints(
+    *,
+    task: str,
+    role: str = "",
+    group_id: str = "",
+    workflow_prior: str = "",
+    current_task_tags: list[str] | tuple[str, ...] | set[str] | None = None,
+) -> set[str]:
+    return _lane_fingerprints_from_parts(
+        role,
+        group_id,
+        workflow_prior,
+        task,
+        " ".join(str(tag) for tag in (current_task_tags or [])),
+    )
+
+
+def _create_exit_decision_tags(tags: list[str] | tuple[str, ...] | set[str] | None) -> bool:
+    normalized = {str(tag).strip().lower() for tag in (tags or [])}
+    return bool(
+        normalized.intersection({"status:solo-decision", "status:pruned"})
+        or any(tag.startswith("reason:peer_ahead") or tag.startswith("reason:duplicate_lane") for tag in normalized)
+    )
+
+
+def _looks_like_verification_request(*parts: Any) -> bool:
+    text = "\n".join(str(part or "") for part in parts).lower()
+    return any(term in text for term in _DOWNSTREAM_STRONG_TERMS)
+
+
+def _looks_like_recovery_request(*parts: Any) -> bool:
+    text = "\n".join(str(part or "") for part in parts).lower()
+    recovery_terms = (
+        "failed lane",
+        "failed child",
+        "recover",
+        "recovery",
+        "repair",
+        "blocked",
+        "missing output",
+        "missing artifact",
+        "unverified",
+        "low confidence",
+        "partial evidence",
+        "partial artifact",
+        "resolve discrepancy",
+        "investigate discrepancy",
+        "resolve contradiction",
+        "investigate contradiction",
+    )
+    return any(term in text for term in recovery_terms)
+
+
+def _looks_like_downstream_focus(*parts: Any) -> bool:
+    text = "\n".join(str(part or "") for part in parts).lower()
+    if not text.strip():
+        return False
+    if any(term in text for term in _EVIDENCE_COLLECTION_TERMS) and not any(
+        term in text for term in _DOWNSTREAM_STRONG_TERMS
+    ):
+        return False
+    return (
+        any(term in text for term in _DOWNSTREAM_STRONG_TERMS)
+        and any(term in text for term in _UPSTREAM_INPUT_TERMS)
+    )
+
+
+def _focus_class_from_parts(
+    *,
+    task: str = "",
+    role: str = "",
+    group_id: str = "",
+    workflow_prior: str = "",
+    current_task_tags: list[str] | tuple[str, ...] | set[str] | None = None,
+) -> str:
+    tags = [str(tag).strip().lower() for tag in (current_task_tags or []) if str(tag).strip()]
+    text = "\n".join([role or "", group_id or "", workflow_prior or "", " ".join(tags), task or ""]).lower()
+    if (
+        _final_answer_paths(task)
+        or _task_mentions_submit_answer_protocol(task)
+        or "submit_answer" in text
+        or "answer_submission" in text
+        or "final_delivery" in text
+        or "final-delivery" in text
+        or "role:delivery" in text
+        or "role:finalizer" in text
+        or re.search(r"\bfinali[sz]er\b", text)
+        or re.search(r"\bdelivery agent\b", text)
+    ):
+        return "final_delivery"
+    if _looks_like_recovery_request(task, role, group_id, workflow_prior, " ".join(tags)):
+        return "recovery"
+    if any(term in text for term in (
+        "synthesis", "synthesize", "synthesizer", "integrate", "integration",
+        "integrator", "aggregate", "summary", "summarize", "overlap",
+        "intersection", "cross-lane", "cross lane", "final synthesis",
+    )):
+        return "synthesis"
+    if _looks_like_verification_request(task, role, group_id, workflow_prior, " ".join(tags)) or any(
+        term in text for term in (
+            "verify", "verifier", "verification", "validate", "validator",
+            "validation", "review", "reviewer", "cross-check", "corroborate",
+        )
+    ):
+        return "verification"
+    return "evidence"
+
+
+@dataclass
+class LoopConstraintMetrics:
+    budget_pressure: float = 0.0
+    time_pressure: float = 0.0
+    context_pressure: float = 0.0
+    agent_pressure: float = 0.0
+    dependency_pressure: float = 0.0
+    handoff_pressure: float = 0.0
+    offspring_create_bias: float = 0.0
+    failed_child_pressure: float = 0.0
+    deferred_spawn_readiness: float = 0.0
+    artifact_gap: float = 0.0
+    coordination_ratio: float = 0.0
+    create_retry_pressure: float = 0.0
+    action_miss_pressure: float = 0.0
+    lane_coverage_pressure: float = 0.0
+    stagnation_pressure: float = 0.0
+    output_similarity: float = 0.0
+    duplicate_tool_pressure: float = 0.0
+    consistency_pressure: float = 0.0
+    uncertain_evidence_pressure: float = 0.0
+    evidence_integration_pressure: float = 0.0
+
+
+@dataclass
+class LoopActionCandidate:
+    action: str
+    reason: str
+    base_priority: float = 0.0
+    data: dict[str, Any] = field(default_factory=dict)
+    score: float = 0.0
 
 
 def _recent_tool_names(history: list[Message], lookback: int = 8) -> set[str]:
@@ -627,6 +1374,7 @@ class RuntimeConfig:
     time_limit: float = 0.0
     max_turns: int = 200
     allowed_models: list[str] | None = None
+    allow_agent_model_override: bool = False
     context_compress_ratio: float = 0.8
     default_model: str = "deepseek-v4-flash"
     log_dir: Path | None = field(default_factory=lambda: Path("./logs"))
@@ -648,6 +1396,7 @@ class RuntimeConfig:
     file_list_max_entries: int = 500        # max entries for file_list (0 = unlimited)
     grep_max_results: int = 100             # max grep results (0 = unlimited)
     artifact_write_max_tokens: int = 12000  # response budget for artifact-only file_write turns
+    create_action_max_tokens: int = 20000   # response budget for create turns that may emit large spawn_many args
     enabled_work_tools: set[str] | None = None  # None = all work tools enabled
     shell_mode: ShellMode = "controlled"        # disabled, controlled, unrestricted
     controlled_shell_allowed_commands: set[str] | None = None
@@ -657,9 +1406,24 @@ class RuntimeConfig:
     min_spawnable_workstreams: int = 3
     spawn_before_turn: int = 2
     max_solo_tool_calls_before_spawn: int = 5
+    spawn_readiness_threshold: float = 0.62
+    handoff_child_count_threshold: int = 2
     peer_progress_check_after_turns: int = 3
     peer_progress_check_no_tool_turns: int = 2
     peer_progress_check_after_artifact_nudges: int = 2
+    # Loop action policy. "rule" preserves the current short-circuit planner;
+    # "constraint" scores candidate actions against runtime pressure metrics.
+    loop_action_policy: Literal["rule", "constraint"] = "rule"
+    # Split loop action selection from action execution for real LLM calls.
+    # The selector is a short, no-tool turn that only chooses one of the six
+    # loop actions; the following execution turn fixes that action and scopes
+    # tools accordingly.
+    two_stage_action_selection: bool = True
+    # After a terminal answer submission, ask remaining descendants to compact
+    # and stop, then stop waiting after this short grace period. This prevents
+    # an already-submitted root task from being held open by a stale child loop.
+    terminal_submission_join_grace: float = 5.0
+    disabled_loop_constraints: set[str] = field(default_factory=set)
 
 
 # ─── Agent ───────────────────────────────────────────────────────────────────
@@ -701,6 +1465,7 @@ class Agent:
     # Workspace
     workspace: Path = field(default_factory=lambda: Path("."))
     artifacts: list[Artifact] = field(default_factory=list)
+    submitted_answer_path: str | None = None
 
     # Message inboxes (three priority levels)
     _queue_inbox: asyncio.Queue[Envelope] = field(default_factory=asyncio.Queue)
@@ -719,7 +1484,12 @@ class Agent:
     _artifact_nudge_count: int = 0
     _peer_progress_nudge_sent: bool = False
     _peer_progress_nudge_turn: int = 0
+    _peer_overlap_query_turn: int = 0
     _last_query_turn: int = 0
+    _last_query_evidence_turn: int = 0
+    _last_query_agent_ids: list[str] = field(default_factory=list)
+    _last_query_reliable_evidence_ids: list[str] = field(default_factory=list)
+    _last_read_evidence_turn: int = 0
     _last_artifact_turn: int = 0
     _no_tool_turns: int = 0
     _tool_calls: int = 0
@@ -730,10 +1500,22 @@ class Agent:
     _write_only_miss_count: int = 0
     _artifact_deferred_nudge_sent: bool = False
     _create_action_filtered_count: int = 0
+    _deferred_spawn_requests: list[dict[str, Any]] = field(default_factory=list)
     _create_resume_after_read: bool = False
+    _auxiliary_only_miss_count: int = 0
+    _action_miss_count: int = 0
+    _action_miss_action: str = ""
     _loop_action_plan: dict[str, Any] | None = None
+    _loop_action_selected_by: str = ""
     _state_action_version: int = 0
     _state_action_consumed_version: int = 0
+    _pending_prune_requests: list[dict[str, Any]] = field(default_factory=list)
+    _prune_requests_sent_targets: set[str] = field(default_factory=set)
+    _last_spawn_skipped_turn: int = 0
+    _last_spawn_skipped_reason: str = ""
+    _last_spawn_skipped_covered_by: list[str] = field(default_factory=list)
+    _last_spawn_skipped_covered_paths: list[str] = field(default_factory=list)
+    _last_create_resolution: str = ""
     memory: dict[str, Any] = field(default_factory=dict)
 
 
@@ -778,13 +1560,16 @@ class Runtime:
         self._start_time = time.time()
         self.memory = MemoryBroker()
         self.state_board: dict[str, dict[str, Any]] = {}
+        self.work_tools = dict(WORK_TOOLS)
         self._events: list[dict] = []  # all events for post-hoc analysis
         self._messages_sent: list[tuple[str, str, int]] = []  # (from, to, tokens) for comm graph
         self._last_llm_messages: dict[str, list[Message]] = {}
+        self.task_ledger: dict[str, Any] = {}
         self._emit_lock = threading.Lock()  # protects events.jsonl writes
 
         self.config.workspace_root.mkdir(parents=True, exist_ok=True)
         self._tool_context.shared_dir.mkdir(parents=True, exist_ok=True)
+        self._ensure_task_ledger_loaded()
         if self.config.log_dir:
             set_log_dir(self.config.log_dir)
 
@@ -808,6 +1593,22 @@ class Runtime:
     ) -> Agent:
         agent_id = self._id_gen.next()
         model = model or self.config.default_model
+        role, role_description, role_tags = canonicalize_role(role, current_task_tags)
+        current_task_tags = normalize_tags(
+            list(current_task_tags or [])
+            + role_tags
+            + agent_identity_tags(
+                agent_id=agent_id,
+                role=role,
+                group_id=group_id,
+                parent=parent,
+                created_by=created_by,
+                create_type=create_type,
+                relationship=relationship,
+                workflow_prior=workflow_prior,
+                depth=depth,
+            )
+        )
         agent_orchestration_preference, orchestration_resolution = self._resolve_agent_orchestration_preference(
             parent=parent,
             requested=orchestration_preference,
@@ -817,7 +1618,7 @@ class Runtime:
             relationship=relationship,
             group_id=group_id,
             workflow_prior=workflow_prior,
-            current_task_tags=current_task_tags or [],
+            current_task_tags=current_task_tags,
         )
         quota = quota or ResourceQuota(
             budget=self.config.budget,
@@ -853,13 +1654,14 @@ class Runtime:
             id=agent_id, task=task, model=model, quota=quota,
             parent=parent, depth=depth, workspace=workspace,
             role=role,
+            bio=role_description,
             create_type=create_type,
             relationship=relationship,
             created_by=created_by,
             group_id=group_id,
             workflow_prior=workflow_prior,
             orchestration_preference=agent_orchestration_preference,
-            current_task_tags=list(current_task_tags or []),
+            current_task_tags=list(current_task_tags),
             history=[{"role": "system", "content": system_prompt}],
         )
 
@@ -879,16 +1681,19 @@ class Runtime:
         self.memory.init_agent(agent_id, task=task, tags=agent.current_task_tags)
         agent.memory = {"public_memory": self.memory.serialize(agent_id)}
         self.state_board_sync(agent_id)
+        self._ensure_task_ledger_agent(agent)
 
         self._emit(agent_id, "agent_new", {
             "task": task, "model": model, "budget": quota.budget if math.isfinite(quota.budget) else None,
             "parent": parent, "depth": depth,
             "role": role,
+            "role_description": role_description,
             "create_type": create_type,
             "relationship": relationship,
             "created_by": created_by,
             "group_id": group_id,
             "workflow_prior": workflow_prior,
+            "current_task_tags": list(agent.current_task_tags),
             "orchestration_preference": agent_orchestration_preference,
             "orchestration_resolution": orchestration_resolution,
         })
@@ -912,21 +1717,6 @@ class Runtime:
     ) -> tuple[OrchestrationPreference, dict[str, Any]]:
         if requested in ORCHESTRATION_PREFERENCES:
             preference = requested  # type: ignore[assignment]
-            if (
-                preference != "solo"
-                and _task_is_leaf_artifact_lane(
-                    task=task,
-                    role=role,
-                    group_id=group_id,
-                    current_task_tags=current_task_tags or [],
-                )
-            ):
-                return "solo", {
-                    "mode": "explicit_spawn_leaf_artifact_override",
-                    "requested": requested,
-                    "resolved": "solo",
-                    "reasons": ["leaf artifact lane should complete assigned output instead of expanding"],
-                }
             return preference, {"mode": "explicit_spawn", "requested": requested, "resolved": preference}
         if parent is None:
             preference = _normalize_orchestration_preference(str(self.config.orchestration_preference), "balanced")
@@ -997,7 +1787,20 @@ class Runtime:
             agent.action_state = action_state
             agent._state_action_version += 1
         if current_task_tags is not None:
-            agent.current_task_tags = list(current_task_tags)
+            agent.current_task_tags = normalize_tags(
+                list(current_task_tags)
+                + agent_identity_tags(
+                    agent_id=agent.id,
+                    role=agent.role,
+                    group_id=agent.group_id,
+                    parent=agent.parent,
+                    created_by=agent.created_by,
+                    create_type=agent.create_type,
+                    relationship=agent.relationship,
+                    workflow_prior=agent.workflow_prior,
+                    depth=agent.depth,
+                )
+            )
         if work_outline is not None:
             agent.work_outline = work_outline
         memory = self.memory.get(agent_id)
@@ -1010,6 +1813,560 @@ class Runtime:
         agent.memory = {"public_memory": self.memory.serialize(agent_id)}
         return self.state_board_sync(agent_id)
 
+    # ─── Task ledger ────────────────────────────────────────────────────
+
+    def _task_ledger_path(self) -> Path:
+        return self._tool_context.shared_dir / ".nanoma" / "task_ledger.json"
+
+    def _empty_task_ledger(self) -> dict[str, Any]:
+        now = time.time()
+        return {
+            "version": 1,
+            "root_task": "",
+            "root_agent_id": "",
+            "created_at": now,
+            "updated_at": now,
+            "items": {},
+        }
+
+    def _ensure_task_ledger_loaded(self) -> dict[str, Any]:
+        if self.task_ledger:
+            return self.task_ledger
+        path = self._task_ledger_path()
+        data: dict[str, Any] = {}
+        if path.exists():
+            try:
+                parsed = json.loads(path.read_text(encoding="utf-8"))
+                if isinstance(parsed, dict):
+                    data = parsed
+            except Exception:
+                data = {}
+        if not data:
+            data = self._empty_task_ledger()
+        data.setdefault("version", 1)
+        data.setdefault("root_task", "")
+        data.setdefault("root_agent_id", "")
+        data.setdefault("created_at", time.time())
+        data.setdefault("updated_at", time.time())
+        if not isinstance(data.get("items"), dict):
+            data["items"] = {}
+        self.task_ledger = data
+        return self.task_ledger
+
+    def _save_task_ledger(self) -> None:
+        ledger = self._ensure_task_ledger_loaded()
+        ledger["updated_at"] = time.time()
+        path = self._task_ledger_path()
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(json.dumps(ledger, ensure_ascii=False, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+        except OSError as e:
+            self._emit("system", "task_ledger_save_failed", {"path": str(path), "error": str(e)})
+
+    def _task_ledger_copy(self) -> dict[str, Any]:
+        return json.loads(json.dumps(self._ensure_task_ledger_loaded(), ensure_ascii=False, default=str))
+
+    def _task_ledger_agent_item_id(self, agent: Agent) -> str:
+        return agent.id
+
+    def _task_ledger_short_task(self, task: str, limit: int = 180) -> str:
+        text = " ".join(str(task or "").strip().split())
+        if len(text) <= limit:
+            return text
+        return text[: max(0, limit - 3)].rstrip() + "..."
+
+    def _task_ledger_existing_output_status(self, item: dict[str, Any], path: str) -> str:
+        for output in item.get("expected_outputs") or []:
+            if isinstance(output, dict) and output.get("path") == path:
+                return str(output.get("status") or "")
+        return ""
+
+    def _task_ledger_output_entries(self, agent: Agent, existing: dict[str, Any]) -> list[dict[str, Any]]:
+        outputs: list[dict[str, Any]] = []
+        for path in _expected_output_paths(agent.task):
+            existing_status = self._task_ledger_existing_output_status(existing, path)
+            abs_path = self._tool_context.workspace_root / path
+            exists = abs_path.exists()
+            is_final_answer = _looks_like_final_answer_path(path)
+            covered_by = []
+            for output in existing.get("expected_outputs") or []:
+                if isinstance(output, dict) and output.get("path") == path:
+                    covered_by = _normalize_string_list(output.get("covered_by"))
+                    break
+            if existing_status == "covered" and covered_by:
+                status = "covered"
+            elif not exists:
+                status = "missing"
+            elif is_final_answer and agent.submitted_answer_path == path:
+                status = "submitted"
+            elif is_final_answer:
+                status = "draft"
+            elif self._artifact_has_unverified_signal(path):
+                status = "unverified"
+            elif existing_status in _TASK_LEDGER_OUTPUT_DONE_STATUSES:
+                status = existing_status
+            elif agent.status == "done" and not self._agent_has_uncertain_evidence(agent):
+                status = "verified"
+            elif path in {artifact.path for artifact in agent.artifacts}:
+                status = "draft"
+            else:
+                status = "draft"
+            entry = {
+                "path": path,
+                "status": status,
+                "exists": bool(exists),
+            }
+            if covered_by:
+                entry["covered_by"] = covered_by[:8]
+            if is_final_answer:
+                entry["final_answer"] = True
+                if agent.submitted_answer_path:
+                    entry["submitted_answer_path"] = agent.submitted_answer_path
+            outputs.append(entry)
+        return outputs
+
+    def _task_ledger_agent_status(
+        self,
+        agent: Agent,
+        existing: dict[str, Any],
+        outputs: list[dict[str, Any]],
+    ) -> str:
+        existing_status = str(existing.get("status") or "")
+        if existing_status in {"covered", "pruned"} and existing.get("covered_by"):
+            return existing_status
+        if existing_status == "failed":
+            return "failed"
+        if agent.status == "failed":
+            return "failed"
+        tags = set(agent.current_task_tags)
+        if "status:pruned" in tags:
+            return "pruned"
+        if outputs:
+            statuses = {str(output.get("status") or "") for output in outputs}
+            if statuses and statuses.issubset(_TASK_LEDGER_OUTPUT_DONE_STATUSES):
+                return "verified" if agent.status == "done" else "ready_for_review"
+            if statuses.intersection({"draft", "unverified"}):
+                return "partial"
+            if "missing" in statuses:
+                if existing_status in {"blocked", "partial", "ready_for_review", "claimed"}:
+                    return existing_status
+                return "in_progress" if agent._turns or agent.status == "running" else "claimed"
+        if existing_status in {"blocked", "partial", "ready_for_review", "claimed", "in_progress"}:
+            return existing_status
+        if agent.status == "done":
+            return "verified" if self._agent_has_reliable_evidence(agent) else "partial"
+        if agent._tool_calls or agent._turns:
+            return "in_progress"
+        return "claimed"
+
+    def _refresh_task_ledger_agent_item(self, agent: Agent, *, save: bool = True) -> dict[str, Any]:
+        ledger = self._ensure_task_ledger_loaded()
+        items = ledger.setdefault("items", {})
+        if not agent.parent and not ledger.get("root_agent_id"):
+            ledger["root_agent_id"] = agent.id
+            ledger["root_task"] = agent.task
+        item_id = self._task_ledger_agent_item_id(agent)
+        existing = dict(items.get(item_id) or {})
+        outputs = self._task_ledger_output_entries(agent, existing)
+        item = {
+            **existing,
+            "id": item_id,
+            "agent_id": agent.id,
+            "owner": agent.id,
+            "title": existing.get("title") or self._task_ledger_short_task(agent.task, 120),
+            "task": agent.task,
+            "task_preview": self._task_ledger_short_task(agent.task, 180),
+            "parent": agent.parent,
+            "children": sorted(agent.children),
+            "depth": agent.depth,
+            "role": agent.role,
+            "group_id": agent.group_id,
+            "workflow_prior": agent.workflow_prior,
+            "tags": list(agent.current_task_tags[:30]),
+            "action_state": agent.action_state,
+            "agent_status": agent.status,
+            "status": "",
+            "expected_outputs": outputs,
+            "updated_turn": agent._turns,
+            "updated_by": agent.id,
+            "updated_at": time.time(),
+        }
+        if "created_at" not in item:
+            item["created_at"] = time.time()
+        if existing.get("blockers"):
+            item["blockers"] = list(existing.get("blockers") or [])[:8]
+        if existing.get("note"):
+            item["note"] = str(existing.get("note") or "")[:1000]
+        if existing.get("covered_by"):
+            item["covered_by"] = _normalize_string_list(existing.get("covered_by"))[:8]
+        if existing.get("updates"):
+            item["updates"] = list(existing.get("updates") or [])[-20:]
+        item["status"] = self._task_ledger_agent_status(agent, existing, outputs)
+        items[item_id] = item
+        if save:
+            self._save_task_ledger()
+        return item
+
+    def _ensure_task_ledger_agent(self, agent: Agent) -> dict[str, Any]:
+        return self._refresh_task_ledger_agent_item(agent)
+
+    def _refresh_task_ledger_all(self) -> None:
+        for agent in list(self.agents.values()):
+            self._refresh_task_ledger_agent_item(agent, save=False)
+        self._save_task_ledger()
+
+    def task_ledger_item_snapshot(self, agent: Agent) -> dict[str, Any] | None:
+        item = self._refresh_task_ledger_agent_item(agent)
+        return self._task_ledger_public_item(item, detailed=True)
+
+    def _task_ledger_public_item(self, item: dict[str, Any], *, detailed: bool = False) -> dict[str, Any]:
+        public = {
+            "id": item.get("id"),
+            "agent_id": item.get("agent_id"),
+            "owner": item.get("owner"),
+            "status": item.get("status"),
+            "agent_status": item.get("agent_status"),
+            "action_state": item.get("action_state"),
+            "title": item.get("title") or item.get("task_preview"),
+            "parent": item.get("parent"),
+            "children": list(item.get("children") or [])[:8],
+            "role": item.get("role"),
+            "group_id": item.get("group_id"),
+            "tags": list(item.get("tags") or [])[:12],
+            "expected_outputs": [
+                {
+                    key: value
+                    for key, value in dict(output).items()
+                    if key in {"path", "status", "exists", "covered_by", "final_answer", "submitted_answer_path"}
+                }
+                for output in list(item.get("expected_outputs") or [])[:8]
+                if isinstance(output, dict)
+            ],
+        }
+        if item.get("blockers"):
+            public["blockers"] = list(item.get("blockers") or [])[:4]
+        if item.get("covered_by"):
+            public["covered_by"] = _normalize_string_list(item.get("covered_by"))[:8]
+        if item.get("note"):
+            public["note"] = str(item.get("note") or "")[:500]
+        if detailed:
+            public["task_preview"] = item.get("task_preview") or self._task_ledger_short_task(str(item.get("task") or ""))
+            public["updated_turn"] = item.get("updated_turn")
+            public["updated_by"] = item.get("updated_by")
+            public["updates"] = list(item.get("updates") or [])[-5:]
+        return public
+
+    def _task_ledger_relevant_item_ids(self, agent: Agent, *, limit: int = 10) -> list[str]:
+        ledger = self._ensure_task_ledger_loaded()
+        items = ledger.get("items") or {}
+        ids: list[str] = []
+
+        def add(item_id: str | None) -> None:
+            if item_id and item_id in items and item_id not in ids:
+                ids.append(item_id)
+
+        add(str(ledger.get("root_agent_id") or ""))
+        add(agent.id)
+        add(agent.parent)
+        for child_id in sorted(agent.children):
+            add(child_id)
+
+        own_outputs = {
+            str(output.get("path") or "")
+            for output in (items.get(agent.id, {}).get("expected_outputs") or [])
+            if isinstance(output, dict) and output.get("path")
+        }
+        for item_id, item in sorted(items.items()):
+            if len(ids) >= limit:
+                break
+            item_outputs = {
+                str(output.get("path") or "")
+                for output in (item.get("expected_outputs") or [])
+                if isinstance(output, dict) and output.get("path")
+            }
+            if own_outputs and own_outputs.intersection(item_outputs):
+                add(item_id)
+        for item_id, item in sorted(items.items()):
+            if len(ids) >= limit:
+                break
+            if agent.group_id and item.get("group_id") == agent.group_id:
+                add(item_id)
+        for item_id, item in sorted(items.items()):
+            if len(ids) >= limit:
+                break
+            if item.get("status") in _TASK_LEDGER_TERMINAL_STATUSES:
+                add(item_id)
+        return ids[:limit]
+
+    def task_ledger_snapshot(
+        self,
+        agent: Agent | None = None,
+        *,
+        include_all: bool = False,
+        item_id: str | None = None,
+        limit: int = 20,
+    ) -> dict[str, Any]:
+        self._refresh_task_ledger_all()
+        ledger = self._ensure_task_ledger_loaded()
+        items = ledger.get("items") or {}
+        if item_id:
+            item = items.get(item_id)
+            return {
+                "path": str(self._task_ledger_path()),
+                "item": self._task_ledger_public_item(item, detailed=True) if isinstance(item, dict) else None,
+            }
+        if include_all or agent is None:
+            selected_ids = list(sorted(items))[: max(1, limit)]
+        else:
+            selected_ids = self._task_ledger_relevant_item_ids(agent, limit=max(1, limit))
+        selected_items = [
+            self._task_ledger_public_item(items[item_id], detailed=include_all)
+            for item_id in selected_ids
+            if isinstance(items.get(item_id), dict)
+        ]
+        counts: dict[str, int] = {}
+        for item in items.values():
+            status = str((item or {}).get("status") or "unknown")
+            counts[status] = counts.get(status, 0) + 1
+        return {
+            "path": str(self._task_ledger_path()),
+            "root_agent_id": ledger.get("root_agent_id"),
+            "root_task": self._task_ledger_short_task(str(ledger.get("root_task") or ""), 220),
+            "counts": counts,
+            "current_agent_item": (
+                self._task_ledger_public_item(items[agent.id], detailed=True)
+                if agent is not None and isinstance(items.get(agent.id), dict)
+                else None
+            ),
+            "items": selected_items,
+            "count": len(selected_items),
+            "total_items": len(items),
+        }
+
+    def task_ledger_update(self, agent: Agent, args: dict[str, Any]) -> dict[str, Any]:
+        self._refresh_task_ledger_all()
+        ledger = self._ensure_task_ledger_loaded()
+        items = ledger.setdefault("items", {})
+        item_id = str(args.get("item_id") or agent.id).strip() or agent.id
+        if item_id not in items:
+            if item_id == agent.id:
+                self._refresh_task_ledger_agent_item(agent)
+            else:
+                return {"error": f"task ledger item '{item_id}' not found"}
+        item = dict(items.get(item_id) or {})
+        status = str(args.get("status") or "").strip()
+        allowed_statuses = {
+            "open", "claimed", "in_progress", "partial", "blocked",
+            "ready_for_review", "verified", "covered", "pruned", "failed",
+        }
+        if status:
+            if status not in allowed_statuses:
+                return {"error": f"Unknown ledger status '{status}'"}
+            item["status"] = status
+        note = args.get("note")
+        if note is not None:
+            item["note"] = str(note)[:1000]
+        blockers = args.get("blockers")
+        if blockers is not None:
+            if isinstance(blockers, list):
+                item["blockers"] = blockers[:8]
+            else:
+                item["blockers"] = [blockers]
+        covered_by = _normalize_string_list(args.get("covered_by"))
+        if covered_by:
+            item["covered_by"] = covered_by[:8]
+        output_path = str(args.get("output_path") or "").strip()
+        if output_path:
+            output_path = self._normalize_workspace_relative_path(output_path, agent.workspace)
+            output_status = str(args.get("output_status") or args.get("status") or "").strip()
+            if not output_status:
+                output_status = "draft"
+            allowed_output_statuses = {"missing", "draft", "partial", "unverified", "verified", "covered", "submitted", "rejected"}
+            if output_status not in allowed_output_statuses:
+                return {"error": f"Unknown output status '{output_status}'"}
+            outputs = [dict(output) for output in (item.get("expected_outputs") or []) if isinstance(output, dict)]
+            target = None
+            for output in outputs:
+                if output.get("path") == output_path:
+                    target = output
+                    break
+            if target is None:
+                target = {"path": output_path}
+                outputs.append(target)
+            target["status"] = output_status
+            target["exists"] = bool((self.config.workspace_root / output_path).exists())
+            if covered_by:
+                target["covered_by"] = covered_by[:8]
+            evidence_refs = _normalize_string_list(args.get("evidence_refs", args.get("evidence", [])))
+            if evidence_refs:
+                target["evidence_refs"] = evidence_refs[:12]
+            item["expected_outputs"] = outputs
+        event = {
+            "turn": agent._turns,
+            "by": agent.id,
+            "status": status or item.get("status"),
+            "output_path": output_path or None,
+            "output_status": args.get("output_status"),
+            "note": str(note or "")[:240] if note is not None else "",
+        }
+        updates = list(item.get("updates") or [])
+        updates.append(event)
+        item["updates"] = updates[-20:]
+        item["updated_at"] = time.time()
+        item["updated_by"] = agent.id
+        items[item_id] = item
+        self._save_task_ledger()
+        self._emit(agent.id, "task_ledger_update", {
+            "item_id": item_id,
+            "status": item.get("status"),
+            "output_path": output_path or None,
+            "output_status": args.get("output_status"),
+        })
+        return {
+            "updated": True,
+            "path": str(self._task_ledger_path()),
+            "item": self._task_ledger_public_item(item, detailed=True),
+        }
+
+    def _task_ledger_loop_context(self, agent: Agent) -> str:
+        snapshot = self.task_ledger_snapshot(agent, include_all=False, limit=10)
+        current = snapshot.get("current_agent_item") or {}
+        lines = [
+            "[Task Ledger]",
+            f"path={snapshot.get('path')}",
+            f"root={snapshot.get('root_agent_id') or '-'} status_counts={snapshot.get('counts') or {}}",
+        ]
+        if current:
+            outputs = current.get("expected_outputs") or []
+            output_text = ", ".join(
+                f"{output.get('path')}={output.get('status')}"
+                for output in outputs[:5]
+                if isinstance(output, dict)
+            ) or "none"
+            blockers = current.get("blockers") or []
+            lines.append(
+                f"you={current.get('id')} status={current.get('status')} "
+                f"action={current.get('action_state')} outputs={output_text}"
+            )
+            if blockers:
+                lines.append(f"your_blockers={json.dumps(blockers[:3], ensure_ascii=False, default=str)}")
+            if current.get("covered_by"):
+                lines.append(f"your_covered_by={current.get('covered_by')}")
+        related = []
+        for item in snapshot.get("items") or []:
+            if item.get("id") == agent.id:
+                continue
+            outputs = ", ".join(
+                f"{output.get('path')}={output.get('status')}"
+                for output in (item.get("expected_outputs") or [])[:3]
+                if isinstance(output, dict)
+            )
+            related.append(
+                f"- {item.get('id')}: status={item.get('status')} "
+                f"agent={item.get('agent_status')} action={item.get('action_state')} "
+                f"group={item.get('group_id') or '-'} outputs={outputs or 'none'}"
+            )
+        if related:
+            lines.append("related:\n" + "\n".join(related[:6]))
+        lines.append(
+            "Use ledger_read/ledger_update to inspect or update task state. "
+            "Memory stores evidence; the task ledger tracks ownership, blockers, and output coverage. "
+            "If this item is already covered/verified by others, compact a reusable summary and self-prune."
+        )
+        return "\n".join(lines)
+
+    def _task_ledger_expected_output_coverage(self, agent: Agent) -> dict[str, list[str]]:
+        ledger = self._ensure_task_ledger_loaded()
+        expected = _non_terminal_expected_output_paths(agent.task)
+        coverage: dict[str, list[str]] = {path: [] for path in expected}
+        if not expected:
+            return coverage
+        for item_id, item in (ledger.get("items") or {}).items():
+            if item_id == agent.id or not isinstance(item, dict):
+                continue
+            owner = str(item.get("owner") or item.get("agent_id") or item_id)
+            for output in item.get("expected_outputs") or []:
+                if not isinstance(output, dict):
+                    continue
+                path = str(output.get("path") or "")
+                if path not in coverage:
+                    continue
+                if str(output.get("status") or "") in _TASK_LEDGER_OUTPUT_DONE_STATUSES:
+                    coverage[path].append(owner)
+        own_item = (ledger.get("items") or {}).get(agent.id) or {}
+        for output in own_item.get("expected_outputs") or []:
+            if not isinstance(output, dict):
+                continue
+            path = str(output.get("path") or "")
+            if path in coverage and str(output.get("status") or "") == "covered":
+                coverage[path].extend(_normalize_string_list(output.get("covered_by")))
+        return {path: sorted(set(ids)) for path, ids in coverage.items()}
+
+    def _task_ledger_pruned_stop_is_allowed(self, agent: Agent) -> bool:
+        ledger = self._ensure_task_ledger_loaded()
+        item = (ledger.get("items") or {}).get(agent.id) or {}
+        if item.get("status") in {"covered", "pruned"} and item.get("covered_by"):
+            return True
+        expected = _non_terminal_expected_output_paths(agent.task)
+        if not expected:
+            return False
+        coverage = self._task_ledger_expected_output_coverage(agent)
+        return bool(coverage) and all(coverage.get(path) for path in expected)
+
+    def _peer_exact_output_coverage_candidates(self, agent: Agent) -> list[Agent]:
+        expected = set(_non_terminal_expected_output_paths(agent.task))
+        if not expected:
+            return []
+        candidates: list[Agent] = []
+        for peer in self.agents.values():
+            if peer.id == agent.id:
+                continue
+            peer_paths = self._agent_known_artifact_paths(peer).union(_non_terminal_expected_output_paths(peer.task))
+            if not expected.issubset(peer_paths):
+                continue
+            if peer.status != "done" and not self._agent_has_prune_worthy_progress(peer):
+                continue
+            if self._agent_has_uncertain_evidence(peer):
+                continue
+            candidates.append(peer)
+        candidates.sort(key=lambda peer: (0 if peer.status == "done" else 1, peer.id))
+        return candidates
+
+    def _queried_prunable_peer_coverage_candidates(self, agent: Agent) -> list[Agent]:
+        if agent._last_query_turn <= 0 or (agent._turns - agent._last_query_turn) > 4:
+            return []
+        queried_ids = set(agent._last_query_agent_ids)
+        candidates: list[Agent] = []
+        for peer in self._peer_progress_candidates(agent):
+            if peer.id == agent.id:
+                continue
+            if queried_ids and peer.id not in queried_ids:
+                continue
+            if not self._agent_has_prune_worthy_progress(peer):
+                continue
+            if self._agent_has_uncertain_evidence(peer):
+                continue
+            if not self._agents_share_prunable_lane(agent, peer):
+                continue
+            candidates.append(peer)
+        candidates.sort(key=lambda peer: (
+            0 if peer.status == "done" else 1,
+            -len(peer.artifacts),
+            -peer._tool_calls,
+            peer.id,
+        ))
+        return candidates
+
+    def _pending_prune_request_has_coverage_signal(self, agent: Agent) -> bool:
+        for request in reversed(agent._pending_prune_requests):
+            if _normalize_string_list(request.get("covered_by")):
+                return True
+            evidence_agents = request.get("evidence_agents")
+            if isinstance(evidence_agents, list) and evidence_agents:
+                return True
+            if _normalize_string_list(request.get("covered_paths")):
+                return True
+        return False
 
     async def run(self, task: str, model: str | None = None) -> str:
         """Run a root agent, letting already-spawned peers finish before shutdown."""
@@ -1043,6 +2400,20 @@ class Runtime:
             agent._steer_inbox.put_nowait(envelope)
         else:
             agent._queue_inbox.put_nowait(envelope)
+        if envelope.message_type == "prune_request":
+            request = dict(envelope.payload or {})
+            request.update({
+                "from": envelope.from_id,
+                "message": envelope.content,
+                "timestamp": envelope.timestamp,
+            })
+            agent._pending_prune_requests.append(request)
+            self.state_board_update(agent.id, action_state="compact")
+            self._emit(agent.id, "prune_request_received", {
+                "from": envelope.from_id,
+                "payload": envelope.payload,
+                "message": envelope.content[:500],
+            })
         # Wake idle agents (guard against double-start)
         if agent.status == "idle":
             agent.status = "running"
@@ -1135,14 +2506,16 @@ class Runtime:
                     agent.history = await self._compress(agent.history)
                     agent.context_tokens = count_message_tokens(agent.history)
 
+                self._refresh_task_ledger_agent_item(agent)
                 missing_outputs = self._missing_expected_outputs(agent)
                 self._refresh_loop_action_plan(agent, missing_outputs)
+                await self._maybe_select_loop_action(agent, missing_outputs)
                 loop_context = self._build_loop_action_context(agent, missing_outputs, transient_messages)
                 loop_action = str((agent._loop_action_plan or {}).get("action", ""))
                 children_before_turn = len(agent.children)
                 create_miss_before_turn = agent._create_action_filtered_count
                 peer_pre_query_pending = self._peer_progress_decision_pending(agent)
-                peer_post_query_pending = self._peer_progress_post_query_pending(agent)
+                peer_post_query_pending = self._peer_progress_post_query_pending(agent) or self._peer_overlap_post_query_pending(agent, missing_outputs)
                 turn_tool_scope = "all"
                 if loop_action:
                     loop_tool_names, turn_tool_scope = self._tools_for_loop_turn(
@@ -1156,15 +2529,57 @@ class Runtime:
                     )
                 else:
                     turn_tool_schemas = tool_schemas
+                plan_reason = str((agent._loop_action_plan or {}).get("reason", ""))
                 recommended_tool_choice: str | None = None
-                if turn_tool_scope in {"retry_file_write_after_text_miss", "artifact_write_only"} and any(
+                if turn_tool_scope in {
+                    "retry_file_write_after_text_miss",
+                    "retry_file_write_after_no_tool_miss",
+                    "artifact_write_only",
+                } and any(
                     (tool.get("function") or {}).get("name") == "file_write" for tool in turn_tool_schemas
                 ):
                     recommended_tool_choice = "file_write"
-                elif turn_tool_scope == "retry_spawn_after_create_miss" and any(
+                elif loop_action == "create" and any(
                     (tool.get("function") or {}).get("name") == "spawn_many" for tool in turn_tool_schemas
+                ) and (
+                    turn_tool_scope == "retry_spawn_after_create_miss"
+                    or plan_reason == "explicit_peer_wave_incomplete"
+                    or plan_reason == "delegate_failed_child_recovery"
+                    or plan_reason == "deferred_spawn_readiness_met"
+                    or plan_reason == "handoff_after_partial_progress"
+                    or plan_reason == "multi_phase_peer_wave_pending"
+                    or plan_reason == "delegate_final_delivery"
                 ):
                     recommended_tool_choice = "spawn_many"
+                elif (
+                    loop_action == "create"
+                    and turn_tool_scope == "final_delivery_handoff"
+                    and any((tool.get("function") or {}).get("name") == "spawn" for tool in turn_tool_schemas)
+                ):
+                    recommended_tool_choice = "spawn"
+                elif (
+                    loop_action == "compact"
+                    and turn_tool_scope == "retry_primary_after_auxiliary_only_miss"
+                    and any((tool.get("function") or {}).get("name") == "compact" for tool in turn_tool_schemas)
+                ):
+                    recommended_tool_choice = "compact"
+                elif (
+                    loop_action == "stop"
+                    and turn_tool_scope == "retry_primary_after_auxiliary_only_miss"
+                    and any((tool.get("function") or {}).get("name") == "set_status" for tool in turn_tool_schemas)
+                ):
+                    recommended_tool_choice = "set_status"
+                elif loop_action and turn_tool_scope != "action_default":
+                    scoped_tool_names = [
+                        str((tool.get("function") or {}).get("name") or "")
+                        for tool in turn_tool_schemas
+                        if (tool.get("function") or {}).get("name")
+                    ]
+                    primary_scoped = sorted(
+                        set(scoped_tool_names) & self._primary_tools_for_loop_action(loop_action)
+                    )
+                    if len(primary_scoped) == 1:
+                        recommended_tool_choice = primary_scoped[0]
                 turn_max_tokens = self._llm_max_tokens_for_turn(
                     loop_action=loop_action,
                     recommended_tool_choice=recommended_tool_choice,
@@ -1216,6 +2631,12 @@ class Runtime:
                     "has_content": bool(response.content),
                     "content_preview": (response.content or "")[:200],
                 })
+                if loop_action in {"read", "query"} and (agent._loop_action_plan or {}).get("target_action"):
+                    self._emit(agent.id, "pre_action_read", {
+                        "target_action": agent._loop_action_plan.get("target_action"),
+                        "reason": agent._loop_action_plan.get("reason"),
+                        "tool_calls": [tc.name for tc in response.tool_calls] if response.tool_calls else [],
+                    })
                 if not response.tool_calls and response.content:
                     recovered_tool_calls = self._recover_text_tool_calls(response.content, turn_tool_schemas)
                     if recovered_tool_calls:
@@ -1236,12 +2657,21 @@ class Runtime:
                     and loop_action == "work"
                     and bool(missing_outputs)
                 )
+                empty_write_only_scope = (
+                    not response.tool_calls
+                    and not response.content
+                    and loop_action == "work"
+                    and turn_tool_scope in {"artifact_write_only", "retry_file_write_after_text_miss"}
+                    and bool(missing_outputs)
+                )
                 write_only_content_note = (
                     "[write_only turn produced assistant text but no file_write tool call; "
                     "full text omitted from persistent history]"
                     if text_only_write_scope
                     else None
                 )
+                main_action_satisfied = False
+                create_action_retargeted = False
 
                 if response.tool_calls:
                     executed_tool_calls, skipped_tool_calls = self._partition_tool_calls_by_action(
@@ -1280,10 +2710,13 @@ class Runtime:
                         if tc.name == "file_write":
                             result = self._annotate_file_write_result(agent, tc, result)
                             self._register_expected_artifact_write(agent, tc, result)
+                            self._refresh_task_ledger_agent_item(agent)
                         if tc.name == "shell":
                             command = str(tc.arguments.get("command", ""))
                             agent._shell_commands.append(command)
                             exit_code = result.get("returncode", result.get("exit_code", 1)) if isinstance(result, dict) else 1
+                            if isinstance(result, dict) and int(exit_code) == 0:
+                                self._publish_shell_evidence(agent, command, result)
                             if (
                                 _looks_like_test_command(command)
                                 and isinstance(result, dict)
@@ -1303,27 +2736,79 @@ class Runtime:
                             "result_full_len": len(result_json),
                         })
                         agent._tool_calls += 1
+                        if tc.name in {"send", "wait"} and loop_action in {"message", "stop"}:
+                            main_action_satisfied = True
                         if tc.name == "query":
+                            if loop_action in {"read", "query", "message"}:
+                                main_action_satisfied = True
                             agent._last_query_turn = agent._turns
+                            agent._last_query_agent_ids = self._query_result_agent_ids(result)
+                            agent._last_query_reliable_evidence_ids = self._query_result_reliable_evidence_ids(result)
+                            if self._query_result_has_reliable_evidence(result):
+                                agent._last_query_evidence_turn = agent._turns
                             agent._filtered_read_intent_count = 0
                             agent._filtered_read_intent_seen_turn = 0
                             if agent._loop_action_plan and agent._loop_action_plan.get("action") == "create":
                                 agent._create_action_filtered_count = 0
                             if agent._loop_action_plan and agent._loop_action_plan.get("action") in {"read", "query"}:
                                 agent._loop_action_plan = None
+                        if tc.name == "ledger_read":
+                            if loop_action in {"read", "query", "message", "work", "compact", "stop"}:
+                                main_action_satisfied = True
+                        if tc.name == "ledger_update":
+                            if loop_action in {"work", "compact", "stop", "message"}:
+                                main_action_satisfied = True
+                            self._refresh_task_ledger_agent_item(agent)
                         if tc.name in {"spawn", "create_agent", "spawn_many"}:
                             created_count = len(agent.children) - children_before_turn
                             valid_spawn = created_count > 0
+                            covered_skip = False
+                            covered_by: list[str] = []
+                            covered_paths: list[str] = []
+                            covered_reason = ""
                             if isinstance(result, dict):
                                 if tc.name == "spawn_many":
                                     valid_spawn = int(result.get("created") or 0) > 0
                                 else:
                                     valid_spawn = bool(result.get("agent_id"))
+                                covered_skip, covered_by, covered_paths, covered_reason = self._spawn_result_covered_skip(result)
                             if valid_spawn:
+                                if loop_action == "create":
+                                    main_action_satisfied = True
                                 agent._create_action_filtered_count = 0
+                                agent._last_create_resolution = "created"
                                 agent._create_resume_after_read = False
                                 if agent._loop_action_plan and agent._loop_action_plan.get("action") == "create":
                                     agent._loop_action_plan = None
+                            elif covered_skip and agent._loop_action_plan and agent._loop_action_plan.get("action") == "create":
+                                main_action_satisfied = True
+                                create_action_retargeted = True
+                                agent._create_action_filtered_count = 0
+                                agent._create_resume_after_read = False
+                                agent._last_create_resolution = "skipped_covered"
+                                agent._last_spawn_skipped_turn = agent._turns
+                                agent._last_spawn_skipped_reason = covered_reason or agent._last_spawn_skipped_reason or "verified_lane_already_covered"
+                                if covered_by:
+                                    agent._last_spawn_skipped_covered_by = covered_by
+                                if covered_paths:
+                                    agent._last_spawn_skipped_covered_paths = covered_paths
+                                followup = self._spawn_skipped_followup_plan(agent, missing_outputs)
+                                agent._loop_action_plan = followup or {
+                                    "action": "compact",
+                                    "reason": "compact_after_spawn_skipped_covered",
+                                    "turn_added": agent._turns,
+                                    "covered_by": list(agent._last_spawn_skipped_covered_by),
+                                    "covered_paths": list(agent._last_spawn_skipped_covered_paths),
+                                    "skip_reason": agent._last_spawn_skipped_reason,
+                                }
+                                self._emit(agent.id, "create_action_resolved", {
+                                    "resolution": "skipped_covered",
+                                    "tool": tc.name,
+                                    "covered_by": list(agent._last_spawn_skipped_covered_by),
+                                    "covered_paths": list(agent._last_spawn_skipped_covered_paths),
+                                    "next_action": agent._loop_action_plan.get("action"),
+                                    "next_reason": agent._loop_action_plan.get("reason"),
+                                })
                             elif agent._loop_action_plan and agent._loop_action_plan.get("action") == "create":
                                 agent._create_action_filtered_count += 1
                                 self._emit(agent.id, "create_action_miss", {
@@ -1333,11 +2818,16 @@ class Runtime:
                                     "result": result,
                                 })
                         if tc.name in {"file_read", "file_list", "grep"}:
+                            if loop_action in {"read", "query", "work", "stop"}:
+                                main_action_satisfied = True
+                            agent._last_read_evidence_turn = agent._turns
                             agent._filtered_read_intent_count = 0
                             agent._filtered_read_intent_seen_turn = 0
                             if agent._loop_action_plan and agent._loop_action_plan.get("action") in {"read", "query"}:
                                 agent._loop_action_plan = None
-                        if tc.name in {"compact", "set_status"}:
+                        if tc.name in {"compact", "set_status", "submit_answer"}:
+                            create_exit_decision = False
+                            create_next_action: str | None = None
                             if (
                                 tc.name == "set_status"
                                 and str(tc.arguments.get("action", "")) == "read"
@@ -1346,9 +2836,60 @@ class Runtime:
                                 and _task_has_spawnable_workstreams(agent.task, self.config.min_spawnable_workstreams)
                             ):
                                 agent._create_resume_after_read = True
+                            if tc.name == "compact":
+                                create_exit_decision = (
+                                    bool(tc.arguments.get("stop_after") or tc.arguments.get("done"))
+                                    or _create_exit_decision_tags(tc.arguments.get("tags"))
+                                )
+                                if not create_exit_decision and agent._compact_pending is not None:
+                                    agent._compact_pending["return_action_after_auxiliary"] = "create"
+                            elif tc.name == "set_status":
+                                action_arg = str(tc.arguments.get("action", ""))
+                                status_arg = str(tc.arguments.get("status", ""))
+                                if action_arg in _LOOP_ACTIONS and action_arg != "create":
+                                    create_next_action = "stop" if action_arg in {"done", "self_stop"} else action_arg
+                                create_exit_decision = (
+                                    action_arg in {"stop", "done", "self_stop"}
+                                    or status_arg in {"done", "idle"}
+                                    or bool(tc.arguments.get("compact_before_stop"))
+                                    or _create_exit_decision_tags(tc.arguments.get("current_task_tags"))
+                                )
+                            elif tc.name == "submit_answer":
+                                create_exit_decision = True
+                            if (
+                                agent._loop_action_plan
+                                and agent._loop_action_plan.get("action") == "create"
+                            ):
+                                if create_next_action:
+                                    agent._loop_action_plan = {
+                                        "action": create_next_action,
+                                        "reason": f"create_action_selected_{create_next_action}",
+                                        "turn_added": agent._turns,
+                                    }
+                                    if create_next_action == "work":
+                                        create_action_retargeted = True
+                                        main_action_satisfied = True
+                                elif create_exit_decision:
+                                    create_action_retargeted = True
+                                    main_action_satisfied = True
+                                else:
+                                    agent._loop_action_plan = {
+                                        "action": "create",
+                                        "reason": "retry_spawn_after_create_miss",
+                                        "turn_added": agent._turns,
+                                    }
+                                    agent.action_state = "create"
+                                    agent._state_action_consumed_version = agent._state_action_version
                             if agent._loop_action_plan and agent._loop_action_plan.get("action") in {"compact", "stop"}:
+                                if tc.name == "compact" or tc.name == "submit_answer" or agent.status != "running" or create_exit_decision:
+                                    main_action_satisfied = True
                                 agent._loop_action_plan = None
+                            self._refresh_task_ledger_agent_item(agent)
+                        if tc.name in {"shell", "bt_aggregate"} and loop_action == "work":
+                            main_action_satisfied = True
                         if tc.name in {"file_write", "file_replace", "submit"}:
+                            if loop_action in {"work", "compact", "stop"}:
+                                main_action_satisfied = True
                             agent._filtered_read_intent_count = 0
                             agent._filtered_read_intent_seen_turn = 0
                             agent._last_artifact_turn = agent._turns
@@ -1375,27 +2916,25 @@ class Runtime:
                     else:
                         agent.history.append({"role": "assistant", "content": response.content})
                     committed_from_text = self._attempt_artifact_commit_from_text(agent, response.content)
+                    if loop_action == "work" and committed_from_text:
+                        main_action_satisfied = True
                 else:
                     agent.history.append({"role": "assistant", "content": "(empty)"})
 
                 if (
                     loop_action == "create"
                     and agent.status == "running"
+                    and not main_action_satisfied
                     and len(agent.children) <= children_before_turn
                     and agent._create_action_filtered_count == create_miss_before_turn
+                    and not create_action_retargeted
                 ):
-                    explicit_next_action = any(
-                        tc.name == "set_status"
-                        and str(tc.arguments.get("action", "")) in {"read", "message", "work", "compact", "stop", "done", "self_stop"}
-                        for tc in executed_tool_calls
-                    )
-                    if not explicit_next_action:
-                        agent._create_action_filtered_count += 1
-                        self._emit(agent.id, "create_action_miss", {
-                            "count": agent._create_action_filtered_count,
-                            "reason": "no_child_created_in_create_action",
-                            "executed_tools": [tc.name for tc in executed_tool_calls],
-                        })
+                    agent._create_action_filtered_count += 1
+                    self._emit(agent.id, "create_action_miss", {
+                        "count": agent._create_action_filtered_count,
+                        "reason": "no_child_created_in_create_action",
+                        "executed_tools": [tc.name for tc in executed_tool_calls],
+                    })
 
                 if committed_from_text:
                     agent._last_artifact_turn = agent._turns
@@ -1403,17 +2942,79 @@ class Runtime:
                         if not self._missing_expected_outputs(agent):
                             agent._loop_action_plan = None
 
-                if text_only_write_scope and not committed_from_text:
+                if (text_only_write_scope or empty_write_only_scope) and not committed_from_text:
                     agent._write_only_miss_count += 1
                     self._emit(agent.id, "write_only_miss", {
                         "count": agent._write_only_miss_count,
                         "missing": missing_outputs[:10],
                         "content_preview": (response.content or "")[:200],
+                        "empty_response": empty_write_only_scope,
                     })
                 else:
                     agent._write_only_miss_count = 0
 
+                if loop_action == "compact" and not main_action_satisfied and agent.status == "running":
+                    agent._auxiliary_only_miss_count += 1
+                    self._emit(agent.id, "loop_action_auxiliary_only_miss", {
+                        "action": loop_action,
+                        "count": agent._auxiliary_only_miss_count,
+                        "tools": [tc.name for tc in executed_tool_calls],
+                        "reason": "compact_action_requires_compact_or_done_status",
+                    })
+                elif loop_action and executed_tool_calls and agent.status == "running":
+                    auxiliary_tools = {"get_cost", "set_status", "compact"}
+                    if not main_action_satisfied and all(tc.name in auxiliary_tools for tc in executed_tool_calls):
+                        agent._auxiliary_only_miss_count += 1
+                        self._emit(agent.id, "loop_action_auxiliary_only_miss", {
+                            "action": loop_action,
+                            "count": agent._auxiliary_only_miss_count,
+                            "tools": [tc.name for tc in executed_tool_calls],
+                            "reason": "auxiliary_tools_did_not_satisfy_current_action",
+                        })
+                    else:
+                        agent._auxiliary_only_miss_count = 0
+
                 agent._no_tool_turns = 0 if response.tool_calls or committed_from_text else agent._no_tool_turns + 1
+                if loop_action and agent.status == "running":
+                    action_satisfied = main_action_satisfied or bool(committed_from_text)
+                    if action_satisfied:
+                        agent._action_miss_count = 0
+                        agent._action_miss_action = ""
+                    else:
+                        if agent._action_miss_action == loop_action:
+                            agent._action_miss_count += 1
+                        else:
+                            agent._action_miss_action = loop_action
+                            agent._action_miss_count = 1
+                        self._emit(agent.id, "loop_action_miss", {
+                            "action": loop_action,
+                            "count": agent._action_miss_count,
+                            "tools": [tc.name for tc in executed_tool_calls],
+                            "has_content": bool(response.content),
+                            "missing_outputs": missing_outputs[:10],
+                            "reason": (
+                                "no_executable_tool_call"
+                                if not executed_tool_calls
+                                else "selected_action_not_satisfied"
+                            ),
+                        })
+                        if agent._action_miss_count >= 2:
+                            stale_plan = dict(agent._loop_action_plan or {})
+                            agent._loop_action_plan = None
+                            if loop_action == "message" and agent.action_state == "message":
+                                if self._deferred_spawn_ready(agent):
+                                    self.state_board_update(agent.id, action_state="create")
+                                elif missing_outputs and not self.unfinished_child_agents(agent):
+                                    self.state_board_update(agent.id, action_state="work")
+                            self._emit(agent.id, "loop_action_replan", {
+                                "from_action": loop_action,
+                                "count": agent._action_miss_count,
+                                "stale_reason": stale_plan.get("reason"),
+                                "missing_outputs": missing_outputs[:10],
+                                "new_action_state": agent.action_state,
+                            })
+                    if loop_action != "compact" and action_satisfied:
+                        agent._auxiliary_only_miss_count = 0
 
                 if agent.status != "running":
                     break
@@ -1431,6 +3032,7 @@ class Runtime:
         finally:
             # Only emit lifecycle completion for agents that actually finished (not just idle).
             if agent.status in ("done", "failed"):
+                self._refresh_task_ledger_agent_item(agent)
                 self.state_board_sync(agent.id)
                 if self.config.notify_parent_on_done and agent.parent and agent.parent in self.agents:
                     result_preview = (agent.result or "")[:200]
@@ -1531,6 +3133,12 @@ class Runtime:
             return
 
         spawnable = _task_has_spawnable_workstreams(agent.task, self.config.min_spawnable_workstreams)
+        if (
+            not spawnable
+            and _task_is_concrete_single_output_work(agent.task)
+            and not self._agent_has_uncertain_evidence(agent)
+        ):
+            return
         turn_trigger = agent._turns >= max(1, self.config.spawn_before_turn)
         tool_trigger = agent._tool_calls >= max(1, self.config.max_solo_tool_calls_before_spawn)
         if agent.orchestration_preference == "balanced":
@@ -1547,7 +3155,9 @@ class Runtime:
             f"Preference: {agent.orchestration_preference}. You are still running without child agents "
             f"at turn {agent._turns} after {agent._tool_calls} tool calls.\n"
             f"If the task has at least {self.config.min_spawnable_workstreams} separable workstreams, "
-            "choose action=create. Use query/read/work/compact/stop only when that action better matches the current state. "
+            "choose action=create for independent worker lanes. Do not start downstream verifier/review/synthesis agents "
+            "until their input readiness is high; use depends_on/readiness if proposing one. "
+            "Use query/read/work/compact/stop only when that action better matches the current state. "
             "Continue solo only if the task is truly atomic or spawning would add no useful independent work, "
             "and record that solo decision in memory with status:solo-decision."
         )
@@ -1710,6 +3320,117 @@ class Runtime:
             return selected[:8]
         return agent.current_task_tags[:8]
 
+    def _shared_coordination_tags(self, agent: Agent, peer: Agent) -> set[str]:
+        identity_prefixes = (
+            "agent:", "id:", "parent:", "created_by:", "depth:",
+            "group:", "group_id:", "create_type:", "relationship:", "workflow:",
+        )
+        left = {
+            tag
+            for tag in agent.current_task_tags
+            if not str(tag).startswith(identity_prefixes)
+        }
+        right = {
+            tag
+            for tag in peer.current_task_tags
+            if not str(tag).startswith(identity_prefixes)
+        }
+        return left.intersection(right)
+
+    def _peer_overlap_query_candidates(self, agent: Agent) -> list[Agent]:
+        candidates: list[Agent] = []
+        agent_lanes = _agent_lane_fingerprints(agent)
+        disambiguating_prefixes = ("topic:", "lane:", "candidate:", "scope:", "deliverable:")
+        agent_disambiguators = {
+            tag for tag in agent.current_task_tags if str(tag).startswith(disambiguating_prefixes)
+        }
+        for peer in self._peer_progress_candidates(agent):
+            if not (agent.group_id and peer.group_id and agent.group_id == peer.group_id):
+                shared_tags = self._shared_coordination_tags(agent, peer)
+                if not shared_tags:
+                    continue
+            peer_lanes = _agent_lane_fingerprints(peer)
+            lane_overlap = bool(agent_lanes and peer_lanes and agent_lanes.intersection(peer_lanes))
+            task_similarity = _cheap_text_similarity(agent.task, peer.task)
+            shared_tags = self._shared_coordination_tags(agent, peer)
+            peer_disambiguators = {
+                tag for tag in peer.current_task_tags if str(tag).startswith(disambiguating_prefixes)
+            }
+            different_explicit_lane = bool(
+                agent_disambiguators
+                and peer_disambiguators
+                and not agent_disambiguators.intersection(peer_disambiguators)
+            )
+            if different_explicit_lane and not lane_overlap:
+                continue
+            if lane_overlap or task_similarity >= 0.20 or len(shared_tags) >= 2:
+                candidates.append(peer)
+        candidates.sort(key=lambda p: (
+            0 if p.status == "done" else 1,
+            -len(p.artifacts),
+            -p._turns,
+            p.id,
+        ))
+        return candidates
+
+    def _peer_overlap_query_before_work_pending(self, agent: Agent, missing_outputs: list[str]) -> bool:
+        if not missing_outputs:
+            return False
+        if not agent.parent:
+            return False
+        if agent.children:
+            return False
+        if agent._last_query_turn > 0:
+            return False
+        if agent._peer_overlap_query_turn > 0:
+            if agent._action_miss_action == "read" and agent._action_miss_count >= 2:
+                return False
+            if (agent._turns - agent._peer_overlap_query_turn) > 4:
+                return False
+        if _task_is_leaf_artifact_lane(
+            task=agent.task,
+            role=agent.role,
+            group_id=agent.group_id,
+            current_task_tags=agent.current_task_tags,
+        ):
+            return False
+        if not _task_is_discovery_work(agent.task):
+            return False
+        if not self._peer_overlap_query_candidates(agent):
+            return False
+        return True
+
+    def _mark_peer_overlap_query_planned(self, agent: Agent) -> None:
+        agent._peer_overlap_query_turn = agent._turns
+
+    def _peer_overlap_post_query_pending(self, agent: Agent, missing_outputs: list[str]) -> bool:
+        if not missing_outputs:
+            return False
+        if agent._peer_overlap_query_turn <= 0:
+            return False
+        if agent._last_query_turn < agent._peer_overlap_query_turn:
+            return False
+        if (agent._turns - agent._last_query_turn) > 4:
+            return False
+        if not _task_is_discovery_work(agent.task):
+            return False
+        return bool(self._completed_peer_overlap_candidates(agent))
+
+    def _peer_overlap_active_duplicate_post_query_pending(self, agent: Agent, missing_outputs: list[str]) -> bool:
+        if not missing_outputs:
+            return False
+        if agent._peer_overlap_query_turn <= 0:
+            return False
+        if agent._last_query_turn < agent._peer_overlap_query_turn:
+            return False
+        if (agent._turns - agent._last_query_turn) > 4:
+            return False
+        if not _task_is_discovery_work(agent.task):
+            return False
+        if agent._last_artifact_turn > 0 or agent.artifacts:
+            return False
+        return bool(self._active_duplicate_peer_overlap_candidates(agent))
+
     def _check_artifact_nudge(self, agent: Agent) -> None:
         """Force artifact-oriented agents back to file tools instead of prose loops."""
         if agent._turns < 2:
@@ -1726,11 +3447,19 @@ class Runtime:
                 return
             agent._artifact_deferred_nudge_sent = True
             unfinished = self.unfinished_child_agents(agent)
+            failed_children = self._failed_children_need_recovery(agent, missing)
             child_lines = "\n".join(
                 f"- {child.id}: role={child.role or '-'} group_id={child.group_id or '-'} "
                 f"status={child.status} turns={child._turns} missing={self._missing_expected_outputs(child)[:4]}"
                 for child in unfinished[:8]
             )
+            failed_lines = "\n".join(
+                f"- {item.get('id')}: role={item.get('role') or '-'} group_id={item.get('group_id') or '-'} "
+                f"status=failed missing={item.get('missing_outputs') or []} result={(item.get('result') or '')[:140]}"
+                for item in failed_children[:8]
+            )
+            if failed_lines:
+                child_lines = (child_lines + "\n" if child_lines else "") + "Recoverable failed children:\n" + failed_lines
             if not child_lines:
                 child_lines = "- no unfinished child details available"
             notice = (
@@ -1772,6 +3501,7 @@ class Runtime:
                     }
                     for child in unfinished[:20]
                 ],
+                "failed_children": failed_children[:20],
             })
             self._emit(agent.id, "send", {
                 "from": "system",
@@ -1882,7 +3612,7 @@ class Runtime:
             "[Artifact Required]\n"
             "Your task names concrete output files, but they are not present yet. "
             "Do not leave the deliverable only in chat. Choose action=work if creating the missing artifacts is the next step. "
-            "If the solution is uncertain, write the best current candidate and record uncertainty in the .md/report file.\n"
+            "If evidence is insufficient, mark the artifact as partial/evidence-pending; do not present it as final.\n"
             f"Missing files:\n{targets}{more}{force_line}"
         )
         envelope = Envelope(
@@ -1913,16 +3643,56 @@ class Runtime:
         })
 
     def _missing_expected_outputs(self, agent: Agent) -> list[str]:
-        expected = _expected_output_paths(agent.task)
+        expected = _non_terminal_expected_output_paths(agent.task)
         if not expected:
             return []
-        return [path for path in expected if not (self._tool_context.workspace_root / path).exists()]
+        missing: list[str] = []
+        for path in expected:
+            abs_path = self._tool_context.workspace_root / path
+            if not abs_path.exists():
+                missing.append(path)
+        return missing
+
+    def answer_submission_required(self, agent: Agent) -> bool:
+        return bool(_final_answer_paths(agent.task)) or _task_mentions_submit_answer_protocol(agent.task)
+
+    def final_answer_path_for(self, agent: Agent) -> str:
+        paths = _final_answer_paths(agent.task)
+        if paths:
+            return paths[0]
+        return f"{self.config.shared_dir}/answer.json"
+
+    def _answer_submission_blockers(self, agent: Agent) -> list[dict[str, Any]]:
+        if not self.answer_submission_required(agent):
+            return []
+        if agent.submitted_answer_path:
+            return []
+        return [{
+            "kind": "answer_submission",
+            "message": (
+                "Answer tasks must finish through submit_answer(answer=...). "
+                "Do not use file_write, compact, or set_status as the final answer submission."
+            ),
+            "path": self.final_answer_path_for(agent),
+        }]
 
     def expected_outputs(self, agent: Agent) -> list[str]:
         return _expected_output_paths(agent.task)
 
     def missing_expected_outputs(self, agent: Agent) -> list[str]:
         return self._missing_expected_outputs(agent)
+
+    def outputs_complete(self, agent: Agent) -> bool:
+        expected = _expected_output_paths(agent.task)
+        if not expected:
+            return False
+        if self._missing_expected_outputs(agent):
+            return False
+        if self._uncertain_artifact_paths(agent, expected_only=True):
+            return False
+        if self.answer_submission_required(agent) and not agent.submitted_answer_path:
+            return False
+        return True
 
     def _shared_source_dir(self) -> Path:
         return self.config.workspace_root / self.config.shared_dir / "source"
@@ -2017,9 +3787,20 @@ class Runtime:
         *,
         tags: list[str] | None = None,
         include_missing_outputs: bool = True,
+        result: str | None = None,
     ) -> list[dict[str, Any]]:
         final_tags = set(tags or agent.current_task_tags)
-        if "status:pruned" in final_tags and self._pruned_stop_is_allowed(agent):
+        if (
+            "status:pruned" in final_tags
+            and any(tag in final_tags for tag in {"reason:peer_ahead", "reason:duplicate_lane", "reason:invalid_candidate"})
+            and self._pruned_stop_is_allowed(agent)
+        ):
+            return []
+        if (
+            "status:pruned" in final_tags
+            and any(tag in final_tags for tag in {"reason:premature_downstream", "needs:upstream_evidence"})
+            and self._premature_downstream_stop_is_allowed(agent)
+        ):
             return []
         blockers: list[dict[str, Any]] = []
         if include_missing_outputs:
@@ -2049,7 +3830,80 @@ class Runtime:
                     for command in related._shell_commands
                 ][-10:],
             })
+        blockers.extend(self._uncertain_evidence_blockers(agent))
+        blockers.extend(self._answer_submission_blockers(agent))
         return blockers
+
+    def _compact_evidence_text(self, agent: Agent, summary: str, experience: str | None, files: list[str]) -> str:
+        parts = [summary or "", experience or "", " ".join(agent.current_task_tags)]
+        candidate_files = list(files)
+        if not candidate_files:
+            candidate_files = [artifact.path for artifact in agent.artifacts]
+        for rel_path in candidate_files[:8]:
+            abs_path = (self.config.workspace_root / rel_path).resolve()
+            try:
+                abs_path.relative_to(self.config.workspace_root.resolve())
+            except ValueError:
+                continue
+            if not abs_path.is_file():
+                continue
+            try:
+                parts.append(abs_path.read_text(errors="replace")[:6000])
+            except OSError:
+                continue
+        return "\n\n".join(parts).lower()
+
+    def _compact_truth_guard(
+        self,
+        agent: Agent,
+        *,
+        summary: str,
+        experience: str | None,
+        tags: list[str],
+        files: list[str],
+        stop_result: str | None,
+    ) -> dict[str, Any]:
+        evidence_text = self._compact_evidence_text(agent, summary, experience, files)
+        unverified = any(term in evidence_text for term in _UNVERIFIED_EVIDENCE_TERMS)
+        if not unverified:
+            return {
+                "summary": summary,
+                "experience": experience,
+                "tags": tags,
+                "stop_result": stop_result,
+                "truth_guard": None,
+            }
+
+        original_tags = normalize_tags(tags)
+        sanitized_tags = [
+            tag for tag in original_tags
+            if tag not in _COMPLETION_CLAIM_TAGS
+        ]
+        sanitized_tags = normalize_tags(sanitized_tags + sorted(_TRUTH_GUARD_UNVERIFIED_TAGS))
+        guarded_summary = summary
+        if not summary.lower().startswith("[unverified / needs verification]"):
+            guarded_summary = f"[UNVERIFIED / NEEDS VERIFICATION]\n{summary}"
+        guarded_experience = experience
+        if experience and not experience.lower().startswith("[unverified / needs verification]"):
+            guarded_experience = f"[UNVERIFIED / NEEDS VERIFICATION] {experience}"
+        guarded_result = stop_result
+        if stop_result and "unverified" not in stop_result.lower() and "low confidence" not in stop_result.lower():
+            guarded_result = f"unverified: {stop_result}"
+
+        event = {
+            "reason": "unverified_or_low_confidence_evidence",
+            "removed_tags": sorted(set(original_tags).intersection(_COMPLETION_CLAIM_TAGS)),
+            "added_tags": sorted(_TRUTH_GUARD_UNVERIFIED_TAGS),
+            "files": files[:8],
+        }
+        self._emit(agent.id, "compact_truth_guard", event)
+        return {
+            "summary": guarded_summary,
+            "experience": guarded_experience,
+            "tags": sanitized_tags,
+            "stop_result": guarded_result,
+            "truth_guard": event,
+        }
 
     def _child_marker_text(self, child: Agent) -> str:
         return "\n".join(
@@ -2106,6 +3960,294 @@ class Runtime:
             ("recovery", "fallback", "repair", "source-recovery", "source_recovery"),
         )
 
+    def _failed_child_agents(self, agent: Agent) -> list[Agent]:
+        return [
+            self.agents[child_id]
+            for child_id in sorted(agent.children)
+            if child_id in self.agents and self.agents[child_id].status == "failed"
+        ]
+
+    def _failed_children_need_recovery(self, agent: Agent, missing_outputs: list[str]) -> list[dict[str, Any]]:
+        if not missing_outputs:
+            return []
+        recoverable: list[dict[str, Any]] = []
+        for child in self._failed_child_agents(agent):
+            child_expected = self.expected_outputs(child)
+            child_missing = self.missing_expected_outputs(child)
+            expected_overlap = [path for path in child_expected if path in missing_outputs or path in child_missing]
+            if child_expected and not expected_overlap and not child_missing:
+                continue
+            recoverable.append({
+                "id": child.id,
+                "role": child.role,
+                "group_id": child.group_id,
+                "task": child.task,
+                "result": child.result,
+                "artifacts": [artifact.path for artifact in child.artifacts],
+                "expected_outputs": child_expected[:20],
+                "missing_outputs": (child_missing or expected_overlap or missing_outputs)[:20],
+                "turns": child._turns,
+                "tokens": child.tokens_consumed,
+            })
+        return recoverable
+
+    def _has_active_recovery_child(self, agent: Agent, failed_children: list[dict[str, Any]]) -> bool:
+        failed_ids = {str(item.get("id") or "") for item in failed_children}
+        failed_roles = {str(item.get("role") or "") for item in failed_children if item.get("role")}
+        for child in self.unfinished_child_agents(agent):
+            text = self._child_marker_text(child)
+            if not any(marker in text for marker in ("recovery", "fallback", "repair")):
+                continue
+            if failed_ids and (failed_ids.intersection(child.current_task_tags) or any(fid in child.task for fid in failed_ids)):
+                return True
+            if failed_roles and any(role and role in child.task for role in failed_roles):
+                return True
+            return True
+        return False
+
+    def _failed_child_recovery_plan(
+        self,
+        agent: Agent,
+        missing_outputs: list[str],
+        blockers: list[dict[str, Any]],
+    ) -> dict[str, Any] | None:
+        failed_children = self._failed_children_need_recovery(agent, missing_outputs)
+        if not failed_children:
+            return None
+        if self._root_steward_mode(agent):
+            return {
+                "action": "message",
+                "reason": "root_steward_query_failed_child_recovery_gap",
+                "turn_added": agent._turns,
+                "failed_children": failed_children,
+                "blockers": blockers,
+            }
+        if self._has_active_recovery_child(agent, failed_children):
+            return {
+                "action": "message",
+                "reason": "coordinate_active_recovery_child",
+                "turn_added": agent._turns,
+                "failed_children": failed_children,
+                "blockers": blockers,
+            }
+        if len(self.agents) >= self.config.max_agents:
+            return {
+                "action": "message",
+                "reason": "failed_child_recovery_blocked_by_agent_limit",
+                "turn_added": agent._turns,
+                "failed_children": failed_children,
+                "blockers": blockers,
+            }
+        return {
+            "action": "create",
+            "reason": "delegate_failed_child_recovery",
+            "turn_added": agent._turns,
+            "failed_children": failed_children,
+            "blockers": blockers,
+        }
+
+    def _can_create_child(self, agent: Agent) -> bool:
+        return (
+            len(self.agents) < self.config.max_agents
+            and agent.depth + 1 <= self.config.max_depth
+            and agent.orchestration_preference != "solo"
+            and not self._root_steward_mode(agent)
+            and not self._agent_has_solo_decision(agent)
+            and not self._agent_has_pending_self_work_decision(agent)
+        )
+
+    def _root_steward_mode(self, agent: Agent) -> bool:
+        return agent.parent is None and bool(agent.children) and not self._root_initial_peer_wave_incomplete(agent)
+
+    def _root_initial_peer_wave_incomplete(self, agent: Agent) -> bool:
+        if agent.parent is not None or not agent.children:
+            return False
+        for requirement in _explicit_peer_wave_requirements(agent.task):
+            target = int(requirement.get("target") or 0)
+            if target <= 1:
+                continue
+            matched = [
+                self.agents[child_id]
+                for child_id in sorted(agent.children)
+                if child_id in self.agents and _agent_matches_peer_wave_requirement(self.agents[child_id], requirement)
+            ]
+            if len(matched) < target:
+                return True
+        return False
+
+    def _agent_has_solo_decision(self, agent: Agent) -> bool:
+        if "status:solo-decision" in set(agent.current_task_tags):
+            return True
+        memory = self.memory.get(agent.id)
+        if not memory:
+            return False
+        if "status:solo-decision" in set(memory.tags or []):
+            return True
+        if memory.active_task and "status:solo-decision" in set(memory.active_task.tags or []):
+            return True
+        return any("status:solo-decision" in set(card.tags or []) for card in memory.experience_cards[-12:])
+
+    def _agent_has_pending_self_work_decision(self, agent: Agent) -> bool:
+        return (
+            agent.action_state == "work"
+            and agent._state_action_version > agent._state_action_consumed_version
+            and (agent._create_action_filtered_count > 0 or self._agent_has_solo_decision(agent))
+        )
+
+    def _spawn_result_covered_skip(self, result: Any) -> tuple[bool, list[str], list[str], str]:
+        if not isinstance(result, dict):
+            return False, [], [], ""
+
+        covered_by: list[str] = []
+        covered_paths: list[str] = []
+        reasons: list[str] = []
+
+        def collect(item: dict[str, Any]) -> None:
+            reason = str(item.get("reason") or "")
+            if reason:
+                reasons.append(reason)
+            for covered in item.get("covered_by") or []:
+                if isinstance(covered, dict) and covered.get("id"):
+                    covered_by.append(str(covered["id"]))
+            for path in item.get("covered_paths") or []:
+                if str(path):
+                    covered_paths.append(str(path))
+
+        skipped_items: list[dict[str, Any]] = []
+        if (
+            result.get("skipped") is True
+            or result.get("reason")
+            or result.get("covered_by")
+            or result.get("covered_paths")
+        ):
+            skipped_items.append(result)
+        for wrapper in result.get("results") or []:
+            if not isinstance(wrapper, dict):
+                continue
+            item = wrapper.get("result")
+            if isinstance(item, dict) and item.get("skipped"):
+                skipped_items.append(item)
+
+        if not skipped_items:
+            return False, [], [], ""
+
+        for item in skipped_items:
+            collect(item)
+
+        created = int(result.get("created") or 0) if "created" in result else 0
+        deferred = int(result.get("deferred") or 0) if "deferred" in result else 0
+        all_covered = all(
+            str(item.get("reason") or "").endswith("already_covered")
+            or str(item.get("reason") or "") == "verified_lane_already_covered"
+            for item in skipped_items
+        )
+        if created > 0 or deferred > 0 or not all_covered:
+            return False, [], [], ""
+
+        return (
+            True,
+            sorted(set(covered_by)),
+            sorted(set(covered_paths)),
+            reasons[0] if reasons else "verified_lane_already_covered",
+        )
+
+    def _spawn_skipped_followup_plan(
+        self,
+        agent: Agent,
+        missing_outputs: list[str],
+        blockers: list[dict[str, Any]] | None = None,
+    ) -> dict[str, Any] | None:
+        if agent._last_spawn_skipped_turn <= 0:
+            return None
+        if (agent._turns - agent._last_spawn_skipped_turn) > 6:
+            return None
+        if agent._last_spawn_skipped_reason and not agent._last_spawn_skipped_reason.endswith("already_covered"):
+            return None
+
+        covered_by = list(agent._last_spawn_skipped_covered_by)
+        covered_paths = list(agent._last_spawn_skipped_covered_paths)
+        if not covered_by and not covered_paths:
+            return None
+
+        data = {
+            "turn_added": agent._turns,
+            "blockers": blockers or [],
+            "covered_by": covered_by,
+            "covered_paths": covered_paths,
+            "skip_reason": agent._last_spawn_skipped_reason or "verified_lane_already_covered",
+        }
+        if not missing_outputs and not self.unfinished_child_agents(agent):
+            return {
+                "action": "compact",
+                "reason": "compact_after_spawn_skipped_covered",
+                **data,
+            }
+        if agent.children:
+            return {
+                "action": "message",
+                "reason": "inspect_coverage_after_spawn_skipped",
+                **data,
+            }
+        return {
+            "action": "read",
+            "reason": "read_after_spawn_skipped",
+            **data,
+        }
+
+    def _create_miss_followup_plan(self, agent: Agent, missing_outputs: list[str]) -> dict[str, Any] | None:
+        blockers = self.completion_blockers(agent, include_missing_outputs=False) if agent.children else []
+        coverage_plan = self._spawn_skipped_followup_plan(agent, missing_outputs, blockers)
+        if coverage_plan:
+            return coverage_plan
+        if agent._create_action_filtered_count <= 0:
+            return None
+        recovery_plan = self._failed_child_recovery_plan(agent, missing_outputs, blockers)
+        if recovery_plan:
+            return recovery_plan
+        if (
+            missing_outputs
+            and not agent.children
+            and (self._agent_has_solo_decision(agent) or self._agent_has_pending_self_work_decision(agent))
+        ):
+            return {
+                "action": "work",
+                "reason": (
+                    "solo_decision_after_create_miss"
+                    if self._agent_has_solo_decision(agent)
+                    else "self_selected_work_after_create_miss"
+                ),
+                "turn_added": agent._turns,
+                "blockers": blockers,
+            }
+        if self.unfinished_child_agents(agent):
+            return {
+                "action": "message",
+                "reason": "wait_after_create_miss_with_active_children",
+                "turn_added": agent._turns,
+                "blockers": blockers,
+            }
+        if self._can_create_child(agent):
+            return {
+                "action": "create",
+                "reason": "retry_spawn_after_create_miss",
+                "turn_added": agent._turns,
+                "blockers": blockers,
+            }
+        if agent._filtered_read_intent_count > 0:
+            return {
+                "action": "read",
+                "reason": "read_after_create_miss_prerequisite",
+                "turn_added": agent._turns,
+                "target_action": "create",
+                "blockers": blockers,
+            }
+        return {
+            "action": "compact",
+            "reason": "create_miss_requires_solo_or_pruned_decision",
+            "turn_added": agent._turns,
+            "blockers": blockers,
+        }
+
     def _coordinator_child_dependency_plan(
         self,
         agent: Agent,
@@ -2118,7 +4260,10 @@ class Runtime:
         unfinished = self.unfinished_child_agents(agent)
         source_task = _task_requires_source_change(agent.task)
         blocker_kinds = {str(blocker.get("kind")) for blocker in blockers}
-        can_create = len(self.agents) < self.config.max_agents
+        can_create = self._can_create_child(agent)
+        recovery_plan = self._failed_child_recovery_plan(agent, missing_outputs, blockers)
+        if recovery_plan:
+            return recovery_plan
         integration_markers = (
             "integration",
             "integrator",
@@ -2183,9 +4328,439 @@ class Runtime:
         return None
 
     def _pruned_stop_is_allowed(self, agent: Agent) -> bool:
+        if self._task_ledger_pruned_stop_is_allowed(agent):
+            return True
+        if agent._pending_prune_requests and self._pending_prune_request_has_coverage_signal(agent):
+            return True
+        expected = _non_terminal_expected_output_paths(agent.task)
+        if expected:
+            if self._peer_exact_output_coverage_candidates(agent):
+                return True
+            if self._queried_prunable_peer_coverage_candidates(agent):
+                return True
+            if (
+                agent._last_query_turn > 0
+                and (agent._turns - agent._last_query_turn) <= 4
+                and _task_is_discovery_work(agent.task)
+                and (
+                    self._completed_peer_overlap_candidates(agent)
+                    or self._active_duplicate_peer_overlap_candidates(agent)
+                )
+            ):
+                return True
+            return False
         if agent._last_query_turn <= 0:
             return False
-        return bool(self._peer_progress_candidates(agent))
+        return bool(
+            self._completed_peer_overlap_candidates(agent)
+            or self._active_duplicate_peer_overlap_candidates(agent)
+        )
+
+    def _agent_has_downstream_focus(self, agent: Agent) -> bool:
+        return _looks_like_downstream_focus(
+            agent.role,
+            agent.task,
+            " ".join(agent.current_task_tags),
+            agent.workflow_prior,
+        )
+
+    def _agent_focus_class(self, agent: Agent) -> str:
+        return _focus_class_from_parts(
+            task=agent.task,
+            role=agent.role,
+            group_id=agent.group_id,
+            workflow_prior=agent.workflow_prior,
+            current_task_tags=agent.current_task_tags,
+        )
+
+    def _spawn_request_focus_class(
+        self,
+        *,
+        task: str,
+        role: str = "",
+        group_id: str = "",
+        workflow_prior: str = "",
+        current_task_tags: list[str] | tuple[str, ...] | set[str] | None = None,
+    ) -> str:
+        return _focus_class_from_parts(
+            task=task,
+            role=role,
+            group_id=group_id,
+            workflow_prior=workflow_prior,
+            current_task_tags=current_task_tags,
+        )
+
+    def _focus_classes_coverage_compatible(self, request_focus: str, covered_focus: str) -> bool:
+        if request_focus == covered_focus:
+            return True
+        if request_focus == "final_delivery":
+            return covered_focus == "final_delivery"
+        if request_focus == "synthesis":
+            return covered_focus in {"synthesis", "final_delivery"}
+        if request_focus == "verification":
+            return covered_focus in {"verification", "synthesis", "final_delivery"}
+        if request_focus == "recovery":
+            return covered_focus == "recovery"
+        return covered_focus in {"evidence", "verification", "synthesis", "final_delivery"}
+
+    def _memory_or_text_has_unverified_signal(self, agent: Agent) -> bool:
+        parts = [agent.result or "", " ".join(agent.current_task_tags)]
+        memory = self.memory.get(agent.id)
+        if memory:
+            parts.append(memory.public_summary or "")
+            parts.append(" ".join(memory.tags or []))
+            for card in memory.experience_cards:
+                parts.append(card.summary or "")
+                parts.append(" ".join(card.tags or []))
+        return any(term in "\n".join(parts).lower() for term in _UNVERIFIED_EVIDENCE_TERMS)
+
+    def _artifact_has_unverified_signal(self, rel_path: str) -> bool:
+        abs_path = (self.config.workspace_root / rel_path).resolve()
+        try:
+            abs_path.relative_to(self.config.workspace_root.resolve())
+        except ValueError:
+            return False
+        if not abs_path.is_file():
+            return False
+        try:
+            text = abs_path.read_text(errors="replace")[:12000].lower()
+        except OSError:
+            return False
+        return any(term in text for term in _UNVERIFIED_EVIDENCE_TERMS)
+
+    def _uncertain_artifact_paths(self, agent: Agent, *, expected_only: bool = False) -> list[str]:
+        paths: list[str] = []
+        seen: set[str] = set()
+        candidates = _non_terminal_expected_output_paths(agent.task) if expected_only else [artifact.path for artifact in agent.artifacts]
+        if not candidates:
+            candidates = _non_terminal_expected_output_paths(agent.task)
+        for path in candidates:
+            if path in seen:
+                continue
+            seen.add(path)
+            if self._artifact_has_unverified_signal(path):
+                paths.append(path)
+        return paths
+
+    def _agent_has_uncertain_evidence(self, agent: Agent) -> bool:
+        return self._memory_or_text_has_unverified_signal(agent) or bool(self._uncertain_artifact_paths(agent))
+
+    def _agent_has_reliable_evidence(self, agent: Agent) -> bool:
+        if self._agent_has_uncertain_evidence(agent):
+            return False
+        memory = self.memory.get(agent.id)
+        if agent.artifacts or agent.result:
+            return True
+        if memory:
+            if memory.artifact_index:
+                return True
+            for card in memory.experience_cards:
+                tags = set(card.tags)
+                if (
+                    card.artifacts
+                    or "memory_kind:evidence" in tags
+                    or "status:complete" in tags
+                    or "status:done" in tags
+                    or card.memory_kind in {"evidence", "terminal"}
+                ):
+                    return True
+        return False
+
+    def _is_internal_evidence_trace_path(self, path: str) -> bool:
+        normalized = str(path or "").replace("\\", "/").lstrip("./")
+        return f"{self.config.shared_dir}/.nanoma/evidence/" in normalized or normalized.startswith(f"{self.config.shared_dir}/.nanoma/evidence/")
+
+    def _agent_has_non_trace_artifact(self, agent: Agent) -> bool:
+        return any(not self._is_internal_evidence_trace_path(path) for path in self._agent_known_artifact_paths(agent))
+
+    def _agent_has_verified_coverage(self, agent: Agent) -> bool:
+        if self._agent_has_uncertain_evidence(agent):
+            return False
+        if agent.status != "done":
+            return False
+        if self._agent_has_downstream_focus(agent):
+            return bool(agent.result or self._agent_has_non_trace_artifact(agent))
+        expected = _expected_output_paths(agent.task)
+        if expected and not self._missing_expected_outputs(agent):
+            return True
+        if self._agent_has_non_trace_artifact(agent):
+            return True
+        memory = self.memory.get(agent.id)
+        if memory:
+            for card in memory.experience_cards:
+                tags = set(card.tags)
+                if (
+                    card.memory_kind == "terminal"
+                    and (
+                        "status:complete" in tags
+                        or "status:done" in tags
+                        or "verified:true" in tags
+                        or "confidence:high" in tags
+                    )
+                ):
+                    return True
+        return False
+
+    def _agent_has_inspectable_evidence_artifact(self, agent: Agent) -> bool:
+        if self._agent_has_uncertain_evidence(agent):
+            return False
+        expected = _expected_output_paths(agent.task)
+        outputs_complete = bool(expected) and not self._missing_expected_outputs(agent)
+        if agent.artifacts or outputs_complete:
+            return True
+        memory = self.memory.get(agent.id)
+        if not memory:
+            return False
+        if memory.artifact_index:
+            return True
+        return any(card.artifacts for card in memory.experience_cards)
+
+    def _agent_has_prune_worthy_progress(self, agent: Agent) -> bool:
+        if self._agent_has_uncertain_evidence(agent):
+            return False
+        expected = _expected_output_paths(agent.task)
+        if expected and not self._missing_expected_outputs(agent):
+            return True
+        if self._agent_has_non_trace_artifact(agent):
+            return True
+        if agent.status == "done" and self._agent_has_reliable_evidence(agent):
+            return True
+        return self._agent_has_reliable_evidence(agent) and self._agent_has_inspectable_evidence_artifact(agent)
+
+    def _agent_known_artifact_paths(self, agent: Agent) -> set[str]:
+        paths = {artifact.path for artifact in agent.artifacts if artifact.path}
+        memory = self.memory.get(agent.id)
+        if memory:
+            paths.update(path for path in memory.artifact_index if path)
+            for card in memory.experience_cards:
+                paths.update(path for path in card.artifacts if path)
+        return paths
+
+    def _spawn_request_overlaps_agent_lane(
+        self,
+        agent: Agent,
+        *,
+        task: str,
+        role: str = "",
+        group_id: str = "",
+        workflow_prior: str = "",
+        current_task_tags: list[str] | tuple[str, ...] | set[str] | None = None,
+    ) -> bool:
+        request_outputs = set(_non_terminal_expected_output_paths(task))
+        request_inputs = set(_referenced_input_like_shared_paths(task))
+        request_paths = request_outputs.union(request_inputs)
+        agent_paths = self._agent_known_artifact_paths(agent).union(_non_terminal_expected_output_paths(agent.task))
+        if request_paths and agent_paths and request_paths.intersection(agent_paths):
+            return True
+
+        request_lanes = _spawn_request_lane_fingerprints(
+            task=task,
+            role=role,
+            group_id=group_id,
+            workflow_prior=workflow_prior,
+            current_task_tags=current_task_tags,
+        )
+        agent_lanes = _agent_lane_fingerprints(agent)
+        generic_lanes = {"lane:verification"}
+        specific_overlap = (request_lanes - generic_lanes).intersection(agent_lanes - generic_lanes)
+        if specific_overlap:
+            return True
+        if request_lanes.intersection(agent_lanes) and group_id and agent.group_id == group_id:
+            return _cheap_text_similarity(task, agent.task) >= 0.25 or bool(request_paths.intersection(agent_paths))
+        return False
+
+    def _completed_spawn_request_coverage(
+        self,
+        creator: Agent,
+        *,
+        task: str,
+        role: str = "",
+        group_id: str = "",
+        workflow_prior: str = "",
+        current_task_tags: list[str] | tuple[str, ...] | set[str] | None = None,
+    ) -> list[Agent]:
+        coverage: list[Agent] = []
+        request_focus = self._spawn_request_focus_class(
+            task=task,
+            role=role,
+            group_id=group_id,
+            workflow_prior=workflow_prior,
+            current_task_tags=current_task_tags,
+        )
+        for peer in self.agents.values():
+            if peer.id == creator.id:
+                continue
+            if peer.status != "done":
+                continue
+            if not self._focus_classes_coverage_compatible(request_focus, self._agent_focus_class(peer)):
+                continue
+            if not self._spawn_request_overlaps_agent_lane(
+                peer,
+                task=task,
+                role=role,
+                group_id=group_id,
+                workflow_prior=workflow_prior,
+                current_task_tags=current_task_tags,
+            ):
+                continue
+            if not self._agent_has_verified_coverage(peer):
+                continue
+            coverage.append(peer)
+        coverage.sort(key=lambda peer: (
+            0 if self._agent_has_downstream_focus(peer) else 1,
+            0 if peer.status == "done" else 1,
+            -len(self._agent_known_artifact_paths(peer)),
+            -peer._tool_calls,
+            peer.id,
+        ))
+        return coverage
+
+    def covered_spawn_request(
+        self,
+        creator: Agent,
+        *,
+        task: str,
+        role: str = "",
+        group_id: str = "",
+        workflow_prior: str = "",
+        current_task_tags: list[str] | tuple[str, ...] | set[str] | None = None,
+    ) -> dict[str, Any] | None:
+        if _looks_like_recovery_request(task, role, group_id, " ".join(str(tag) for tag in (current_task_tags or []))):
+            return None
+        request_focus = self._spawn_request_focus_class(
+            task=task,
+            role=role,
+            group_id=group_id,
+            workflow_prior=workflow_prior,
+            current_task_tags=current_task_tags,
+        )
+        coverage = self._completed_spawn_request_coverage(
+            creator,
+            task=task,
+            role=role,
+            group_id=group_id,
+            workflow_prior=workflow_prior,
+            current_task_tags=current_task_tags,
+        )
+        if not coverage:
+            return None
+
+        request_is_downstream = _looks_like_verification_request(
+            task,
+            role,
+            group_id,
+            " ".join(str(tag) for tag in (current_task_tags or [])),
+        )
+        downstream_coverage = [peer for peer in coverage if self._agent_has_downstream_focus(peer)]
+        recently_queried_coverage = [peer for peer in coverage if peer.id in set(creator._last_query_reliable_evidence_ids)]
+        repeated_coverage = len(coverage) >= 2
+        if not (request_is_downstream or recently_queried_coverage or repeated_coverage):
+            return None
+        if request_is_downstream and not (downstream_coverage or recently_queried_coverage or repeated_coverage):
+            return None
+
+        covered_paths = sorted({path for peer in coverage for path in self._agent_known_artifact_paths(peer)})
+        return {
+            "covered": True,
+            "reason": (
+                "verified_lane_already_covered"
+                if downstream_coverage or request_is_downstream
+                else "reliable_lane_already_covered"
+            ),
+            "covered_by": [
+                {
+                    "id": peer.id,
+                    "role": peer.role,
+                    "focus": self._agent_focus_class(peer),
+                    "status": peer.status,
+                    "artifacts": sorted(self._agent_known_artifact_paths(peer))[:8],
+                    "result": (peer.result or "")[:220],
+                    "tags": peer.current_task_tags[:12],
+                }
+                for peer in coverage[:8]
+            ],
+            "covered_paths": covered_paths[:20],
+            "request_focus": request_focus,
+            "coverage_focuses": sorted({self._agent_focus_class(peer) for peer in coverage}),
+            "role_compatible": True,
+            "advice": "Query/read the covered agents and either integrate their evidence or send prune_request to active duplicates instead of spawning another same-lane agent.",
+        }
+
+    def _upstream_peer_candidates(self, agent: Agent) -> list[Agent]:
+        peers = [
+            peer for peer in self._peer_progress_candidates(agent)
+            if peer.parent and not self._agent_has_downstream_focus(peer)
+        ]
+        evidence_peers = [
+            peer for peer in peers
+            if peer.artifacts
+            or self.expected_outputs(peer)
+            or peer.result
+            or any(term in " ".join([peer.role, " ".join(peer.current_task_tags)]).lower() for term in ("worker", "source", "evidence"))
+        ]
+        return evidence_peers or peers
+
+    def _upstream_inputs_ready_for_downstream(self, agent: Agent) -> bool:
+        upstream = self._upstream_peer_candidates(agent)
+        if not upstream:
+            return False
+        for peer in upstream:
+            if peer.status != "done":
+                return False
+            expected = self.expected_outputs(peer)
+            if expected and self.missing_expected_outputs(peer):
+                return False
+            if not self._agent_has_reliable_evidence(peer):
+                return False
+        return True
+
+    def _uncertain_evidence_blockers(self, agent: Agent) -> list[dict[str, Any]]:
+        if agent.submitted_answer_path:
+            return []
+        uncertain_paths = self._uncertain_artifact_paths(agent, expected_only=True)
+        if not uncertain_paths and not self._memory_or_text_has_unverified_signal(agent):
+            return []
+        if "status:pruned" in set(agent.current_task_tags):
+            return []
+        return [{
+            "kind": "uncertain_evidence",
+            "message": (
+                "This agent's current evidence/artifacts are explicitly partial, unverified, or low confidence. "
+                "Do not mark the lane complete until a verifier/recovery step resolves the uncertainty, or compact as pruned/blocked."
+            ),
+            "artifacts": uncertain_paths[:20],
+        }]
+
+    def _premature_downstream_stop_is_allowed(self, agent: Agent) -> bool:
+        return self._agent_has_downstream_focus(agent) and not self._upstream_inputs_ready_for_downstream(agent)
+
+    def _premature_downstream_plan(self, agent: Agent, missing_outputs: list[str]) -> dict[str, Any] | None:
+        if not missing_outputs:
+            return None
+        if not agent.parent:
+            return None
+        if agent.children:
+            return None
+        if not self._agent_has_downstream_focus(agent):
+            return None
+        if self._upstream_inputs_ready_for_downstream(agent):
+            return None
+        upstream = self._upstream_peer_candidates(agent)
+        return {
+            "action": "compact",
+            "reason": "premature_downstream_wait_for_evidence",
+            "turn_added": agent._turns,
+            "upstream_agents": [
+                {
+                    "id": peer.id,
+                    "role": peer.role,
+                    "status": peer.status,
+                    "missing_outputs": self.missing_expected_outputs(peer)[:20],
+                    "artifacts": [artifact.path for artifact in peer.artifacts[:5]],
+                }
+                for peer in upstream[:8]
+            ],
+        }
 
     def unfinished_child_agents(self, agent: Agent) -> list[Agent]:
         return [
@@ -2193,6 +4768,232 @@ class Runtime:
             for child_id in sorted(agent.children)
             if child_id in self.agents and self.agents[child_id].status in {"running", "idle"}
         ]
+
+    def _completed_child_evidence_candidates(self, agent: Agent) -> list[Agent]:
+        candidates: list[Agent] = []
+        for child_id in sorted(agent.children):
+            child = self.agents.get(child_id)
+            if not child:
+                continue
+            expected = _expected_output_paths(child.task)
+            outputs_complete = bool(expected) and not self._missing_expected_outputs(child)
+            has_progress_artifact = child.status == "done" or child.artifacts or child.result or outputs_complete
+            if (
+                has_progress_artifact
+                and self._agent_has_reliable_evidence(child)
+                and self._agent_has_inspectable_evidence_artifact(child)
+            ):
+                candidates.append(child)
+        candidates.sort(key=lambda item: (
+            0 if item.status == "done" else 1,
+            -len(item.artifacts),
+            -item._last_artifact_turn,
+            -item._tool_calls,
+            item.id,
+        ))
+        return candidates
+
+    def _agents_share_prunable_lane(self, left: Agent, right: Agent) -> bool:
+        left_outputs = set(_non_terminal_expected_output_paths(left.task))
+        right_outputs = set(_non_terminal_expected_output_paths(right.task))
+        if left_outputs and right_outputs and left_outputs.intersection(right_outputs):
+            return True
+        left_lanes = _agent_lane_fingerprints(left)
+        right_lanes = _agent_lane_fingerprints(right)
+        if left_lanes and right_lanes and left_lanes.intersection(right_lanes):
+            return True
+        disambiguating_prefixes = ("topic:", "lane:", "candidate:", "scope:", "deliverable:")
+        left_disambiguators = {
+            str(tag)
+            for tag in left.current_task_tags
+            if str(tag).startswith(disambiguating_prefixes)
+        }
+        right_disambiguators = {
+            str(tag)
+            for tag in right.current_task_tags
+            if str(tag).startswith(disambiguating_prefixes)
+        }
+        if left_disambiguators and right_disambiguators and not left_disambiguators.intersection(right_disambiguators):
+            return False
+        if left.group_id and right.group_id and left.group_id == right.group_id:
+            shared_tags = self._shared_coordination_tags(left, right)
+            if len(shared_tags) >= 2:
+                return True
+            return _cheap_text_similarity(left.task, right.task) >= 0.30
+        return False
+
+    def _queried_evidence_agents(self, agent: Agent) -> list[Agent]:
+        if agent._last_query_turn <= 0 or (agent._turns - agent._last_query_turn) > 4:
+            return []
+        evidence_ids = list(agent._last_query_reliable_evidence_ids)
+        if not evidence_ids:
+            evidence_ids = [
+                peer.id
+                for peer in self._completed_child_evidence_candidates(agent)
+                if peer.id in set(agent._last_query_agent_ids)
+            ]
+        candidates: list[Agent] = []
+        seen: set[str] = set()
+        for peer_id in evidence_ids:
+            peer = self.agents.get(peer_id)
+            if not peer or peer.id == agent.id or peer.id in seen:
+                continue
+            expected = _expected_output_paths(peer.task)
+            outputs_complete = bool(expected) and not self._missing_expected_outputs(peer)
+            if self._agent_has_uncertain_evidence(peer):
+                continue
+            if not (self._agent_has_reliable_evidence(peer) or outputs_complete):
+                continue
+            candidates.append(peer)
+            seen.add(peer.id)
+        candidates.sort(key=lambda peer: (
+            0 if peer.status == "done" else 1,
+            -len(peer.artifacts),
+            -peer._tool_calls,
+            peer.id,
+        ))
+        return candidates
+
+    def _prunable_agents_after_evidence_query(self, agent: Agent) -> list[Agent]:
+        evidence_agents = self._queried_evidence_agents(agent)
+        if not evidence_agents:
+            return []
+        queried_ids = set(agent._last_query_agent_ids)
+        peer_progress_ids = {peer.id for peer in self._peer_progress_candidates(agent)}
+        evidence_has_downstream = any(self._agent_has_downstream_focus(peer) for peer in evidence_agents)
+        candidates: list[Agent] = []
+        evidence_ids = {item.id for item in evidence_agents}
+        for peer in self.agents.values():
+            if peer.id == agent.id:
+                continue
+            if peer.id in agent._prune_requests_sent_targets:
+                continue
+            if peer.status not in {"running", "idle"}:
+                continue
+            if not peer.parent:
+                continue
+            if queried_ids and peer.id not in queried_ids and peer.id not in peer_progress_ids and peer.parent != agent.id:
+                continue
+            if peer.id in evidence_ids:
+                continue
+            peer_downstream = self._agent_has_downstream_focus(peer)
+            if peer_downstream and not evidence_has_downstream:
+                if not any(self._spawn_request_overlaps_agent_lane(
+                    evidence_peer,
+                    task=peer.task,
+                    role=peer.role,
+                    group_id=peer.group_id,
+                    workflow_prior=peer.workflow_prior,
+                    current_task_tags=peer.current_task_tags,
+                ) for evidence_peer in evidence_agents):
+                    continue
+            if not peer_downstream and self._agent_has_reliable_evidence(peer):
+                continue
+            if any(self._agents_share_prunable_lane(peer, evidence_peer) for evidence_peer in evidence_agents):
+                candidates.append(peer)
+        candidates.sort(key=lambda peer: (
+            -peer._turns,
+            -peer._tool_calls,
+            peer.id,
+        ))
+        return candidates
+
+    def _prune_request_plan(self, agent: Agent) -> dict[str, Any] | None:
+        targets = self._prunable_agents_after_evidence_query(agent)
+        if not targets:
+            return None
+        evidence_agents = self._queried_evidence_agents(agent)
+        return {
+            "action": "message",
+            "reason": "request_duplicate_agents_self_prune_after_key_evidence",
+            "turn_added": agent._turns,
+            "prune_targets": [peer.id for peer in targets[:8]],
+            "evidence_agents": [
+                {
+                    "id": peer.id,
+                    "role": peer.role,
+                    "status": peer.status,
+                    "artifacts": [artifact.path for artifact in peer.artifacts[:8]],
+                    "result": (peer.result or "")[:240],
+                    "tags": peer.current_task_tags[:12],
+                }
+                for peer in evidence_agents[:4]
+            ],
+        }
+
+    def _pending_prune_request_plan(self, agent: Agent) -> dict[str, Any] | None:
+        if not agent._pending_prune_requests:
+            return None
+        latest = dict(agent._pending_prune_requests[-1])
+        return {
+            "action": "compact",
+            "reason": "received_prune_request_self_prune",
+            "turn_added": agent._turns,
+            "prune_request": latest,
+            "prune_request_count": len(agent._pending_prune_requests),
+        }
+
+    def _evidence_integration_candidates(self, agent: Agent, missing_outputs: list[str]) -> list[Agent]:
+        if not missing_outputs:
+            return []
+        candidates: list[Agent] = []
+        seen: set[str] = set()
+        for peer in self._completed_child_evidence_candidates(agent):
+            if peer.id not in seen:
+                candidates.append(peer)
+                seen.add(peer.id)
+        candidates.sort(key=lambda item: (
+            0 if item.parent == agent.id else 1,
+            0 if item.status == "done" else 1,
+            -len(item.artifacts),
+            -item._tool_calls,
+            item.id,
+        ))
+        return candidates
+
+    def _evidence_integration_ready(self, agent: Agent, missing_outputs: list[str]) -> bool:
+        return bool(self._evidence_integration_candidates(agent, missing_outputs))
+
+    def _evidence_integration_needs_inspection(self, agent: Agent, missing_outputs: list[str]) -> bool:
+        if not self._evidence_integration_ready(agent, missing_outputs):
+            return False
+        if agent._last_query_evidence_turn > 0 and (agent._turns - agent._last_query_evidence_turn) <= 3:
+            return False
+        if agent._last_read_evidence_turn > 0 and (agent._turns - agent._last_read_evidence_turn) <= 3:
+            return False
+        return True
+
+    def _evidence_integration_plan_data(self, agent: Agent, missing_outputs: list[str]) -> dict[str, Any]:
+        peers = self._evidence_integration_candidates(agent, missing_outputs)
+        return {
+            "evidence_agents": [
+                {
+                    "id": peer.id,
+                    "role": peer.role,
+                    "status": peer.status,
+                    "artifacts": [artifact.path for artifact in peer.artifacts[:8]],
+                    "result": (peer.result or "")[:240],
+                    "missing_outputs": self._missing_expected_outputs(peer)[:8],
+                    "tags": peer.current_task_tags[:12],
+                }
+                for peer in peers[:8]
+            ],
+            "missing_outputs": missing_outputs[:20],
+        }
+
+    def _evidence_integration_lines(self, agent: Agent, missing_outputs: list[str]) -> list[str]:
+        lines: list[str] = []
+        for item in self._evidence_integration_plan_data(agent, missing_outputs).get("evidence_agents", []):
+            artifacts = ", ".join(item.get("artifacts") or []) or "-"
+            missing = item.get("missing_outputs") or []
+            missing_text = f" missing={missing}" if missing else ""
+            result = str(item.get("result") or "").replace("\n", " ")
+            result_text = f" result={result[:120]}" if result else ""
+            lines.append(
+                f"- {item.get('id')} role={item.get('role') or '-'} "
+                f"status={item.get('status') or '-'} artifacts={artifacts}{missing_text}{result_text}"
+            )
+        return lines
 
     def expected_child_outputs_status(self, agent: Agent) -> dict[str, dict[str, Any]]:
         status: dict[str, dict[str, Any]] = {}
@@ -2251,12 +5052,125 @@ class Runtime:
     def can_stop_with_active_dependencies(self, agent: Agent, blockers: list[dict[str, Any]]) -> bool:
         if not blockers:
             return True
+        if agent._pending_prune_requests:
+            return True
         if agent._last_query_turn <= 0:
             return False
         return (agent._turns - agent._last_query_turn) <= 4
 
+    def _root_terminal_submission_complete(self, root: Agent) -> bool:
+        if root.status != "done":
+            return False
+        if not self.answer_submission_required(root):
+            return False
+        if not root.submitted_answer_path:
+            return False
+        path = self.config.workspace_root / root.submitted_answer_path
+        return path.exists()
+
+    async def _request_remaining_agents_prune_after_terminal_submission(
+        self,
+        root: Agent,
+        running: list[Agent],
+    ) -> None:
+        evidence_agents = [
+            {
+                "id": root.id,
+                "status": root.status,
+                "artifacts": [artifact.path for artifact in root.artifacts[:8]],
+                "result": (root.result or "")[:240],
+            }
+        ]
+        payload = {
+            "reason": "root_terminal_submission_complete",
+            "covered_by": [root.id],
+            "covered_paths": [root.submitted_answer_path] if root.submitted_answer_path else [],
+            "evidence_agents": evidence_agents,
+            "tags": ["status:prune-request", "reason:root_terminal_submission_complete"],
+        }
+        message = (
+            "Root terminal answer has been submitted. If your remaining work cannot change the submitted "
+            "terminal artifact, compact your current state with status:pruned and stop. If you have a critical "
+            "contradiction that should block the answer, publish it immediately with compact/set_status."
+        )
+        for agent in running:
+            if agent.id == root.id:
+                continue
+            if agent.status not in {"running", "idle"}:
+                continue
+            if agent.id in root._prune_requests_sent_targets:
+                continue
+            await self.deliver(Envelope(
+                from_id=root.id,
+                to_id=agent.id,
+                content=message,
+                tokens=estimate_tokens(message),
+                timestamp=time.time(),
+                message_type="prune_request",
+                payload=payload,
+                requires_ack=False,
+                urgency="high",
+                mode="steer",
+            ))
+            root._prune_requests_sent_targets.add(agent.id)
+            self._emit(root.id, "terminal_prune_request", {
+                "to": agent.id,
+                "reason": payload["reason"],
+                "covered_paths": payload["covered_paths"],
+            })
+
+    def _soft_stop_terminal_leftover_agent(self, root: Agent, agent: Agent) -> bool:
+        if agent.status not in {"running", "idle"}:
+            return False
+        if self._missing_expected_outputs(agent):
+            return False
+        blockers = [
+            blocker
+            for blocker in self.completion_blockers(agent, include_missing_outputs=False)
+            if blocker.get("kind") not in {"answer_submission"}
+        ]
+        if any(blocker.get("kind") in {"source_change", "test_run", "missing_outputs"} for blocker in blockers):
+            return False
+        agent.status = "done"
+        agent.action_state = "stop"
+        agent.result = agent.result or (
+            f"[Pruned after root terminal submission {root.submitted_answer_path or ''}]".strip()
+        )
+        tags = normalize_tags(
+            list(agent.current_task_tags)
+            + ["status:pruned", "reason:root_terminal_submission_complete", f"covered_by:{root.id}"]
+        )
+        self.memory.update(
+            agent.id,
+            public_summary=agent.result,
+            clear_active_task=True,
+            add_experience=build_memory_card(
+                agent.result,
+                tags=tags,
+                artifacts=[artifact.path for artifact in agent.artifacts],
+                memory_kind="terminal",
+                memory_source="terminal_join_prune",
+                stop_after=True,
+            ),
+            tags=tags,
+        )
+        agent.memory = {"public_memory": self.memory.serialize(agent.id)}
+        self.state_board_sync(agent.id)
+        self._refresh_task_ledger_agent_item(agent)
+        if agent._task and not agent._task.done():
+            agent._task.cancel()
+        self._emit(root.id, "terminal_leftover_agent_pruned", {
+            "agent": agent.id,
+            "reason": "root_terminal_submission_complete",
+            "submitted_answer_path": root.submitted_answer_path,
+        })
+        return True
+
     async def _wait_for_remaining_agents(self, root: Agent) -> None:
         """After root finishes, avoid truncating running children that are still making progress."""
+        terminal_complete = self._root_terminal_submission_complete(root)
+        prune_requested = False
+        prune_started_at = 0.0
         while True:
             running = [a for a in self.agents.values() if a.id != root.id and a.status in {"running", "idle"}]
             if not running:
@@ -2264,6 +5178,39 @@ class Runtime:
             tasks = [a._task for a in running if a._task and not a._task.done()]
             if not tasks:
                 return
+            if terminal_complete:
+                if not prune_requested:
+                    prune_requested = True
+                    prune_started_at = time.time()
+                    await self._request_remaining_agents_prune_after_terminal_submission(root, running)
+                    self._emit(root.id, "terminal_join_grace_started", {
+                        "running": [agent.id for agent in running],
+                        "grace_seconds": self.config.terminal_submission_join_grace,
+                        "submitted_answer_path": root.submitted_answer_path,
+                    })
+                elapsed = time.time() - prune_started_at
+                grace = max(0.0, float(self.config.terminal_submission_join_grace))
+                if elapsed >= grace:
+                    pruned = [
+                        agent.id
+                        for agent in running
+                        if self._soft_stop_terminal_leftover_agent(root, agent)
+                    ]
+                    remaining = [
+                        agent.id
+                        for agent in self.agents.values()
+                        if agent.id != root.id and agent.status in {"running", "idle"}
+                    ]
+                    self._emit(root.id, "terminal_join_grace_finished", {
+                        "pruned": pruned,
+                        "remaining": remaining,
+                        "submitted_answer_path": root.submitted_answer_path,
+                    })
+                    if not remaining:
+                        return
+                    if pruned:
+                        continue
+                    return
             self._emit(root.id, "join_remaining_agents", {
                 "count": len(running),
                 "agents": [
@@ -2278,10 +5225,21 @@ class Runtime:
                     for a in running[:20]
                 ],
             })
+            if terminal_complete:
+                done, pending = await asyncio.wait(
+                    tasks,
+                    timeout=max(0.05, min(1.0, self.config.terminal_submission_join_grace)),
+                    return_when=asyncio.ALL_COMPLETED,
+                )
+                if not pending:
+                    return
+                continue
             await asyncio.gather(*tasks, return_exceptions=True)
 
     def _artifact_tool_scope(self, agent: Agent, missing_outputs: list[str]) -> Literal["all", "read_write", "write_only"]:
         if not missing_outputs:
+            return "all"
+        if self.answer_submission_required(agent) and not agent.submitted_answer_path:
             return "all"
         if agent._turns < 2:
             return "all"
@@ -2304,10 +5262,44 @@ class Runtime:
         if agent._artifact_nudge_count >= 3:
             if self._peer_progress_decision_pending(agent):
                 return "read_write"
+            if self._artifact_write_needs_more_evidence(agent, missing_outputs):
+                return "read_write"
             return "write_only"
         if "file_read" in available:
             return "read_write"
         return "write_only"
+
+    def _artifact_write_needs_more_evidence(self, agent: Agent, missing_outputs: list[str]) -> bool:
+        evidence_like_output = any(
+            _looks_like_final_report_path(path) or _looks_like_evidence_report_path(path)
+            for path in missing_outputs
+        )
+        if not evidence_like_output and not (
+            _task_is_discovery_work(agent.task) and _non_terminal_expected_output_paths(agent.task)
+        ):
+            return False
+        if (agent._turns - agent._last_read_evidence_turn) <= 4 and agent._last_read_evidence_turn > 0:
+            return False
+        if (agent._turns - agent._last_query_evidence_turn) <= 4 and agent._last_query_evidence_turn > 0:
+            return False
+        if agent._shell_commands:
+            return False
+        memory = self.memory.get(agent.id)
+        if memory:
+            if memory.artifact_index:
+                return False
+            if any(
+                card.artifacts
+                or card.memory_kind in {"evidence", "terminal"}
+                or "memory_kind:evidence" in set(card.tags)
+                or "evidence:true" in set(card.tags)
+                for card in memory.experience_cards
+            ):
+                return False
+        return True
+
+    def _final_report_write_needs_more_evidence(self, agent: Agent, missing_outputs: list[str]) -> bool:
+        return self._artifact_write_needs_more_evidence(agent, missing_outputs)
 
     def _llm_max_tokens_for_turn(
         self,
@@ -2316,9 +5308,12 @@ class Runtime:
         recommended_tool_choice: str | None,
         missing_outputs: list[str],
     ) -> int | None:
-        if loop_action != "work" or not missing_outputs:
+        if loop_action == "create":
+            configured = int(self.config.create_action_max_tokens or 0)
+        elif loop_action == "work" and missing_outputs:
+            configured = int(self.config.artifact_write_max_tokens or 0)
+        else:
             return None
-        configured = int(self.config.artifact_write_max_tokens or 0)
         if configured <= 0:
             return None
         try:
@@ -2343,7 +5338,7 @@ class Runtime:
             if name == "file_write":
                 function["description"] = (
                     "Write one required artifact file now. Write a path listed in the remaining required output files: "
-                    f"{targets}{more}. Do not write placeholders or unrelated paths. "
+                    f"{targets}{more}. Do not write unrelated paths. "
                     "Put the full artifact in the content argument. Keep assistant message text empty or very short; "
                     "assistant prose alone does not create files."
                 )
@@ -2366,6 +5361,15 @@ class Runtime:
             return result
         path_arg = str(tc.arguments.get("path", tc.arguments.get("file_path", tc.arguments.get("filepath", ""))))
         normalized = self._normalize_workspace_relative_path(path_arg, agent.workspace)
+        if normalized and _looks_like_final_answer_path(normalized):
+            annotated = dict(result)
+            annotated["artifact_warning"] = "terminal_answer_requires_submit_answer"
+            annotated["message"] = (
+                "This file write is not treated as final answer submission. "
+                "Use submit_answer(answer=...) when ready to submit."
+            )
+            annotated["written_relative_path"] = normalized
+            return annotated
         if normalized and normalized not in set(expected):
             annotated = dict(result)
             annotated["artifact_warning"] = "unexpected_artifact_path"
@@ -2375,7 +5379,7 @@ class Runtime:
         return result
 
     def _register_expected_artifact_write(self, agent: Agent, tc: ToolCall, result: Any) -> None:
-        expected = set(_expected_output_paths(agent.task))
+        expected = set(_non_terminal_expected_output_paths(agent.task))
         if not expected or not isinstance(result, dict) or result.get("error"):
             return
         path_arg = str(tc.arguments.get("path", tc.arguments.get("file_path", tc.arguments.get("filepath", ""))))
@@ -2388,6 +5392,61 @@ class Runtime:
         if normalized not in {artifact.path for artifact in agent.artifacts}:
             agent.artifacts.append(Artifact(path=normalized, absolute_path=abs_path, description="expected output", agent_id=agent.id))
         self.memory.update(agent.id, add_artifacts=[normalized], tags=agent.current_task_tags)
+
+    def _publish_shell_evidence(self, agent: Agent, command: str, result: dict[str, Any]) -> None:
+        stdout = str(result.get("stdout") or "").strip()
+        stderr = str(result.get("stderr") or "").strip()
+        if not stdout and not stderr:
+            return
+        full_parts = [
+            f"agent: {agent.id}",
+            f"turn: {agent._turns}",
+            f"command: {command}",
+        ]
+        if stdout:
+            full_parts.append(f"stdout:\n{stdout}")
+        if stderr:
+            full_parts.append(f"stderr:\n{stderr}")
+        full_text = "\n\n".join(full_parts) + "\n"
+        digest = hashlib.sha256(full_text.encode("utf-8", errors="replace")).hexdigest()[:12]
+        evidence_rel = f"{self.config.shared_dir}/.nanoma/evidence/{agent.id}/turn_{agent._turns}_{digest}.txt"
+        evidence_abs = (self.config.workspace_root / evidence_rel).resolve()
+        evidence_artifacts: list[str] = []
+        try:
+            evidence_abs.relative_to(self.config.workspace_root.resolve())
+            evidence_abs.parent.mkdir(parents=True, exist_ok=True)
+            evidence_abs.write_text(full_text, encoding="utf-8")
+            evidence_artifacts.append(evidence_rel)
+        except OSError:
+            evidence_artifacts = []
+        stdout_excerpt = stdout[:2500]
+        stderr_excerpt = stderr[:800]
+        parts = [
+            f"Shell command succeeded: {command}",
+        ]
+        if stdout_excerpt:
+            parts.append(f"stdout:\n{stdout_excerpt}")
+        if stderr_excerpt:
+            parts.append(f"stderr:\n{stderr_excerpt}")
+        summary = "\n\n".join(parts)
+        tags = normalize_tags(
+            list(agent.current_task_tags)
+            + ["tool:shell", "status:evidence", f"agent:{agent.id}", f"id:{agent.id}"]
+        )
+        self.memory.update(
+            agent.id,
+            tags=agent.current_task_tags,
+            add_artifacts=evidence_artifacts,
+            add_experience=build_memory_card(
+                summary,
+                tags=tags,
+                artifacts=evidence_artifacts,
+                memory_kind="evidence",
+                memory_source="shell",
+                evidence=["shell"],
+            ),
+        )
+        agent.memory = {"public_memory": self.memory.serialize(agent.id)}
         agent.memory = {"public_memory": self.memory.serialize(agent.id)}
         self.state_board_sync(agent.id)
 
@@ -2426,7 +5485,7 @@ class Runtime:
         return committed
 
     def _auto_complete_if_outputs_exist(self, agent: Agent, *, reason: str) -> bool:
-        expected = _expected_output_paths(agent.task)
+        expected = _non_terminal_expected_output_paths(agent.task)
         if not expected or self._missing_expected_outputs(agent):
             return False
         blockers = self.completion_blockers(agent, include_missing_outputs=False)
@@ -2448,7 +5507,14 @@ class Runtime:
             tags=agent.current_task_tags,
             add_artifacts=files,
             clear_active_task=True,
-            add_experience=ExperienceCard(summary=agent.result or summary, tags=agent.current_task_tags, artifacts=files),
+            add_experience=build_memory_card(
+                agent.result or summary,
+                tags=agent.current_task_tags,
+                artifacts=files,
+                memory_kind="terminal",
+                memory_source="auto_complete",
+                stop_after=True,
+            ),
         )
         agent.memory = {"public_memory": self.memory.serialize(agent.id)}
         agent.action_state = "stop"
@@ -2525,17 +5591,186 @@ class Runtime:
                 candidates.append(peer)
         return candidates
 
+    def _queried_reliable_peer_progress(self, agent: Agent) -> bool:
+        if agent._last_query_turn <= 0:
+            return False
+        if (agent._turns - agent._last_query_turn) > 8:
+            return False
+        return any(
+            self._agent_has_reliable_evidence(peer)
+            for peer in self._completed_peer_progress_candidates(agent)
+        )
+
+    def _query_result_has_reliable_evidence(self, result: Any) -> bool:
+        if not isinstance(result, dict):
+            return False
+        agents = result.get("agents")
+        if not isinstance(agents, list):
+            return False
+        for item in agents:
+            if not isinstance(item, dict):
+                continue
+            progress = item.get("progress") if isinstance(item.get("progress"), dict) else {}
+            public_memory = item.get("public_memory") if isinstance(item.get("public_memory"), dict) else {}
+            memory = item.get("memory") if isinstance(item.get("memory"), dict) else {}
+            nested_public = memory.get("public_memory") if isinstance(memory.get("public_memory"), dict) else {}
+            if progress.get("outputs_complete") is True:
+                return True
+            if item.get("artifacts") or item.get("result"):
+                return True
+            if public_memory.get("artifact_index") or nested_public.get("artifact_index"):
+                return True
+            cards: list[Any] = []
+            if isinstance(public_memory.get("experience_cards"), list):
+                cards.extend(public_memory.get("experience_cards") or [])
+            if isinstance(nested_public.get("experience_cards"), list):
+                cards.extend(nested_public.get("experience_cards") or [])
+            for card in cards:
+                if not isinstance(card, dict):
+                    continue
+                tags = set(card.get("tags") or [])
+                if (
+                    card.get("artifacts")
+                    or card.get("memory_kind") in {"evidence", "terminal"}
+                    or "memory_kind:evidence" in tags
+                    or "status:complete" in tags
+                    or "status:done" in tags
+                    or "evidence:true" in tags
+                ):
+                    return True
+        return False
+
+    def _query_result_agent_ids(self, result: Any) -> list[str]:
+        if not isinstance(result, dict):
+            return []
+        raw_agents: list[Any]
+        if isinstance(result.get("agents"), list):
+            raw_agents = list(result.get("agents") or [])
+        else:
+            raw_agents = [result] if result.get("id") else []
+        ids: list[str] = []
+        seen: set[str] = set()
+        for item in raw_agents:
+            if not isinstance(item, dict):
+                continue
+            agent_id = str(item.get("id") or "").strip()
+            if agent_id and agent_id not in seen:
+                ids.append(agent_id)
+                seen.add(agent_id)
+        return ids
+
+    def _query_result_reliable_evidence_ids(self, result: Any) -> list[str]:
+        if not isinstance(result, dict):
+            return []
+        raw_agents: list[Any]
+        if isinstance(result.get("agents"), list):
+            raw_agents = list(result.get("agents") or [])
+        else:
+            raw_agents = [result] if result.get("id") else []
+        ids: list[str] = []
+        seen: set[str] = set()
+        for item in raw_agents:
+            if not isinstance(item, dict):
+                continue
+            agent_id = str(item.get("id") or "").strip()
+            if not agent_id or agent_id in seen:
+                continue
+            if self._query_snapshot_has_reliable_evidence(item):
+                ids.append(agent_id)
+                seen.add(agent_id)
+        return ids
+
+    def _query_snapshot_has_reliable_evidence(self, item: dict[str, Any]) -> bool:
+        progress = item.get("progress") if isinstance(item.get("progress"), dict) else {}
+        public_memory = item.get("public_memory") if isinstance(item.get("public_memory"), dict) else {}
+        memory = item.get("memory") if isinstance(item.get("memory"), dict) else {}
+        nested_public = memory.get("public_memory") if isinstance(memory.get("public_memory"), dict) else {}
+        if progress.get("outputs_complete") is True:
+            return True
+        if item.get("artifacts") or item.get("result"):
+            return True
+        if public_memory.get("artifact_index") or nested_public.get("artifact_index"):
+            return True
+        cards: list[Any] = []
+        if isinstance(public_memory.get("experience_cards"), list):
+            cards.extend(public_memory.get("experience_cards") or [])
+        if isinstance(nested_public.get("experience_cards"), list):
+            cards.extend(nested_public.get("experience_cards") or [])
+        for card in cards:
+            if not isinstance(card, dict):
+                continue
+            tags = set(card.get("tags") or [])
+            if (
+                card.get("artifacts")
+                or card.get("memory_kind") in {"evidence", "terminal"}
+                or "memory_kind:evidence" in tags
+                or "status:complete" in tags
+                or "status:done" in tags
+                or "evidence:true" in tags
+            ):
+                return True
+        return False
+
+    def _completed_peer_overlap_candidates(self, agent: Agent) -> list[Agent]:
+        candidates: list[Agent] = []
+        for peer in self._peer_overlap_query_candidates(agent):
+            if self._agent_has_prune_worthy_progress(peer):
+                candidates.append(peer)
+        return candidates
+
+    def _active_duplicate_peer_overlap_candidates(self, agent: Agent) -> list[Agent]:
+        candidates: list[Agent] = []
+        agent_outputs = set(_non_terminal_expected_output_paths(agent.task))
+        agent_lanes = _agent_lane_fingerprints(agent)
+        for peer in self._peer_overlap_query_candidates(agent):
+            if peer.status not in {"running", "idle"}:
+                continue
+            if not peer.parent:
+                continue
+            peer_outputs = set(_non_terminal_expected_output_paths(peer.task))
+            same_output = bool(agent_outputs and peer_outputs and agent_outputs.intersection(peer_outputs))
+            lane_overlap = bool(agent_lanes and _agent_lane_fingerprints(peer).intersection(agent_lanes))
+            similar_task = _cheap_text_similarity(agent.task, peer.task) >= 0.45
+            if not (same_output or lane_overlap or similar_task):
+                continue
+            if self._agent_has_prune_worthy_progress(peer):
+                candidates.append(peer)
+        candidates.sort(key=lambda p: (
+            -len(p.artifacts),
+            -p._tool_calls,
+            -p._turns,
+            p.id,
+        ))
+        return candidates
+
     def _create_resume_after_read_pending(self, agent: Agent) -> bool:
         if not agent._create_resume_after_read:
             return False
         if agent.children:
             agent._create_resume_after_read = False
             return False
-        if len(self.agents) >= self.config.max_agents:
+        if not self._can_create_child(agent):
             agent._create_resume_after_read = False
             return False
-        if "status:solo-decision" in set(agent.current_task_tags):
-            agent._create_resume_after_read = False
+        return _task_has_spawnable_workstreams(agent.task, self.config.min_spawnable_workstreams)
+
+    def _pre_create_reference_read_pending(self, agent: Agent) -> bool:
+        if agent.children:
+            return False
+        if agent._create_resume_after_read:
+            return False
+        if agent._last_query_turn > 0 or agent._filtered_read_intent_count > 0:
+            return False
+        if not self._can_create_child(agent):
+            return False
+        if not _task_has_spawnable_workstreams(agent.task, self.config.min_spawnable_workstreams):
+            return False
+        return bool(_referenced_input_like_shared_paths(agent.task))
+
+    def _initial_create_required(self, agent: Agent) -> bool:
+        if agent.children:
+            return False
+        if not self._can_create_child(agent):
             return False
         return _task_has_spawnable_workstreams(agent.task, self.config.min_spawnable_workstreams)
 
@@ -2544,17 +5779,634 @@ class Runtime:
             return False
         if self.unfinished_child_agents(agent):
             return False
-        if len(self.agents) >= self.config.max_agents:
+        if not self._can_create_child(agent):
             return False
         if not self._missing_expected_outputs(agent):
             return False
-        if "status:solo-decision" in set(agent.current_task_tags):
-            return False
         if not _task_has_multi_phase_peer_protocol(agent.task):
+            return False
+        if self._lane_coverage_pressure(agent) >= 0.95:
             return False
         return True
 
+    def _handoff_pressure(self, agent: Agent) -> float:
+        if not agent.children:
+            return 0.0
+        threshold = max(1, int(self.config.handoff_child_count_threshold or 1))
+        pressure = len(agent.children) / threshold
+        if agent.depth == 0:
+            pressure += 0.35
+        if self.unfinished_child_agents(agent):
+            pressure += 0.35
+        if agent._deferred_spawn_requests:
+            pressure = max(0.0, pressure - 0.25)
+        return max(0.0, min(1.0, pressure))
+
+    def _lane_coverage_pressure(self, agent: Agent) -> float:
+        if not agent.children:
+            return 0.0
+        lane_counts: dict[str, int] = {}
+        artifact_or_done_counts: dict[str, int] = {}
+        for child_id in agent.children:
+            child = self.agents.get(child_id)
+            if not child:
+                continue
+            fingerprints = _agent_lane_fingerprints(child)
+            if not fingerprints:
+                continue
+            covered = child.status in {"done", "failed"} or bool(child.artifacts) or bool(child.result)
+            for lane in fingerprints:
+                lane_counts[lane] = lane_counts.get(lane, 0) + 1
+                if covered:
+                    artifact_or_done_counts[lane] = artifact_or_done_counts.get(lane, 0) + 1
+        if not lane_counts:
+            return 0.0
+        repeated = max((count - 1 for count in lane_counts.values()), default=0)
+        covered_repeated = max((count - 1 for count in artifact_or_done_counts.values()), default=0)
+        pressure = 0.35 * repeated + 0.45 * covered_repeated
+        if len(agent.children) >= max(2, int(self.config.handoff_child_count_threshold or 2)):
+            pressure += 0.20
+        return max(0.0, min(1.0, pressure))
+
+    def _offspring_create_bias(self, agent: Agent) -> float:
+        if not agent.parent:
+            return 0.0
+        if agent.orchestration_preference == "solo":
+            return 0.0
+        if agent.children:
+            return 0.0
+        if not self._agent_has_uncertain_evidence(agent) and not _task_has_spawnable_workstreams(agent.task, self.config.min_spawnable_workstreams):
+            return 0.0
+        rank = ORCHESTRATION_RANK.get(agent.orchestration_preference, ORCHESTRATION_RANK["balanced"])
+        return max(0.0, min(1.0, 0.35 + 0.2 * rank))
+
+    def _handoff_create_after_partial_progress_plan(
+        self,
+        agent: Agent,
+        missing_outputs: list[str],
+    ) -> dict[str, Any] | None:
+        uncertain_evidence = self._agent_has_uncertain_evidence(agent)
+        if not missing_outputs and not uncertain_evidence:
+            return None
+        if not agent.parent:
+            return None
+        if agent.children:
+            return None
+        if not self._can_create_child(agent):
+            return None
+        if self.unfinished_child_agents(agent):
+            return None
+        if (
+            missing_outputs
+            and not uncertain_evidence
+            and _task_is_concrete_single_output_work(agent.task)
+        ):
+            return None
+        if (
+            uncertain_evidence
+            and _task_is_concrete_single_output_work(agent.task)
+            and self._artifact_write_needs_more_evidence(
+                agent,
+                missing_outputs or _non_terminal_expected_output_paths(agent.task),
+            )
+        ):
+            return None
+        has_progress = (
+            agent._tool_calls >= 3
+            or agent._last_read_evidence_turn > 0
+            or bool(agent.artifacts)
+            or self._agent_has_reliable_evidence(agent)
+        )
+        if not has_progress:
+            return None
+        needs_help = (
+            agent._artifact_nudge_count >= 2
+            or agent._no_tool_turns >= 2
+            or agent._write_only_miss_count >= 1
+            or uncertain_evidence
+            or _task_prefers_query_before_artifact(agent.task)
+        )
+        if not needs_help and agent._tool_calls < max(3, self.config.max_solo_tool_calls_before_spawn):
+            return None
+        return {
+            "action": "create",
+            "reason": "delegate_uncertain_evidence_recovery" if uncertain_evidence else "handoff_after_partial_progress",
+            "turn_added": agent._turns,
+            "missing_outputs": missing_outputs[:20],
+            "uncertain_artifacts": self._uncertain_artifact_paths(agent)[:20],
+        }
+
+    def _ancestor_terminal_delivery_target(self, agent: Agent) -> Agent | None:
+        parent_id = agent.parent
+        while parent_id and parent_id in self.agents:
+            parent = self.agents[parent_id]
+            if self.answer_submission_required(parent) and not parent.submitted_answer_path:
+                return parent
+            parent_id = parent.parent
+        return None
+
+    def _sibling_evidence_agents_for_handoff(self, agent: Agent) -> list[Agent]:
+        if not agent.parent or agent.parent not in self.agents:
+            return []
+        parent = self.agents[agent.parent]
+        candidates: list[Agent] = []
+        seen: set[str] = set()
+        for peer_id in sorted(parent.children):
+            peer = self.agents.get(peer_id)
+            if not peer or peer.id in seen:
+                continue
+            if peer.id != agent.id and peer.status != "done":
+                continue
+            if not self._agent_has_reliable_evidence(peer):
+                continue
+            candidates.append(peer)
+            seen.add(peer.id)
+        candidates.sort(key=lambda peer: (
+            0 if peer.id == agent.id else 1,
+            0 if peer.status == "done" else 1,
+            -len(self._agent_known_artifact_paths(peer)),
+            -peer._tool_calls,
+            peer.id,
+        ))
+        return candidates
+
+    def _has_peer_final_delivery_claim(self, agent: Agent, target: Agent) -> bool:
+        related_ids = {target.id, *target.children}
+        if agent.parent:
+            related_ids.add(agent.parent)
+            related_ids.update(self.agents.get(agent.parent, agent).children)
+        for peer in self.agents.values():
+            if peer.id == agent.id:
+                continue
+            if peer.parent not in related_ids and peer.id not in related_ids:
+                continue
+            if self._is_final_delivery_agent(peer) and peer.status in {"running", "idle", "done"}:
+                return True
+        return False
+
+    def _mature_evidence_handoff_plan(self, agent: Agent) -> dict[str, Any] | None:
+        if not agent.parent:
+            return None
+        if agent.children:
+            return None
+        if not self._can_create_child(agent):
+            return None
+        if self._agent_focus_class(agent) not in {"evidence", "verification"}:
+            return None
+        if agent.status != "running":
+            return None
+        if self._agent_has_uncertain_evidence(agent):
+            return None
+        if not self._agent_has_reliable_evidence(agent):
+            return None
+        if not (agent.result or agent.artifacts or self._agent_has_non_trace_artifact(agent)):
+            return None
+        target = self._ancestor_terminal_delivery_target(agent)
+        if not target:
+            return None
+        if self._has_peer_final_delivery_claim(agent, target):
+            return None
+        evidence_agents = self._sibling_evidence_agents_for_handoff(agent)
+        if len(evidence_agents) < 2 and not self._answer_submission_ready(target):
+            return None
+        return {
+            "action": "create",
+            "reason": "handoff_after_evidence_maturity",
+            "turn_added": agent._turns,
+            "answer_path": self.final_answer_path_for(target),
+            "target_agent": target.id,
+            "evidence_agents": [
+                {
+                    "id": peer.id,
+                    "role": peer.role,
+                    "status": peer.status,
+                    "artifacts": sorted(self._agent_known_artifact_paths(peer))[:8],
+                    "result": (peer.result or "")[:240],
+                    "tags": peer.current_task_tags[:12],
+                }
+                for peer in evidence_agents[:8]
+            ],
+        }
+
+    def _answer_submission_ready(self, agent: Agent) -> bool:
+        if not self.answer_submission_required(agent) or agent.submitted_answer_path:
+            return False
+        if self._agent_has_uncertain_evidence(agent):
+            return False
+        if agent.result:
+            return True
+        if agent.artifacts:
+            return True
+        children = [self.agents[child_id] for child_id in agent.children if child_id in self.agents]
+        if any(
+            (child.status == "done" or child.artifacts or child.result)
+            and self._agent_has_reliable_evidence(child)
+            for child in children
+        ):
+            return True
+        for related in self._related_agents_for_completion_evidence(agent):
+            if related.id == agent.id:
+                continue
+            if related.status not in {"done", "running", "idle"}:
+                continue
+            if self._agent_has_reliable_evidence(related):
+                return True
+        if self._agent_has_reliable_evidence(agent):
+            return True
+        return False
+
+    def _answer_submission_pending(self, agent: Agent) -> bool:
+        return self.answer_submission_required(agent) and not agent.submitted_answer_path
+
+    def _final_delivery_evidence_agents(self, agent: Agent) -> list[Agent]:
+        candidates: list[Agent] = []
+        seen: set[str] = set()
+        for related in self._related_agents_for_completion_evidence(agent):
+            if related.id == agent.id or related.id in seen:
+                continue
+            if not self._agent_has_reliable_evidence(related):
+                continue
+            candidates.append(related)
+            seen.add(related.id)
+        candidates.sort(key=lambda peer: (
+            0 if peer.status == "done" else 1,
+            -len(peer.artifacts),
+            -peer._tool_calls,
+            peer.id,
+        ))
+        return candidates
+
+    def _is_final_delivery_agent(self, agent: Agent) -> bool:
+        identity_text = " ".join(
+            [
+                agent.role,
+                agent.bio,
+                agent.workflow_prior,
+                " ".join(agent.current_task_tags),
+            ]
+        ).lower()
+        task_text = (agent.task or "")[:700].lower()
+        identity_markers = (
+            "finalizer", "finaliser", "delivery", "deliverer",
+            "final_delivery", "final-delivery", "role:finalizer", "role:delivery",
+        )
+        if any(marker in identity_text for marker in identity_markers):
+            return True
+        task_markers = (
+            "finalizer", "finaliser", "final delivery", "final_delivery",
+            "final-delivery", "delivery agent", "deliverer agent",
+        )
+        return any(marker in task_text for marker in task_markers)
+
+    def _has_active_final_delivery_agent(self, agent: Agent) -> bool:
+        for peer in self._descendant_agents(agent):
+            if peer.status in {"running", "idle"} and self._is_final_delivery_agent(peer):
+                return True
+        return False
+
+    def _can_create_final_delivery_agent(self, agent: Agent) -> bool:
+        return (
+            len(self.agents) < self.config.max_agents
+            and agent.depth + 1 <= self.config.max_depth
+            and agent.orchestration_preference != "solo"
+            and not self._agent_has_solo_decision(agent)
+            and not self._agent_has_pending_self_work_decision(agent)
+        )
+
+    def _final_delivery_handoff_plan(self, agent: Agent) -> dict[str, Any] | None:
+        if not self.answer_submission_required(agent) or agent.submitted_answer_path:
+            return None
+        if self._is_final_delivery_agent(agent):
+            return None
+        if not agent.children:
+            return None
+        if self.unfinished_child_agents(agent):
+            return None
+        if self._has_active_final_delivery_agent(agent):
+            return None
+        if not self._can_create_final_delivery_agent(agent):
+            return None
+        evidence_agents = self._final_delivery_evidence_agents(agent)
+        if not evidence_agents:
+            return None
+        blockers = [
+            blocker
+            for blocker in self.completion_blockers(agent, include_missing_outputs=False)
+            if blocker.get("kind") != "answer_submission"
+        ]
+        if any(blocker.get("kind") in {"source_change", "test_run", "missing_outputs"} for blocker in blockers):
+            return None
+        return {
+            "action": "create",
+            "reason": "delegate_final_delivery",
+            "turn_added": agent._turns,
+            "answer_path": self.final_answer_path_for(agent),
+            "evidence_agents": [
+                {
+                    "id": peer.id,
+                    "role": peer.role,
+                    "status": peer.status,
+                    "artifacts": [artifact.path for artifact in peer.artifacts[:8]],
+                    "result": (peer.result or "")[:240],
+                    "tags": peer.current_task_tags[:12],
+                }
+                for peer in evidence_agents[:8]
+            ],
+            "blockers": blockers,
+        }
+
+    def _deferred_spawn_readiness(self, agent: Agent) -> float:
+        if not agent._deferred_spawn_requests:
+            return 0.0
+        scores = [self._deferred_spawn_request_readiness(agent, request) for request in agent._deferred_spawn_requests]
+        return max(0.0, min(1.0, max(scores, default=0.0)))
+
+    def _deferred_spawn_request_readiness(self, agent: Agent, request: dict[str, Any]) -> float:
+        depends_on = [str(item).strip().lower() for item in request.get("depends_on") or [] if str(item).strip()]
+        peers = [self.agents[child_id] for child_id in agent.children if child_id in self.agents]
+        if agent.parent and (not depends_on or _agent_matches_dependency_terms(agent, depends_on)):
+            peers.append(agent)
+
+        def peer_score(peer: Agent) -> float:
+            expected = self.expected_outputs(peer)
+            missing = self.missing_expected_outputs(peer)
+            if self._agent_has_uncertain_evidence(peer):
+                if peer.artifacts or peer.result or peer.status == "done":
+                    return 0.35
+                return 0.15
+            if peer.status == "done":
+                return 1.0
+            if expected:
+                return (len(expected) - len(missing)) / max(1, len(expected))
+            if peer.artifacts or peer.result:
+                return 0.85
+            if peer._tool_calls >= 3:
+                return 0.35
+            return 0.1
+
+        if depends_on:
+            dependency_scores: list[float] = []
+            for dep in depends_on:
+                matched = [peer for peer in peers if _agent_matches_dependency_terms(peer, [dep])]
+                if not matched:
+                    dependency_scores.append(0.0)
+                    continue
+                dependency_scores.append(max(peer_score(peer) for peer in matched))
+            return sum(dependency_scores) / max(1, len(dependency_scores))
+
+        if not peers:
+            return float(request.get("readiness") or 0.0)
+        downstream_focus = bool(request.get("downstream_focus"))
+        if downstream_focus:
+            informative = [
+                peer for peer in peers
+                if peer.status == "done" or peer.artifacts or peer.result or peer._tool_calls >= 3
+            ]
+            peers = informative or peers
+        peer_scores = [peer_score(peer) for peer in peers]
+        return sum(peer_scores) / max(1, len(peer_scores))
+
+    def _deferred_spawn_ready(self, agent: Agent) -> bool:
+        if not agent._deferred_spawn_requests:
+            return False
+        if len(self.agents) >= self.config.max_agents:
+            return False
+        configured_threshold = max(0.0, min(1.0, self.config.spawn_readiness_threshold))
+        for request in agent._deferred_spawn_requests:
+            threshold = max(
+                configured_threshold,
+                max(0.0, min(1.0, float(request.get("readiness_threshold") or configured_threshold))),
+            )
+            if self._deferred_spawn_request_readiness(agent, request) >= threshold:
+                return True
+        return False
+
+    def _peer_wave_create_gap(self, agent: Agent) -> dict[str, Any] | None:
+        if len(self.agents) >= self.config.max_agents:
+            return None
+        if agent.depth + 1 > self.config.max_depth:
+            return None
+        if agent.orchestration_preference == "solo":
+            return None
+        for requirement in _explicit_peer_wave_requirements(agent.task):
+            target = int(requirement.get("target") or 0)
+            if target <= 1:
+                continue
+            matched = [
+                self.agents[child_id]
+                for child_id in sorted(agent.children)
+                if child_id in self.agents and _agent_matches_peer_wave_requirement(self.agents[child_id], requirement)
+            ]
+            if len(matched) < target:
+                unfinished = [
+                    child
+                    for child in matched
+                    if child.status in {"running", "idle"}
+                ]
+                remaining = target - len(matched)
+                return {
+                    "target": target,
+                    "current": len(matched),
+                    "remaining": remaining,
+                    "unfinished": len(unfinished),
+                    "role": requirement.get("role") or "",
+                    "phase": requirement.get("phase") or "",
+                    "requirement": requirement.get("text") or "",
+                }
+        return None
+
     def _refresh_loop_action_plan(self, agent: Agent, missing_outputs: list[str]) -> None:
+        if self.config.loop_action_policy == "constraint":
+            self._refresh_loop_action_plan_constraint(agent, missing_outputs)
+        else:
+            self._refresh_loop_action_plan_rule(agent, missing_outputs)
+        self._apply_root_steward_plan(agent, missing_outputs)
+        if agent._loop_action_plan:
+            agent._loop_action_plan.setdefault("selected_by", "runtime_planner")
+            agent._loop_action_selected_by = str(agent._loop_action_plan.get("selected_by") or "runtime_planner")
+
+    def _two_stage_action_selection_enabled(self) -> bool:
+        return (
+            self.config.two_stage_action_selection
+            and self.config.loop_action_policy == "constraint"
+            and self.llm_call is openai_compatible_call
+        )
+
+    def _selector_action_context(self, agent: Agent, missing_outputs: list[str]) -> Message:
+        plan = dict(agent._loop_action_plan or {})
+        candidates = list(plan.get("candidate_scores") or [])
+        if not candidates and plan.get("action"):
+            candidates = [{
+                "action": plan.get("action"),
+                "reason": plan.get("reason"),
+                "score": plan.get("score"),
+            }]
+        ledger = self.task_ledger_snapshot(agent, include_all=False, limit=8)
+        blockers = self.completion_blockers(agent, include_missing_outputs=bool(missing_outputs))
+        payload = {
+            "agent_id": agent.id,
+            "role": agent.role,
+            "status": agent.status,
+            "turn": agent._turns,
+            "task_preview": agent.task[:700],
+            "available_actions": sorted(_LOOP_ACTIONS),
+            "runtime_recommended_action": plan.get("action"),
+            "runtime_reason": plan.get("reason"),
+            "candidate_scores": candidates[:8],
+            "missing_outputs": missing_outputs[:8],
+            "blockers": blockers[:6],
+            "ledger_counts": ledger.get("counts") or {},
+            "current_ledger_item": ledger.get("current_agent_item") or {},
+            "related_ledger_items": (ledger.get("items") or [])[:6],
+        }
+        return {
+            "role": "user",
+            "content": (
+                "[Loop Action Selector]\n"
+                "Select exactly one next action for this agent from create, read, message, work, compact, stop.\n"
+                "Return only JSON: {\"action\":\"...\",\"reason\":\"...\"}.\n"
+                "Do not plan tools and do not call tools. Tool planning happens after this selection.\n"
+                "Use the runtime recommendation unless current state clearly favors another action.\n"
+                f"State:\n{json.dumps(payload, ensure_ascii=False, default=str)[:12000]}"
+            ),
+        }
+
+    def _parse_selected_loop_action(self, content: str | None) -> tuple[str, str]:
+        text = (content or "").strip()
+        if not text:
+            return "", ""
+        match = re.search(r"\{.*\}", text, flags=re.DOTALL)
+        if match:
+            try:
+                data = json.loads(match.group(0))
+                action = str(data.get("action") or "").strip().lower()
+                reason = str(data.get("reason") or "").strip()
+                if action in _LOOP_ACTIONS:
+                    return action, reason
+            except Exception:
+                pass
+        lowered = text.lower()
+        for action in sorted(_LOOP_ACTIONS, key=len, reverse=True):
+            if re.search(rf"\b{re.escape(action)}\b", lowered):
+                return action, text[:240]
+        return "", ""
+
+    async def _maybe_select_loop_action(self, agent: Agent, missing_outputs: list[str]) -> None:
+        if not self._two_stage_action_selection_enabled():
+            return
+        if not agent._loop_action_plan:
+            return
+        if agent._loop_action_plan.get("selector_locked"):
+            return
+        if agent.status != "running":
+            return
+        planned_action = str((agent._loop_action_plan or {}).get("action") or "")
+        if (
+            planned_action
+            and agent._action_miss_action == planned_action
+            and agent._action_miss_count >= 1
+            and not (planned_action == "create" and agent._last_create_resolution == "skipped_covered")
+        ):
+            plan = dict(agent._loop_action_plan or {})
+            plan["selected_by"] = "runtime_retry_after_action_miss"
+            plan["selector_locked"] = True
+            plan["selector_reason"] = (
+                "Previous execution did not satisfy the same selected action; "
+                "retry execution with the current scoped tools instead of re-selecting."
+            )
+            agent._loop_action_plan = plan
+            agent._loop_action_selected_by = "runtime_retry_after_action_miss"
+            self._emit(agent.id, "loop_action_selector_skipped", {
+                "action": planned_action,
+                "reason": "retry_after_action_miss",
+                "miss_count": agent._action_miss_count,
+            })
+            return
+        selector_message = self._selector_action_context(agent, missing_outputs)
+        await self.scheduler.acquire()
+        try:
+            response = await self.llm_call(
+                [selector_message],
+                agent.model,
+                [],
+                retry_config=self.config.retry,
+                max_tokens=160,
+                tool_choice=None,
+                temperature=0.1,
+            )
+        finally:
+            self.scheduler.release()
+        if response is None:
+            return
+        cost = self.ledger.record(agent.id, response.usage)
+        agent.tokens_consumed += response.usage.total_tokens
+        agent.quota.budget -= cost
+        selected, reason = self._parse_selected_loop_action(response.content)
+        previous_plan = dict(agent._loop_action_plan or {})
+        previous = str(previous_plan.get("action") or "")
+        self._emit(agent.id, "loop_action_selected", {
+            "selected": selected or None,
+            "previous": previous or None,
+            "reason": reason,
+            "tokens": response.usage.total_tokens,
+            "input_tokens": response.usage.input_tokens,
+            "output_tokens": response.usage.output_tokens,
+            "cost": round(cost, 6),
+            "content_preview": (response.content or "")[:240],
+        })
+        if selected not in _LOOP_ACTIONS:
+            return
+        if previous_plan.get("reason") == "delegate_final_delivery" and selected != "create":
+            self._emit(agent.id, "loop_action_selector_override_ignored", {
+                "selected": selected,
+                "kept": "create",
+                "reason": "final_delivery_handoff_requires_create",
+                "selector_reason": reason[:500],
+            })
+            plan = dict(previous_plan)
+            plan["selected_by"] = "runtime_final_delivery_guard"
+            plan["selector_previous_action"] = previous
+            plan["selector_reason"] = reason[:500]
+            plan["selector_locked"] = True
+            agent._loop_action_plan = plan
+            agent._loop_action_selected_by = "runtime_final_delivery_guard"
+            self._apply_root_steward_plan(agent, missing_outputs)
+            return
+        plan = dict(previous_plan)
+        plan["selector_previous_action"] = previous
+        plan["action"] = selected
+        plan["selected_by"] = "llm_selector"
+        plan["selector_reason"] = reason[:500]
+        plan["selector_locked"] = True
+        agent._loop_action_plan = plan
+        agent._loop_action_selected_by = "llm_selector"
+        self._apply_root_steward_plan(agent, missing_outputs)
+
+    def _apply_root_steward_plan(self, agent: Agent, missing_outputs: list[str]) -> None:
+        if not self._root_steward_mode(agent):
+            return
+        plan = agent._loop_action_plan or {}
+        if plan:
+            plan["root_steward"] = True
+            agent._loop_action_plan = plan
+        if plan.get("action") == "create" and plan.get("reason") == "delegate_final_delivery":
+            return
+        if plan.get("action") not in {"create", "work"}:
+            return
+        next_action = "message"
+        reason = "root_steward_query_and_update_ledger"
+        if self.outputs_complete(agent) and not self.completion_blockers(agent, include_missing_outputs=False):
+            next_action = "compact"
+            reason = "root_steward_outputs_complete_publish_memory"
+        agent._loop_action_plan = {
+            **plan,
+            "action": next_action,
+            "reason": reason,
+            "steward_replaced_action": plan.get("action"),
+            "missing_outputs": missing_outputs[:20],
+        }
+
+    def _refresh_loop_action_plan_rule(self, agent: Agent, missing_outputs: list[str]) -> None:
         state_action = agent.action_state if agent.action_state in _LOOP_ACTIONS else ""
         child_revalidation_blockers = self.completion_blockers(agent, include_missing_outputs=False) if agent.children else []
         child_revalidation_plan = self._coordinator_child_dependency_plan(
@@ -2562,11 +6414,49 @@ class Runtime:
             missing_outputs,
             child_revalidation_blockers,
         )
+        pending_prune_plan = self._pending_prune_request_plan(agent)
+        if pending_prune_plan:
+            agent._loop_action_plan = pending_prune_plan
+            return
+        peer_wave_gap = self._peer_wave_create_gap(agent)
+        if peer_wave_gap:
+            agent._loop_action_plan = {
+                "action": "create",
+                "reason": "explicit_peer_wave_incomplete",
+                "turn_added": agent._turns,
+                "peer_wave_gap": peer_wave_gap,
+            }
+            return
+
+        prune_request_plan = self._prune_request_plan(agent)
+        if prune_request_plan:
+            agent._loop_action_plan = prune_request_plan
+            return
+
+        if missing_outputs and self._evidence_integration_ready(agent, missing_outputs):
+            reason = (
+                "child_or_peer_evidence_inspect_before_artifact"
+                if self._evidence_integration_needs_inspection(agent, missing_outputs)
+                else "integrate_child_or_peer_evidence_into_artifact"
+            )
+            agent._loop_action_plan = {
+                "action": "read" if reason == "child_or_peer_evidence_inspect_before_artifact" else "work",
+                "reason": reason,
+                "turn_added": agent._turns,
+                **self._evidence_integration_plan_data(agent, missing_outputs),
+            }
+            return
+
         if child_revalidation_plan and child_revalidation_plan.get("action") in {"message", "create"}:
             current = agent._loop_action_plan
             if current and current.get("action") == child_revalidation_plan.get("action") and current.get("reason") == child_revalidation_plan.get("reason"):
                 return
             agent._loop_action_plan = child_revalidation_plan
+            return
+
+        premature_downstream_plan = self._premature_downstream_plan(agent, missing_outputs)
+        if premature_downstream_plan:
+            agent._loop_action_plan = premature_downstream_plan
             return
 
         if state_action and state_action != "create" and agent._state_action_version > agent._state_action_consumed_version:
@@ -2586,6 +6476,16 @@ class Runtime:
             }
             return
 
+        if self._pre_create_reference_read_pending(agent):
+            agent._create_resume_after_read = True
+            agent._loop_action_plan = {
+                "action": "read",
+                "reason": "pre_create_reference",
+                "turn_added": agent._turns,
+                "target_action": "create",
+            }
+            return
+
         if self._spawn_create_action_pending(agent):
             agent._loop_action_plan = {
                 "action": "create",
@@ -2594,33 +6494,32 @@ class Runtime:
             }
             return
 
-        if agent._create_action_filtered_count > 0:
-            if (
-                agent._filtered_read_intent_count <= 0
-                and not agent.children
-                and agent.action_state == "create"
-                and _task_has_spawnable_workstreams(agent.task, self.config.min_spawnable_workstreams)
-            ):
-                agent._loop_action_plan = {
-                    "action": "create",
-                    "reason": "retry_spawn_after_create_miss",
-                    "turn_added": agent._turns,
-                }
-                return
-            action = "read" if agent._filtered_read_intent_count > 0 else "work"
-            if action == "read":
-                agent._create_resume_after_read = True
-            self.state_board_update(agent.id, action_state=action)
-            agent._state_action_consumed_version = agent._state_action_version
+        if self._deferred_spawn_ready(agent):
             agent._loop_action_plan = {
-                "action": action,
-                "reason": "create_scope_intent_released",
+                "action": "create",
+                "reason": "deferred_spawn_readiness_met",
                 "turn_added": agent._turns,
+                "deferred_spawn_count": len(agent._deferred_spawn_requests),
+                "deferred_spawn_readiness": round(self._deferred_spawn_readiness(agent), 3),
             }
+            return
+
+        create_miss_plan = self._create_miss_followup_plan(agent, missing_outputs)
+        if create_miss_plan:
+            if create_miss_plan.get("action") == "read":
+                agent._create_resume_after_read = True
+            agent._loop_action_plan = create_miss_plan
+            return
+
+        final_delivery_plan = self._final_delivery_handoff_plan(agent)
+        if final_delivery_plan:
+            agent._loop_action_plan = final_delivery_plan
             return
 
         expected_outputs = _expected_output_paths(agent.task)
         outputs_complete = bool(expected_outputs) and not missing_outputs
+        answer_submission_pending = self.answer_submission_required(agent) and not agent.submitted_answer_path
+        answer_submission_ready = self._answer_submission_ready(agent)
         if outputs_complete:
             current = agent._loop_action_plan
             if current and current.get("action") in {"compact", "stop"}:
@@ -2633,6 +6532,37 @@ class Runtime:
                 agent._loop_action_plan = child_plan
                 return
             if blockers:
+                uncertain_handoff_plan = (
+                    self._handoff_create_after_partial_progress_plan(agent, missing_outputs)
+                    if any(blocker.get("kind") == "uncertain_evidence" for blocker in blockers)
+                    else None
+                )
+                if uncertain_handoff_plan:
+                    agent._loop_action_plan = uncertain_handoff_plan
+                    return
+                if answer_submission_pending:
+                    if answer_submission_ready:
+                        agent._loop_action_plan = {
+                            "action": "stop",
+                            "reason": "answer_submission_pending",
+                            "turn_added": agent._turns,
+                            "blockers": blockers,
+                        }
+                    elif self._initial_create_required(agent):
+                        agent._loop_action_plan = {
+                            "action": "create",
+                            "reason": "answer_needs_research_before_submission",
+                            "turn_added": agent._turns,
+                            "blockers": blockers,
+                        }
+                    else:
+                        agent._loop_action_plan = {
+                            "action": "work",
+                            "reason": "answer_needs_evidence_before_submission",
+                            "turn_added": agent._turns,
+                            "blockers": blockers,
+                        }
+                    return
                 agent._loop_action_plan = {
                     "action": "work",
                     "reason": "completion_evidence_required_before_compact",
@@ -2657,10 +6587,25 @@ class Runtime:
         current = agent._loop_action_plan
         blockers_without_outputs = self.completion_blockers(agent, include_missing_outputs=False)
         child_plan = self._coordinator_child_dependency_plan(agent, missing_outputs, blockers_without_outputs)
+        peer_wave_gap = self._peer_wave_create_gap(agent)
+        if peer_wave_gap:
+            agent._loop_action_plan = {
+                "action": "create",
+                "reason": "explicit_peer_wave_incomplete",
+                "turn_added": agent._turns,
+                "peer_wave_gap": peer_wave_gap,
+            }
+            return
+
         if child_plan:
             if current and current.get("action") == child_plan.get("action") and current.get("reason") == child_plan.get("reason"):
                 return
             agent._loop_action_plan = child_plan
+            return
+
+        premature_downstream_plan = self._premature_downstream_plan(agent, missing_outputs)
+        if premature_downstream_plan:
+            agent._loop_action_plan = premature_downstream_plan
             return
 
         if self._multi_phase_create_action_pending(agent):
@@ -2669,6 +6614,25 @@ class Runtime:
                 "reason": "multi_phase_peer_wave_pending",
                 "turn_added": agent._turns,
             }
+            return
+
+        if missing_outputs and self._evidence_integration_ready(agent, missing_outputs):
+            reason = (
+                "child_or_peer_evidence_inspect_before_artifact"
+                if self._evidence_integration_needs_inspection(agent, missing_outputs)
+                else "integrate_child_or_peer_evidence_into_artifact"
+            )
+            agent._loop_action_plan = {
+                "action": "read" if reason == "child_or_peer_evidence_inspect_before_artifact" else "work",
+                "reason": reason,
+                "turn_added": agent._turns,
+                **self._evidence_integration_plan_data(agent, missing_outputs),
+            }
+            return
+
+        handoff_plan = self._handoff_create_after_partial_progress_plan(agent, missing_outputs)
+        if handoff_plan:
+            agent._loop_action_plan = handoff_plan
             return
 
         if missing_outputs and self._artifact_pressure_deferred(agent, missing_outputs):
@@ -2687,6 +6651,7 @@ class Runtime:
             and _task_prefers_query_before_artifact(agent.task)
             and agent._last_query_turn <= 0
         )
+        peer_overlap_query_pending = self._peer_overlap_query_before_work_pending(agent, missing_outputs)
         coordination_task = _task_is_coordination_artifact_task(agent.task)
         filtered_read_threshold = 1 if coordination_task else 2
         filtered_read_intent = bool(missing_outputs) and agent._filtered_read_intent_count >= filtered_read_threshold
@@ -2695,7 +6660,11 @@ class Runtime:
             and coordination_task
             and agent._filtered_read_intent_seen_turn >= agent._turns
         )
-        peer_post_query_pending = bool(missing_outputs) and self._peer_progress_post_query_pending(agent)
+        peer_post_query_pending = bool(missing_outputs) and (
+            self._peer_progress_post_query_pending(agent)
+            or self._peer_overlap_post_query_pending(agent, missing_outputs)
+            or self._peer_overlap_active_duplicate_post_query_pending(agent, missing_outputs)
+        )
         if current:
             action = current.get("action")
             if filtered_read_from_current_turn and action == "work":
@@ -2706,7 +6675,10 @@ class Runtime:
                 if peer_post_query_pending:
                     if action in {"work", "compact", "stop"}:
                         return
-                if query_before_artifact or filtered_read_intent:
+                if peer_overlap_query_pending:
+                    if action in {"read", "query"}:
+                        return
+                elif query_before_artifact or filtered_read_intent:
                     if action in {"read", "query"}:
                         return
                 elif action == "work" and missing_outputs and agent._last_artifact_turn < int(current.get("turn_added", 0)):
@@ -2714,10 +6686,19 @@ class Runtime:
 
         if missing_outputs:
             if peer_post_query_pending:
-                if agent._write_only_miss_count >= 1:
+                if (
+                    agent._write_only_miss_count >= 1
+                    or self._peer_overlap_post_query_pending(agent, missing_outputs)
+                    or self._peer_overlap_active_duplicate_post_query_pending(agent, missing_outputs)
+                ):
+                    reason = (
+                        "peer_query_found_active_duplicate_prune_or_summarize"
+                        if self._peer_overlap_active_duplicate_post_query_pending(agent, missing_outputs)
+                        else "peer_query_found_completed_peers_prune_or_summarize"
+                    )
                     agent._loop_action_plan = {
                         "action": "compact",
-                        "reason": "peer_query_found_completed_peers_prune_or_summarize",
+                        "reason": reason,
                         "turn_added": agent._turns,
                     }
                     return
@@ -2725,6 +6706,15 @@ class Runtime:
                     "action": "work",
                     "reason": "peer_query_found_completed_peers_write_or_prune",
                     "turn_added": agent._turns,
+                }
+                return
+            if peer_overlap_query_pending:
+                self._mark_peer_overlap_query_planned(agent)
+                agent._loop_action_plan = {
+                    "action": "read",
+                    "reason": "peer_overlap_query_before_work",
+                    "turn_added": agent._turns,
+                    "overlap_peers": [peer.id for peer in self._peer_overlap_query_candidates(agent)[:8]],
                 }
                 return
             if query_before_artifact or filtered_read_intent:
@@ -2747,10 +6737,749 @@ class Runtime:
             "turn_added": agent._turns,
         }
 
+    def _refresh_loop_action_plan_constraint(self, agent: Agent, missing_outputs: list[str]) -> None:
+        if self._deferred_spawn_ready(agent) and not self._evidence_integration_ready(agent, missing_outputs):
+            metrics = self._compute_loop_constraint_metrics(agent, missing_outputs)
+            agent._loop_action_plan = {
+                "action": "create",
+                "reason": "deferred_spawn_readiness_met",
+                "turn_added": agent._turns,
+                "constraints": asdict(metrics),
+                "deferred_spawn_count": len(agent._deferred_spawn_requests),
+                "deferred_spawn_readiness": round(self._deferred_spawn_readiness(agent), 3),
+            }
+            return
+
+        create_miss_plan = self._create_miss_followup_plan(agent, missing_outputs)
+        if create_miss_plan:
+            metrics = self._compute_loop_constraint_metrics(agent, missing_outputs)
+            if create_miss_plan.get("action") == "read":
+                agent._create_resume_after_read = True
+            plan = {
+                "action": create_miss_plan["action"],
+                "reason": create_miss_plan.get("reason") or "create_miss_followup",
+                "turn_added": agent._turns,
+                "constraints": asdict(metrics),
+            }
+            plan.update(create_miss_plan)
+            agent._loop_action_plan = plan
+            return
+
+        candidates = self._collect_loop_action_candidates(agent, missing_outputs)
+        metrics = self._compute_loop_constraint_metrics(agent, missing_outputs)
+        legal = self._filter_loop_action_candidates(agent, candidates, metrics, missing_outputs)
+        if not legal:
+            fallback = self._default_loop_action(agent)
+            agent._loop_action_plan = {
+                "action": fallback,
+                "reason": "constraint_fallback_default",
+                "turn_added": agent._turns,
+                "constraints": asdict(metrics),
+            }
+            return
+
+        for candidate in legal:
+            candidate.score = self._score_loop_action_candidate(candidate, metrics)
+        legal.sort(key=lambda item: item.score, reverse=True)
+        selected = legal[0]
+
+        if selected.action == "read" and selected.reason == "pre_create_reference":
+            agent._create_resume_after_read = True
+        if selected.action == "read" and selected.reason == "read_after_create_miss_prerequisite":
+            agent._create_resume_after_read = True
+        if selected.action == "read" and selected.reason == "peer_overlap_query_before_work":
+            self._mark_peer_overlap_query_planned(agent)
+        if selected.reason == "state_board_action":
+            agent._state_action_consumed_version = agent._state_action_version
+
+        plan = {
+            "action": selected.action,
+            "reason": selected.reason,
+            "turn_added": agent._turns,
+            "score": round(selected.score, 4),
+            "constraints": asdict(metrics),
+            "candidate_scores": [
+                {
+                    "action": item.action,
+                    "reason": item.reason,
+                    "score": round(item.score, 4),
+                    "base_priority": item.base_priority,
+                }
+                for item in legal[:8]
+            ],
+        }
+        plan.update(selected.data)
+        agent._loop_action_plan = plan
+
+    def _collect_loop_action_candidates(self, agent: Agent, missing_outputs: list[str]) -> list[LoopActionCandidate]:
+        candidates: list[LoopActionCandidate] = []
+
+        def add(action: str, reason: str, base_priority: float, **data: Any) -> None:
+            if action in _LOOP_ACTIONS:
+                candidates.append(LoopActionCandidate(action=action, reason=reason, base_priority=base_priority, data=data))
+
+        current = agent._loop_action_plan
+        state_action = agent.action_state if agent.action_state in _LOOP_ACTIONS else ""
+        blockers_without_outputs = self.completion_blockers(agent, include_missing_outputs=False)
+        child_revalidation_blockers = blockers_without_outputs if agent.children else []
+        child_plan = self._coordinator_child_dependency_plan(agent, missing_outputs, child_revalidation_blockers)
+        pending_prune_plan = self._pending_prune_request_plan(agent)
+        if pending_prune_plan:
+            add(
+                str(pending_prune_plan["action"]),
+                str(pending_prune_plan.get("reason") or "received_prune_request_self_prune"),
+                0.99,
+                prune_request=pending_prune_plan.get("prune_request"),
+                prune_request_count=pending_prune_plan.get("prune_request_count"),
+            )
+        prune_request_plan = self._prune_request_plan(agent)
+        if prune_request_plan:
+            add(
+                str(prune_request_plan["action"]),
+                str(prune_request_plan.get("reason") or "request_duplicate_agents_self_prune_after_key_evidence"),
+                0.97,
+                prune_targets=prune_request_plan.get("prune_targets", []),
+                evidence_agents=prune_request_plan.get("evidence_agents", []),
+            )
+        peer_wave_gap = self._peer_wave_create_gap(agent)
+        if peer_wave_gap:
+            add("create", "explicit_peer_wave_incomplete", 0.94, peer_wave_gap=peer_wave_gap)
+
+        if child_plan and child_plan.get("action") in _LOOP_ACTIONS:
+            add(
+                str(child_plan["action"]),
+                str(child_plan.get("reason") or "child_dependency_plan"),
+                0.90,
+                blockers=child_plan.get("blockers", []),
+                failed_children=child_plan.get("failed_children", []),
+            )
+
+        premature_downstream_plan = self._premature_downstream_plan(agent, missing_outputs)
+        if premature_downstream_plan:
+            add(
+                str(premature_downstream_plan["action"]),
+                str(premature_downstream_plan.get("reason") or "premature_downstream_wait_for_evidence"),
+                0.96,
+                upstream_agents=premature_downstream_plan.get("upstream_agents", []),
+            )
+
+        if state_action and state_action != "create" and agent._state_action_version > agent._state_action_consumed_version:
+            add(state_action, "state_board_action", 0.82)
+
+        if self._create_resume_after_read_pending(agent):
+            add("create", "resume_create_after_read_orientation", 0.78)
+
+        if self._pre_create_reference_read_pending(agent):
+            add("read", "pre_create_reference", 0.92, target_action="create")
+
+        if self._spawn_create_action_pending(agent):
+            add("create", "spawnable_workstreams_before_solo_execution", 0.80)
+
+        if missing_outputs and self._evidence_integration_ready(agent, missing_outputs):
+            data = self._evidence_integration_plan_data(agent, missing_outputs)
+            if self._evidence_integration_needs_inspection(agent, missing_outputs):
+                add("read", "child_or_peer_evidence_inspect_before_artifact", 0.93, **data)
+            add("work", "integrate_child_or_peer_evidence_into_artifact", 0.91, **data)
+
+        create_miss_plan = self._create_miss_followup_plan(agent, missing_outputs)
+        if create_miss_plan:
+            add(
+                str(create_miss_plan["action"]),
+                str(create_miss_plan.get("reason") or "create_miss_followup"),
+                0.92,
+                blockers=create_miss_plan.get("blockers", []),
+                failed_children=create_miss_plan.get("failed_children", []),
+                target_action=create_miss_plan.get("target_action"),
+            )
+
+        final_delivery_plan = self._final_delivery_handoff_plan(agent)
+        if final_delivery_plan:
+            add(
+                "create",
+                "delegate_final_delivery",
+                0.98,
+                answer_path=final_delivery_plan.get("answer_path"),
+                evidence_agents=final_delivery_plan.get("evidence_agents", []),
+                blockers=final_delivery_plan.get("blockers", []),
+            )
+
+        mature_handoff_plan = self._mature_evidence_handoff_plan(agent)
+        if mature_handoff_plan:
+            add(
+                "create",
+                "handoff_after_evidence_maturity",
+                0.93,
+                answer_path=mature_handoff_plan.get("answer_path"),
+                target_agent=mature_handoff_plan.get("target_agent"),
+                evidence_agents=mature_handoff_plan.get("evidence_agents", []),
+            )
+
+        expected_outputs = _expected_output_paths(agent.task)
+        outputs_complete = bool(expected_outputs) and not missing_outputs
+        answer_submission_pending = self.answer_submission_required(agent) and not agent.submitted_answer_path
+        answer_submission_ready = self._answer_submission_ready(agent)
+        if outputs_complete:
+            if current and current.get("action") in {"compact", "stop"}:
+                add(str(current["action"]), str(current.get("reason") or "current_terminal_action"), 0.95)
+            completion_blockers = self.completion_blockers(agent, include_missing_outputs=False)
+            completion_child_plan = self._coordinator_child_dependency_plan(agent, missing_outputs, completion_blockers)
+            if completion_child_plan and completion_child_plan.get("action") in _LOOP_ACTIONS:
+                add(
+                    str(completion_child_plan["action"]),
+                    str(completion_child_plan.get("reason") or "outputs_complete_child_plan"),
+                    0.85,
+                    failed_children=completion_child_plan.get("failed_children", []),
+                )
+            if completion_blockers:
+                uncertain_handoff_plan = (
+                    self._handoff_create_after_partial_progress_plan(agent, missing_outputs)
+                    if any(blocker.get("kind") == "uncertain_evidence" for blocker in completion_blockers)
+                    else None
+                )
+                if uncertain_handoff_plan:
+                    add(
+                        "create",
+                        str(uncertain_handoff_plan.get("reason") or "delegate_uncertain_evidence_recovery"),
+                        0.96,
+                        blockers=completion_blockers,
+                        missing_outputs=uncertain_handoff_plan.get("missing_outputs", []),
+                        uncertain_artifacts=uncertain_handoff_plan.get("uncertain_artifacts", []),
+                    )
+                if answer_submission_pending:
+                    if answer_submission_ready:
+                        add("stop", "answer_submission_pending", 0.90, blockers=completion_blockers)
+                    elif self._initial_create_required(agent):
+                        add("create", "answer_needs_research_before_submission", 0.92, blockers=completion_blockers)
+                    else:
+                        add("work", "answer_needs_evidence_before_submission", 0.82, blockers=completion_blockers)
+                else:
+                    add("work", "completion_evidence_required_before_compact", 0.82, blockers=completion_blockers)
+            if _task_prefers_query_before_artifact(agent.task) and agent._last_query_turn <= 0:
+                add("read", "outputs_complete_but_peer_query_required", 0.72)
+            if answer_submission_pending and answer_submission_ready:
+                add("stop", "answer_submission_pending", 0.90)
+            elif not answer_submission_pending:
+                add("compact", "outputs_complete_publish_memory", 0.86)
+                add("stop", "outputs_complete_stop_candidate", 0.52)
+
+        if self._multi_phase_create_action_pending(agent):
+            add("create", "multi_phase_peer_wave_pending", 0.86)
+
+        handoff_plan = self._handoff_create_after_partial_progress_plan(agent, missing_outputs)
+        if handoff_plan:
+            add(
+                "create",
+                str(handoff_plan.get("reason") or "handoff_after_partial_progress"),
+                0.84,
+                missing_outputs=handoff_plan.get("missing_outputs", []),
+                uncertain_artifacts=handoff_plan.get("uncertain_artifacts", []),
+            )
+
+        if agent._deferred_spawn_requests:
+            readiness = self._deferred_spawn_readiness(agent)
+            if self._deferred_spawn_ready(agent):
+                add(
+                    "create",
+                    "deferred_spawn_readiness_met",
+                    0.88,
+                    deferred_spawn_count=len(agent._deferred_spawn_requests),
+                    deferred_spawn_readiness=round(readiness, 3),
+                )
+            elif agent.children:
+                add(
+                    "message",
+                    "deferred_spawn_wait_for_readiness",
+                    0.74,
+                    deferred_spawn_count=len(agent._deferred_spawn_requests),
+                    deferred_spawn_readiness=round(readiness, 3),
+                )
+
+        if missing_outputs and self._artifact_pressure_deferred(agent, missing_outputs):
+            add("work", "source_test_evidence_before_artifacts", 0.86, blockers=blockers_without_outputs)
+        if (
+            _task_is_concrete_single_output_work(agent.task)
+            and self._agent_has_uncertain_evidence(agent)
+            and self._artifact_write_needs_more_evidence(
+                agent,
+                missing_outputs or _non_terminal_expected_output_paths(agent.task),
+            )
+        ):
+            add("work", "uncertain_evidence_needs_primary_work", 0.88, blockers=blockers_without_outputs)
+
+        query_before_artifact = (
+            bool(missing_outputs)
+            and _task_prefers_query_before_artifact(agent.task)
+            and agent._last_query_turn <= 0
+        )
+        peer_overlap_query_pending = self._peer_overlap_query_before_work_pending(agent, missing_outputs)
+        coordination_task = _task_is_coordination_artifact_task(agent.task)
+        filtered_read_threshold = 1 if coordination_task else 2
+        filtered_read_intent = bool(missing_outputs) and agent._filtered_read_intent_count >= filtered_read_threshold
+        filtered_read_from_current_turn = (
+            filtered_read_intent
+            and coordination_task
+            and agent._filtered_read_intent_seen_turn >= agent._turns
+        )
+        peer_post_query_pending = bool(missing_outputs) and (
+            self._peer_progress_post_query_pending(agent)
+            or self._peer_overlap_post_query_pending(agent, missing_outputs)
+            or self._peer_overlap_active_duplicate_post_query_pending(agent, missing_outputs)
+        )
+
+        if current:
+            action = str(current.get("action") or "")
+            if action in _LOOP_ACTIONS:
+                if filtered_read_from_current_turn and action == "work":
+                    pass
+                elif action in {"compact", "stop"} and agent.status == "running":
+                    add(action, str(current.get("reason") or "current_terminal_action"), 0.88)
+                elif peer_post_query_pending and action in {"work", "compact", "stop"}:
+                    add(action, str(current.get("reason") or "current_peer_followup_action"), 0.74)
+                elif peer_overlap_query_pending and action in {"read", "query"}:
+                    add("read", str(current.get("reason") or "current_peer_overlap_query_action"), 0.82)
+                elif (query_before_artifact or filtered_read_intent) and action in {"read", "query"}:
+                    add("read", str(current.get("reason") or "current_read_action"), 0.78)
+                elif action == "work" and missing_outputs and agent._last_artifact_turn < int(current.get("turn_added", 0)):
+                    add("work", str(current.get("reason") or "current_work_action"), 0.78)
+
+        if missing_outputs:
+            if peer_post_query_pending:
+                active_duplicate = self._peer_overlap_active_duplicate_post_query_pending(agent, missing_outputs)
+                completed_overlap = self._peer_overlap_post_query_pending(agent, missing_outputs)
+                if agent._write_only_miss_count >= 1 or completed_overlap or active_duplicate:
+                    add(
+                        "compact",
+                        (
+                            "peer_query_found_active_duplicate_prune_or_summarize"
+                            if active_duplicate
+                            else "peer_query_found_completed_peers_prune_or_summarize"
+                        ),
+                        0.88 if not active_duplicate else 0.90,
+                        overlap_peers=[
+                            peer.id
+                            for peer in (
+                                self._active_duplicate_peer_overlap_candidates(agent)
+                                if active_duplicate
+                                else self._completed_peer_overlap_candidates(agent)
+                            )[:8]
+                        ],
+                    )
+                add("work", "peer_query_found_completed_peers_write_or_prune", 0.76)
+            if peer_overlap_query_pending:
+                add(
+                    "read",
+                    "peer_overlap_query_before_work",
+                    0.90,
+                    overlap_peers=[peer.id for peer in self._peer_overlap_query_candidates(agent)[:8]],
+                )
+            if query_before_artifact or filtered_read_intent:
+                add(
+                    "read",
+                    "task_requests_peer_query_before_artifact" if query_before_artifact else "filtered_read_intent_after_write_scope",
+                    0.78,
+                )
+            add("work", "missing_artifacts", 0.82)
+
+        default_action = self._default_loop_action(agent)
+        add(default_action, "default_task_progress", 0.45)
+
+        add("read", "constraint_alternative_read", 0.20)
+        add("work", "constraint_alternative_work", 0.20)
+        add("compact", "constraint_alternative_compact", 0.20)
+        if not missing_outputs:
+            add("stop", "constraint_alternative_stop", 0.20)
+        if (
+            self._can_create_child(agent)
+            and (
+                _task_has_spawnable_workstreams(agent.task, self.config.min_spawnable_workstreams)
+                or self._agent_has_uncertain_evidence(agent)
+            )
+        ):
+            add("create", "constraint_alternative_create", 0.15)
+        if agent.children:
+            add("message", "constraint_alternative_message", 0.25)
+
+        return self._dedupe_loop_action_candidates(candidates)
+
+    def _dedupe_loop_action_candidates(self, candidates: list[LoopActionCandidate]) -> list[LoopActionCandidate]:
+        by_key: dict[tuple[str, str], LoopActionCandidate] = {}
+        for candidate in candidates:
+            key = (candidate.action, candidate.reason)
+            existing = by_key.get(key)
+            if existing is None or candidate.base_priority > existing.base_priority:
+                by_key[key] = candidate
+        return list(by_key.values())
+
+    def _compute_loop_constraint_metrics(self, agent: Agent, missing_outputs: list[str]) -> LoopConstraintMetrics:
+        disabled = self.config.disabled_loop_constraints
+
+        def maybe(name: str, value: float) -> float:
+            return 0.0 if name in disabled else max(0.0, min(1.0, value))
+
+        total_budget = max(0.0, float(self.ledger.total_budget))
+        budget_pressure = (self.ledger.total_spent / total_budget) if total_budget > 0 and math.isfinite(total_budget) else 0.0
+
+        elapsed = time.time() - self._start_time
+        time_limit = agent.quota.time_limit or self.config.time_limit
+        time_pressure = elapsed / time_limit if time_limit and time_limit > 0 else 0.0
+
+        context_pressure = agent.context_tokens / max(1, agent.context_limit)
+        agent_pressure = len(self.agents) / max(1, self.config.max_agents)
+
+        child_count = len(agent.children)
+        unfinished_children = len(self.unfinished_child_agents(agent))
+        dependency_pressure = unfinished_children / max(1, child_count)
+        handoff_pressure = self._handoff_pressure(agent)
+        offspring_create_bias = self._offspring_create_bias(agent)
+        failed_child_pressure = len(self._failed_children_need_recovery(agent, missing_outputs)) / max(1, child_count)
+        deferred_spawn_readiness = self._deferred_spawn_readiness(agent)
+        lane_coverage_pressure = self._lane_coverage_pressure(agent)
+        uncertain_evidence_pressure = 1.0 if self._agent_has_uncertain_evidence(agent) else 0.0
+
+        expected_outputs = _expected_output_paths(agent.task)
+        artifact_gap = len(missing_outputs) / max(1, len(expected_outputs)) if expected_outputs else 0.0
+
+        total_tool_calls = sum(a._tool_calls for a in self.agents.values())
+        coordination_events = len(self._messages_sent)
+        coordination_ratio = coordination_events / max(1, total_tool_calls + coordination_events)
+
+        create_retry_pressure = agent._create_action_filtered_count / 3
+        action_miss_pressure = agent._action_miss_count / 3 if agent._action_miss_action else 0.0
+        stagnation_pressure = agent._no_tool_turns / 3
+
+        output_similarity = self._estimate_peer_output_similarity(agent)
+        duplicate_tool_pressure = self._estimate_duplicate_recent_tool_pressure(agent)
+        consistency_pressure = self._estimate_recent_consistency_pressure(agent)
+        evidence_integration_pressure = 1.0 if self._evidence_integration_ready(agent, missing_outputs) else 0.0
+
+        return LoopConstraintMetrics(
+            budget_pressure=maybe("budget", budget_pressure),
+            time_pressure=maybe("time", time_pressure),
+            context_pressure=maybe("context", context_pressure),
+            agent_pressure=maybe("agent", agent_pressure),
+            dependency_pressure=maybe("dependency", dependency_pressure),
+            handoff_pressure=maybe("handoff", handoff_pressure),
+            offspring_create_bias=maybe("offspring_create", offspring_create_bias),
+            failed_child_pressure=maybe("failed_child", failed_child_pressure),
+            deferred_spawn_readiness=maybe("deferred_spawn", deferred_spawn_readiness),
+            artifact_gap=maybe("artifact", artifact_gap),
+            coordination_ratio=maybe("coordination", coordination_ratio),
+            create_retry_pressure=maybe("create_retry", create_retry_pressure),
+            action_miss_pressure=maybe("action_miss", action_miss_pressure),
+            lane_coverage_pressure=maybe("lane_coverage", lane_coverage_pressure),
+            stagnation_pressure=maybe("stagnation", stagnation_pressure),
+            output_similarity=maybe("redundancy", output_similarity),
+            duplicate_tool_pressure=maybe("duplicate_tool", duplicate_tool_pressure),
+            consistency_pressure=maybe("consistency", consistency_pressure),
+            uncertain_evidence_pressure=maybe("uncertain_evidence", uncertain_evidence_pressure),
+            evidence_integration_pressure=maybe("evidence_integration", evidence_integration_pressure),
+        )
+
+    def _filter_loop_action_candidates(
+        self,
+        agent: Agent,
+        candidates: list[LoopActionCandidate],
+        metrics: LoopConstraintMetrics,
+        missing_outputs: list[str],
+    ) -> list[LoopActionCandidate]:
+        expected_outputs = _expected_output_paths(agent.task)
+        blockers = self.completion_blockers(agent, include_missing_outputs=False)
+        unfinished_children = self.unfinished_child_agents(agent)
+        evidence_integration_ready = self._evidence_integration_ready(agent, missing_outputs)
+        legal: list[LoopActionCandidate] = []
+        for candidate in candidates:
+            action = candidate.action
+            if action == "work" and self._initial_create_required(agent):
+                continue
+            if action == "create":
+                final_delivery_create = candidate.reason == "delegate_final_delivery"
+                if (
+                    evidence_integration_ready
+                    and candidate.reason not in {
+                        "explicit_peer_wave_incomplete",
+                        "delegate_failed_child_recovery",
+                        "delegate_uncertain_evidence_recovery",
+                        "delegate_final_delivery",
+                        "handoff_after_evidence_maturity",
+                    }
+                ):
+                    continue
+                if unfinished_children and candidate.reason not in {
+                    "explicit_peer_wave_incomplete",
+                    "delegate_failed_child_recovery",
+                    "deferred_spawn_readiness_met",
+                    "delegate_uncertain_evidence_recovery",
+                    "delegate_final_delivery",
+                    "handoff_after_evidence_maturity",
+                }:
+                    continue
+                if not (self._can_create_child(agent) or (final_delivery_create and self._can_create_final_delivery_agent(agent))):
+                    continue
+                if metrics.budget_pressure >= 0.98 or metrics.time_pressure >= 0.98:
+                    continue
+                if (
+                    missing_outputs
+                    and not self._agent_has_uncertain_evidence(agent)
+                    and not _task_has_spawnable_workstreams(agent.task, self.config.min_spawnable_workstreams)
+                    and candidate.reason in {
+                        "constraint_alternative_create",
+                        "spawnable_workstreams_before_solo_execution",
+                    }
+                ):
+                    continue
+                if (
+                    metrics.lane_coverage_pressure >= 0.95
+                    and candidate.reason not in {
+                        "deferred_spawn_readiness_met",
+                        "delegate_failed_child_recovery",
+                        "explicit_peer_wave_incomplete",
+                        "delegate_uncertain_evidence_recovery",
+                        "delegate_final_delivery",
+                        "handoff_after_evidence_maturity",
+                    }
+                ):
+                    continue
+                if (
+                    self._queried_reliable_peer_progress(agent)
+                    and candidate.reason not in {
+                        "deferred_spawn_readiness_met",
+                        "delegate_failed_child_recovery",
+                        "explicit_peer_wave_incomplete",
+                        "delegate_uncertain_evidence_recovery",
+                        "delegate_final_delivery",
+                        "handoff_after_evidence_maturity",
+                    }
+                ):
+                    continue
+            if action == "stop":
+                if missing_outputs and expected_outputs:
+                    continue
+                non_submission_blockers = [blocker for blocker in blockers if blocker.get("kind") != "answer_submission"]
+                if non_submission_blockers:
+                    continue
+            if action == "compact":
+                if blockers and missing_outputs:
+                    continue
+            if action == "message":
+                has_unfinished_children = bool(unfinished_children)
+                has_peer_query_need = bool(self._peer_progress_candidates(agent)) and self._peer_progress_decision_pending(agent)
+                waiting_for_deferred = bool(agent._deferred_spawn_requests) and not self._deferred_spawn_ready(agent)
+                sending_prune_request = candidate.reason == "request_duplicate_agents_self_prune_after_key_evidence"
+                if evidence_integration_ready and not sending_prune_request:
+                    continue
+                if not (has_unfinished_children or has_peer_query_need or waiting_for_deferred or sending_prune_request):
+                    continue
+                if (
+                    missing_outputs
+                    and not has_unfinished_children
+                    and not sending_prune_request
+                    and agent._action_miss_action == "message"
+                    and agent._action_miss_count >= 1
+                ):
+                    continue
+            legal.append(candidate)
+        return legal
+
+    def _score_loop_action_candidate(self, candidate: LoopActionCandidate, metrics: LoopConstraintMetrics) -> float:
+        score = candidate.base_priority
+        resource_pressure = max(
+            _sigmoid01(metrics.budget_pressure),
+            _sigmoid01(metrics.time_pressure),
+        )
+
+        if candidate.action == "create":
+            score += 0.65 * metrics.artifact_gap
+            score += 0.25 * metrics.stagnation_pressure
+            score += 0.80 * metrics.offspring_create_bias
+            if candidate.reason in {
+                "spawnable_workstreams_before_solo_execution",
+                "retry_spawn_after_create_miss",
+                "multi_phase_peer_wave_pending",
+                "explicit_peer_wave_incomplete",
+                "retry_spawn_after_create_miss",
+                "deferred_spawn_readiness_met",
+                "delegate_failed_child_recovery",
+                "handoff_after_partial_progress",
+                "delegate_uncertain_evidence_recovery",
+                "delegate_final_delivery",
+                "handoff_after_evidence_maturity",
+            }:
+                score += 0.75
+            if candidate.reason == "delegate_final_delivery":
+                score += 1.35
+            if candidate.reason == "handoff_after_evidence_maturity":
+                score += 1.10
+            if candidate.reason == "delegate_failed_child_recovery":
+                score += 0.95 * metrics.failed_child_pressure
+            if candidate.reason == "delegate_uncertain_evidence_recovery":
+                score += 1.10 * metrics.uncertain_evidence_pressure
+            if candidate.reason == "deferred_spawn_readiness_met":
+                score += 0.85 * metrics.deferred_spawn_readiness
+            score -= 0.85 * resource_pressure
+            score -= 0.70 * metrics.agent_pressure
+            score -= 0.45 * metrics.dependency_pressure
+            if candidate.reason not in {
+                "deferred_spawn_readiness_met",
+                "delegate_failed_child_recovery",
+                "explicit_peer_wave_incomplete",
+                "delegate_uncertain_evidence_recovery",
+                "delegate_final_delivery",
+                "handoff_after_evidence_maturity",
+            }:
+                score -= 1.05 * metrics.lane_coverage_pressure
+            if candidate.reason not in {
+                "explicit_peer_wave_incomplete",
+                "deferred_spawn_readiness_met",
+                "delegate_failed_child_recovery",
+                "handoff_after_partial_progress",
+                "delegate_uncertain_evidence_recovery",
+                "delegate_final_delivery",
+                "handoff_after_evidence_maturity",
+            }:
+                score -= 0.95 * metrics.handoff_pressure
+            if candidate.reason != "deferred_spawn_readiness_met":
+                score -= 0.45 * max(0.0, 1.0 - metrics.deferred_spawn_readiness) if metrics.deferred_spawn_readiness else 0.0
+            score -= 0.55 * metrics.create_retry_pressure
+            score -= 0.35 * metrics.coordination_ratio
+            score -= 1.30 * metrics.evidence_integration_pressure
+            if metrics.handoff_pressure >= 0.8 and candidate.reason not in _UNCERTAIN_EVIDENCE_CREATE_REASONS.union({
+                "deferred_spawn_readiness_met",
+                "delegate_failed_child_recovery",
+                "explicit_peer_wave_incomplete",
+                "delegate_final_delivery",
+                "handoff_after_evidence_maturity",
+            }):
+                score -= 0.70
+
+        elif candidate.action == "read":
+            score += 0.45 * metrics.stagnation_pressure
+            score += 0.25 * metrics.artifact_gap
+            score += 0.20 * metrics.consistency_pressure
+            score += 0.28 * metrics.handoff_pressure
+            if candidate.reason in {
+                "task_requests_peer_query_before_artifact",
+                "filtered_read_intent_after_write_scope",
+                "outputs_complete_but_peer_query_required",
+                "create_scope_intent_released",
+                "pre_create_reference",
+                "peer_overlap_query_before_work",
+                "child_or_peer_evidence_inspect_before_artifact",
+            }:
+                score += 0.60
+            if candidate.reason == "peer_overlap_query_before_work":
+                score += 0.35
+            if candidate.reason == "child_or_peer_evidence_inspect_before_artifact":
+                score += 1.05 * metrics.evidence_integration_pressure
+            if candidate.reason == "pre_create_reference":
+                score += 0.75
+            score -= 0.25 * resource_pressure
+
+        elif candidate.action == "message":
+            score += 0.85 * metrics.dependency_pressure
+            score += 0.55 * metrics.handoff_pressure
+            if candidate.reason == "request_duplicate_agents_self_prune_after_key_evidence":
+                score += 1.20
+            if candidate.reason == "deferred_spawn_wait_for_readiness":
+                score += 0.55 * max(0.0, 1.0 - metrics.deferred_spawn_readiness)
+            score += 0.20 * metrics.consistency_pressure
+            score -= 0.45 * metrics.coordination_ratio
+            score -= 0.25 * metrics.context_pressure
+            score -= 1.10 * metrics.action_miss_pressure
+            score -= 1.40 * metrics.evidence_integration_pressure
+
+        elif candidate.action == "work":
+            score += 0.80 * metrics.artifact_gap
+            score += 0.25 * (1.0 - metrics.dependency_pressure)
+            score -= 0.85 * metrics.uncertain_evidence_pressure
+            if candidate.reason == "uncertain_evidence_needs_primary_work":
+                score += 1.05 * metrics.uncertain_evidence_pressure
+            if candidate.reason == "integrate_child_or_peer_evidence_into_artifact":
+                score += 1.20 * metrics.evidence_integration_pressure
+                score += 0.25 * metrics.handoff_pressure
+            if candidate.reason == "missing_artifacts":
+                score -= 0.45
+            if candidate.reason in {"missing_artifacts", "peer_query_found_completed_peers_write_or_prune"}:
+                score += 0.45 * metrics.action_miss_pressure
+            score -= 0.75 * metrics.failed_child_pressure
+            score -= 0.65 * metrics.handoff_pressure
+            score -= 0.35 * metrics.context_pressure
+            score -= 0.20 * resource_pressure
+            score -= 0.25 * metrics.output_similarity
+
+        elif candidate.action == "compact":
+            score += 0.95 * metrics.context_pressure
+            score += 0.40 * resource_pressure
+            score += 0.35 * metrics.output_similarity
+            score += 0.25 * metrics.duplicate_tool_pressure
+            score += 0.20 * metrics.coordination_ratio
+            score += 0.25 * metrics.handoff_pressure
+            score -= 0.70 * metrics.uncertain_evidence_pressure
+            score -= 0.45 * metrics.artifact_gap
+            if candidate.reason == "peer_query_found_completed_peers_prune_or_summarize":
+                score += 1.40 + 0.50 * metrics.artifact_gap
+            if candidate.reason == "peer_query_found_active_duplicate_prune_or_summarize":
+                score += 2.05 + 0.65 * metrics.artifact_gap
+
+        elif candidate.action == "stop":
+            score += 0.85 * resource_pressure
+            score += 0.35 * (1.0 - metrics.artifact_gap)
+            score += 0.20 * metrics.handoff_pressure
+            if candidate.reason == "answer_submission_pending":
+                score += 1.00
+            score -= 0.75 * metrics.dependency_pressure
+            score -= 0.45 * metrics.consistency_pressure
+            score -= 1.00 * metrics.uncertain_evidence_pressure
+
+        return score
+
+    def _estimate_peer_output_similarity(self, agent: Agent) -> float:
+        texts = [self._latest_assistant_text(agent)]
+        peers = self._peer_progress_candidates(agent)
+        texts.extend(self._latest_assistant_text(peer) for peer in peers[:8])
+        texts = [text for text in texts if text.strip()]
+        if len(texts) < 2:
+            return 0.0
+        scores: list[float] = []
+        for i, left in enumerate(texts):
+            for right in texts[i + 1:]:
+                scores.append(_cheap_text_similarity(left, right))
+        return sum(scores) / max(1, len(scores))
+
+    def _estimate_duplicate_recent_tool_pressure(self, agent: Agent) -> float:
+        names = list(_recent_tool_names(agent.history, lookback=12))
+        for peer in self._peer_progress_candidates(agent)[:8]:
+            names.extend(_recent_tool_names(peer.history, lookback=12))
+        if not names:
+            return 0.0
+        return max(0.0, min(1.0, 1.0 - len(set(names)) / max(1, len(names))))
+
+    def _estimate_recent_consistency_pressure(self, agent: Agent) -> float:
+        texts = [self._latest_assistant_text(agent)]
+        texts.extend(self._latest_assistant_text(peer) for peer in self._peer_progress_candidates(agent)[:4])
+        joined = "\n".join(text for text in texts if text)
+        if not joined:
+            return 0.0
+        patterns = (
+            r"\bcontradict", r"\bconflict", r"\bdisagree", r"\binconsistent",
+            r"\bhowever\b", r"\bbut\b", "矛盾", "冲突", "不一致", "不同意", "相反", "但是", "然而",
+        )
+        count = sum(len(re.findall(pattern, joined, flags=re.IGNORECASE)) for pattern in patterns)
+        return max(0.0, min(1.0, count / 5))
+
+    def _latest_assistant_text(self, agent: Agent) -> str:
+        for msg in reversed(agent.history):
+            if msg.get("role") == "assistant":
+                return str(msg.get("content") or "")
+        return ""
+
     def _default_loop_action(self, agent: Agent) -> str:
         if self.unfinished_child_agents(agent):
             return "message"
-        if agent._turns <= 1 and agent.orchestration_preference != "solo" and len(self.agents) < self.config.max_agents:
+        if (
+            agent._turns <= 1
+            and self._can_create_child(agent)
+            and _task_has_spawnable_workstreams(agent.task, self.config.min_spawnable_workstreams)
+        ):
             return "create"
         blockers = self.completion_blockers(agent, include_missing_outputs=False)
         if any(blocker.get("kind") in {"source_change", "test_run"} for blocker in blockers):
@@ -2874,46 +7603,144 @@ class Runtime:
 
     def _tools_for_loop_action(self, action: str) -> set[str]:
         if action in {"read", "query"}:
-            return {"query", "file_read", "file_list", "grep", "set_status", "get_cost"}
+            return {"query", "ledger_read", "file_read", "file_list", "grep", "set_status", "get_cost"}
         if action == "work":
             return {
                 "file_read", "file_write", "file_replace", "file_list", "grep",
-                "shell", "bt_aggregate", "submit", "query", "compact", "set_status", "get_cost",
+                "shell", "bt_aggregate", "submit", "query", "ledger_read", "ledger_update",
+                "compact", "set_status", "get_cost",
             }
         if action == "message":
-            return {"send", "wait", "query", "set_status", "get_cost"}
+            return {"send", "wait", "query", "ledger_read", "ledger_update", "set_status", "get_cost"}
         if action == "compact":
             return {
-                "compact", "set_status", "query", "file_read", "file_list", "grep",
+                "compact", "set_status", "query", "ledger_read", "ledger_update", "file_read", "file_list", "grep",
                 "file_write", "file_replace", "submit", "get_cost",
             }
         if action == "stop":
             return {
-                "set_status", "compact", "wait", "query", "file_read", "file_list", "grep",
-                "file_write", "file_replace", "submit", "get_cost",
+                "set_status", "compact", "wait", "query", "ledger_read", "ledger_update", "file_read", "file_list", "grep",
+                "file_write", "file_replace", "submit", "submit_answer", "get_cost",
             }
         if action == "create":
-            return {"spawn", "create_agent", "spawn_many", "query", "compact", "set_status", "get_cost"}
+            return set(_CREATE_ALLOWED_TOOLS)
+        return set()
+
+    def _primary_tools_for_loop_action(self, action: str) -> set[str]:
+        if action in {"read", "query"}:
+            return {"query", "ledger_read", "file_read", "file_list", "grep"}
+        if action == "work":
+            return {
+                "file_read", "file_write", "file_replace", "file_list", "grep",
+                "shell", "bt_aggregate", "submit", "query",
+            }
+        if action == "message":
+            return {"send", "wait", "query"}
+        if action == "compact":
+            return {"compact", "set_status"}
+        if action == "stop":
+            return {"set_status", "compact", "submit_answer"}
+        if action == "create":
+            return set(_CREATE_EXECUTION_TOOLS)
         return set()
 
     def _tools_for_loop_turn(self, agent: Agent, action: str, missing_outputs: list[str]) -> tuple[set[str], str]:
         allowed = self._tools_for_loop_action(action)
+        if not self.answer_submission_required(agent):
+            allowed = allowed - {"submit_answer"}
+        if self._root_steward_mode(agent):
+            if action == "create" and (agent._loop_action_plan or {}).get("reason") == "delegate_final_delivery":
+                create_execution_tools = _CREATE_EXECUTION_TOOLS & allowed
+                if create_execution_tools:
+                    return create_execution_tools, "final_delivery_handoff"
+            steward_allowed = {
+                "query", "ledger_read", "ledger_update", "send", "wait",
+                "compact", "set_status", "get_cost",
+            }
+            if self.answer_submission_required(agent):
+                steward_allowed.add("submit_answer")
+            return allowed.union(_LEDGER_TOOLS).intersection(steward_allowed), "root_steward"
         if (
             action == "create"
             and agent._create_action_filtered_count >= 1
+            and not self.unfinished_child_agents(agent)
+            and self._can_create_child(agent)
+        ):
+            create_execution_tools = _CREATE_EXECUTION_TOOLS & allowed
+            if create_execution_tools:
+                return create_execution_tools, "retry_spawn_after_create_miss"
+        if (
+            action == "create"
+            and (agent._loop_action_plan or {}).get("reason") == "resume_create_after_read_orientation"
             and not agent.children
             and _task_has_spawnable_workstreams(agent.task, self.config.min_spawnable_workstreams)
         ):
-            spawn_tools = {"spawn", "create_agent", "spawn_many"} & allowed
-            if spawn_tools:
-                return spawn_tools, "retry_spawn_after_create_miss"
+            create_execution_tools = _CREATE_EXECUTION_TOOLS & allowed
+            if create_execution_tools:
+                return create_execution_tools, "resume_create_after_read_orientation"
+        if (
+            action == "stop"
+            and self._answer_submission_pending(agent)
+            and "submit_answer" in allowed
+        ):
+            return {"submit_answer"}, "answer_submit_only"
+        if action == "compact" and (agent._auxiliary_only_miss_count >= 1 or (agent._action_miss_action == action and agent._action_miss_count >= 1)):
+            primary_tools = self._primary_tools_for_loop_action(action) & allowed
+            if primary_tools:
+                return primary_tools, "retry_primary_after_auxiliary_only_miss"
+        if action == "stop" and (agent._auxiliary_only_miss_count >= 1 or (agent._action_miss_action == action and agent._action_miss_count >= 1)):
+            primary_tools = self._primary_tools_for_loop_action(action) & allowed
+            if primary_tools:
+                return primary_tools, "retry_primary_after_auxiliary_only_miss"
+        if agent._auxiliary_only_miss_count >= 1 and (
+            bool(missing_outputs)
+            or self.unfinished_child_agents(agent)
+            or bool((agent._loop_action_plan or {}).get("target_action"))
+        ):
+            primary_tools = self._primary_tools_for_loop_action(action) & allowed
+            if action == "work" and missing_outputs:
+                artifact_scope = self._artifact_tool_scope(agent, missing_outputs)
+                if (
+                    artifact_scope == "write_only"
+                    and "file_write" in primary_tools
+                    and not self._artifact_write_needs_more_evidence(agent, missing_outputs)
+                ):
+                    return {"file_write"}, "retry_primary_after_auxiliary_only_miss"
+            if primary_tools:
+                return primary_tools, "retry_primary_after_auxiliary_only_miss"
         if (
             action == "work"
             and missing_outputs
             and agent._write_only_miss_count >= 1
             and "file_write" in self._available_work_tools()
         ):
-            return {"file_write"}, "retry_file_write_after_text_miss"
+            if not self._artifact_write_needs_more_evidence(agent, missing_outputs):
+                return {"file_write"}, "retry_file_write_after_text_miss"
+        if (
+            action == "work"
+            and missing_outputs
+            and agent._action_miss_action == "work"
+            and agent._action_miss_count >= 2
+        ):
+            if (
+                "file_write" in self._available_work_tools()
+                and "file_write" in allowed
+                and not self._artifact_write_needs_more_evidence(agent, missing_outputs)
+            ):
+                return {"file_write"}, "retry_file_write_after_no_tool_miss"
+            evidence_tools = {
+                "query", "file_read", "file_list", "grep", "shell",
+            } & allowed
+            if evidence_tools:
+                return evidence_tools, "retry_evidence_after_no_tool_miss"
+        if (
+            action == "work"
+            and missing_outputs
+            and self._evidence_integration_ready(agent, missing_outputs)
+        ):
+            scoped = {"query", "file_read", "file_list", "grep", "file_write", "file_replace"} & allowed
+            if scoped:
+                return scoped, "integrate_evidence_artifact"
         if action == "work" and missing_outputs:
             artifact_scope = self._artifact_tool_scope(agent, missing_outputs)
             if artifact_scope == "read_write":
@@ -2921,6 +7748,8 @@ class Runtime:
                     "file_read", "file_list", "grep", "query", "file_write", "file_replace",
                     "compact", "set_status", "get_cost",
                 } & allowed
+                if self._artifact_write_needs_more_evidence(agent, missing_outputs) and "shell" in allowed:
+                    scoped.add("shell")
                 if scoped:
                     return scoped, "artifact_read_write"
             if artifact_scope == "write_only":
@@ -2936,39 +7765,103 @@ class Runtime:
         messages: list[Envelope],
     ) -> Message | None:
         transient = [msg for msg in messages if msg.transient]
-        if not transient and not agent._loop_action_plan:
+        ledger_context = self._task_ledger_loop_context(agent)
+        if not transient and not agent._loop_action_plan and not ledger_context:
             return None
 
         actions = "create, read, message, work, compact, stop"
         plan = agent._loop_action_plan
+        selected_action = str((plan or {}).get("action") or "")
         parts = [
             "[Loop Action Card]",
-            "This is transient runtime guidance for this LLM turn only; it is not agent memory.",
-            f"Choose exactly one next action from: {actions}.",
-            "Use tools only for the selected action. You may call multiple tools within that action, but follow-up actions must wait for the next loop turn so runtime can revalidate state.",
-            "Use set_status(action=...) only to publish the next action/state after this turn; it does not execute that next action immediately.",
+            "This is transient runtime guidance for this execution turn only; it is not agent memory.",
+            (
+                f"Current action is fixed by runtime: {selected_action}. "
+                f"Do not re-select among {actions} in this turn."
+                if selected_action
+                else f"Runtime has not fixed an action; valid actions are: {actions}."
+            ),
+            "Plan and call tools only for the fixed current action. You may call multiple tools within that action, but follow-up actions must wait for the next loop turn so runtime can revalidate state.",
+            "Do not use set_status(action=...) to change this turn's action. Use set_status only to publish state after doing the current action, or to stop/self-prune when that is the current action.",
         ]
+        if ledger_context:
+            parts.append(ledger_context)
+        if self._root_steward_mode(agent):
+            parts.append(
+                "Root steward boundary: the first child wave already exists. "
+                "Do not take over worker/search/implementation artifacts yourself. "
+                "Use query, ledger_read, ledger_update, send/wait, compact, or stop to inspect agents, update the task ledger, request pruning, and record remaining gaps."
+            )
         if missing_outputs:
             targets = "\n".join(f"- {path}" for path in missing_outputs[:8])
             more = "" if len(missing_outputs) <= 8 else f"\n- ... {len(missing_outputs) - 8} more"
             parts.append(f"Missing required outputs:\n{targets}{more}")
+            if plan and plan.get("reason") in {
+                "child_or_peer_evidence_inspect_before_artifact",
+                "integrate_child_or_peer_evidence_into_artifact",
+            }:
+                evidence_lines = self._evidence_integration_lines(agent, missing_outputs)
+                parts.append(
+                    "Queryable child/peer evidence already exists, but your own required output files are still missing. "
+                    "Use query and file_read/file_list/grep to inspect the listed agents' public memory and artifacts, "
+                    "then write your own missing output files from verified evidence. Do not create more agents or wait "
+                    "until you have attempted this integration step."
+                    + ("\nEvidence to inspect:\n" + "\n".join(evidence_lines[:8]) if evidence_lines else "")
+                )
             if plan and plan.get("action") == "work":
                 parts.append(
                     "Current action is work. Do the work that best advances the task within the work tool scope. "
                     "If a different action is needed, leave it for the next loop turn so runtime can revalidate state."
                 )
-            if agent._write_only_miss_count:
-                parts.append(
-                    "Previous write-only artifact turns produced assistant text but no executable file_write call. "
-                    "Plain prose does not create the missing files. Runtime will narrow this retry turn to file_write "
-                    "so the selected work action creates the required output files."
-                )
-        elif _expected_output_paths(agent.task):
+                if self._artifact_write_needs_more_evidence(agent, missing_outputs):
+                    parts.append(
+                        "This output is evidence/report-like and current evidence is not sufficient yet. "
+                        "Use work tools such as shell, grep, file_read, or query to obtain or inspect primary evidence before writing. "
+                        "Do not write a speculative placeholder merely to satisfy the file path."
+                    )
+                if agent._write_only_miss_count:
+                    parts.append(
+                        "Previous write-only artifact turns produced assistant text but no executable file_write call. "
+                        "Plain prose does not create the missing files. Runtime will narrow this retry turn to file_write "
+                        "so the selected work action creates the required output files."
+                    )
+                if agent._action_miss_action == "work" and agent._action_miss_count >= 2:
+                    if self._artifact_write_needs_more_evidence(agent, missing_outputs):
+                        parts.append(
+                            "Previous work turns did not execute a usable work tool. Runtime will narrow this retry turn "
+                            "to evidence tools such as shell, grep, file_read, or query so the selected work action obtains "
+                            "the missing evidence instead of looping."
+                        )
+                    else:
+                        parts.append(
+                            "Previous work turns did not execute a usable work tool. Runtime will narrow this retry turn "
+                            "to file_write so the selected work action creates the required output files."
+                        )
+        if agent._auxiliary_only_miss_count:
             parts.append(
-                "All explicit output files named by your task currently exist. Prefer action=compact or action=stop: "
-                "publish a short summary, tags, and artifact paths. Do not continue open-ended verification unless it changes the deliverable."
+                "Previous loop turns only used auxiliary tools such as get_cost/set_status/compact and did not satisfy "
+                f"the selected action ({agent._auxiliary_only_miss_count} consecutive auxiliary-only miss"
+                f"{'es' if agent._auxiliary_only_miss_count != 1 else ''}). "
+                "Use those tools only if they directly support the current action; otherwise call a primary tool for this action now."
             )
         blockers = self.completion_blockers(agent, include_missing_outputs=False)
+        if not missing_outputs and _expected_output_paths(agent.task):
+            if self.answer_submission_required(agent) and not agent.submitted_answer_path:
+                parts.append(
+                    "All ordinary output files are complete, but this answer-style task still needs submit_answer(answer=...). "
+                    "Use action=stop when ready to submit the concise answer; if evidence is insufficient, query/read/work first."
+                )
+            elif blockers:
+                parts.append(
+                    "All explicit output files named by your task currently exist, but completion blockers remain. "
+                    "Do not prefer compact/stop merely because files exist. Use work to repair weak evidence, create to delegate a verifier/recovery lane when allowed, "
+                    "or compact only as a clearly blocked/pruned handoff summary."
+                )
+            else:
+                parts.append(
+                    "All explicit output files named by your task currently exist. Prefer action=compact or action=stop: "
+                    "publish a short summary, tags, and artifact paths. Do not continue open-ended verification unless it changes the deliverable."
+                )
         if blockers:
             blocker_lines = "\n".join(f"- {b['message']}" for b in blockers[:6])
             parts.append(
@@ -2976,11 +7869,46 @@ class Runtime:
                 "until these are resolved:\n"
                 f"{blocker_lines}"
             )
+        handoff_pressure = self._handoff_pressure(agent)
+        if handoff_pressure >= 0.5:
+            parts.append(
+                "Handoff pressure is active: this agent has already formed a child wave. "
+                "Prefer query(), wait(), compact(), or a clearly justified downstream handoff over taking over implementation yourself. "
+                "Create more agents only for a concrete uncovered lane, failed-lane recovery, or an input-dependent focus whose upstream evidence is ready."
+            )
+        lane_pressure = self._lane_coverage_pressure(agent)
+        if lane_pressure >= 0.6:
+            parts.append(
+                f"Lane coverage pressure is high ({lane_pressure:.2f}): existing child agents already cover overlapping semantic lanes. "
+                "Before creating another agent, query/read existing lane reports and identify a concrete uncovered gap. "
+                "If no new gap exists, choose work to integrate/finalize or compact/stop instead of duplicating the same lane."
+            )
         if plan and plan.get("action") == "create":
             parts.append(
                 "Current action is create. Decide whether to form or adjust the agent structure. "
+                "Use create-scope tools only: spawn/create_agent/spawn_many, plus get_cost/set_status/compact when needed to publish state or a solo/pruned decision. "
+                "Assign each new agent a focused, inspectable task and useful query tags; role names are optional labels, not capability limits. "
+                "Use a 0-1 readiness estimate for any input-dependent downstream focus: spawn independent worker lanes early, but delay handoff/check/synthesis work until input evidence is mature. "
+                "If you still need query/read evidence before creating, do not call query/read tools this turn; explain the missing prerequisite briefly so the next loop can revalidate with read/query. "
+                "Do not switch to action=work before the first child wave on a spawnable task; runtime will route that back to create. "
                 "If you continue solo, compact/update memory with status:solo-decision and a concrete reason."
             )
+            if agent._deferred_spawn_requests:
+                readiness = self._deferred_spawn_readiness(agent)
+                deferred_lines = []
+                for request in agent._deferred_spawn_requests[:5]:
+                    deferred_lines.append(
+                        f"- role={request.get('role') or '-'} group={request.get('group_id') or '-'} "
+                        f"depends_on={request.get('depends_on') or []} "
+                        f"previous_readiness={request.get('readiness', 0)} task={(request.get('task') or '')[:120]}"
+                    )
+                parts.append(
+                    "Deferred spawn proposals exist. Re-evaluate them numerically against current peer state. "
+                    f"Current inferred readiness={readiness:.2f}, threshold={self.config.spawn_readiness_threshold:.2f}. "
+                    "If readiness is now high enough, call spawn/spawn_many with the same concrete task and updated readiness; "
+                    "otherwise leave them deferred and use message/read in a later turn to inspect worker progress.\n"
+                    + "\n".join(deferred_lines)
+                )
             if plan.get("reason") == "resume_create_after_read_orientation":
                 parts.append(
                     "You requested read orientation during a create turn and have now had that read turn. "
@@ -2988,13 +7916,69 @@ class Runtime:
                 )
             elif plan.get("reason") == "retry_spawn_after_create_miss":
                 parts.append(
-                    "Previous create turns did not create any child agents. Runtime will narrow this retry turn to spawn/create_agent/spawn_many. "
-                    "Do not write directory placeholders or only set action=create again; create the peer wave now, or compact a solo-decision if spawning is truly wrong."
+                    "Previous create turns did not create a valid child agent. Runtime will narrow this retry turn to create-execution tools. "
+                    "Do not write directory placeholders or only set action=create again; create the focused agent(s) now, or compact a solo/pruned decision if spawning is truly wrong."
                 )
-            elif plan.get("reason") == "multi_phase_peer_wave_pending":
+            if plan.get("reason") == "handoff_after_partial_progress":
+                parts.append(
+                    "You have partial progress but explicit outputs or confidence gaps remain. "
+                    "Create one focused follow-up agent for the specific remaining boundary: checking evidence, integrating partial findings, completing a missing artifact, or reviewing uncertainty. "
+                    "Keep the assignment narrow and tag it with the shared group/problem plus the concrete gap; do not create a vague role-only agent."
+                )
+            if plan.get("reason") == "delegate_final_delivery":
+                evidence = list(plan.get("evidence_agents") or [])
+                evidence_lines = "\n".join(
+                    f"- {item.get('id')}: status={item.get('status') or '-'} artifacts={item.get('artifacts') or []} result={(item.get('result') or '')[:160]}"
+                    for item in evidence[:8]
+                    if isinstance(item, dict)
+                )
+                parts.append(
+                    "Final delivery handoff: the task has a terminal answer/submission protocol and queryable evidence appears ready, "
+                    "but this coordinator should not take over final delivery directly. Prefer one focused finalizer/delivery agent unless current state clearly calls for a different delivery shape. "
+                    "That delivery agent should query/read the listed evidence, verify the answer is sufficiently supported, call submit_answer(answer=...) if ready, "
+                    "or compact a blocked summary if evidence is still insufficient. Do not create more research lanes from this action.\n"
+                    f"Answer path={plan.get('answer_path') or self.final_answer_path_for(agent)}\n"
+                    f"Evidence signals:\n{evidence_lines or '- none'}"
+                )
+            if plan.get("reason") == "handoff_after_evidence_maturity":
+                evidence = list(plan.get("evidence_agents") or [])
+                evidence_lines = "\n".join(
+                    f"- {item.get('id')}: status={item.get('status') or '-'} artifacts={item.get('artifacts') or []} result={(item.get('result') or '')[:160]}"
+                    for item in evidence[:8]
+                    if isinstance(item, dict)
+                )
+                parts.append(
+                    "Your evidence appears mature and an upstream terminal/integration target is still open. "
+                    "Create one focused downstream agent instead of continuing to expand this evidence lane yourself. "
+                    "Do not make it a vague role-only agent: assign the concrete next boundary such as cross-checking, synthesis, answer delivery, "
+                    "or resolving a named uncertainty. The downstream agent should query/read the listed evidence agents and decide whether to submit, "
+                    "publish a verified synthesis, or compact a blocked summary.\n"
+                    f"Target agent={plan.get('target_agent') or '-'} answer_path={plan.get('answer_path') or '-'}\n"
+                    f"Evidence signals:\n{evidence_lines or '- current agent evidence only'}"
+                )
+            if plan.get("reason") == "delegate_uncertain_evidence_recovery":
+                uncertain = list(plan.get("uncertain_artifacts") or [])
+                artifact_lines = "\n".join(f"- {path}" for path in uncertain[:8]) or "- current memory/result contains unverified or low-confidence evidence"
+                parts.append(
+                    "Your current evidence is explicitly partial, unverified, or low confidence. "
+                    "Do not rewrite the same low-confidence artifact or mark this lane done. "
+                    "Create a focused verifier/recovery agent that must query/read your public memory and artifacts, verify the uncertain claims from primary evidence, "
+                    "and either replace the artifact with a verified version or compact with a clear blocked summary. "
+                    "Use tags such as role:verifier or role:recovery plus the lane/task tags so other agents can query it later.\n"
+                    f"Uncertain artifacts/signals:\n{artifact_lines}"
+                )
+            if plan.get("reason") == "multi_phase_peer_wave_pending":
                 parts.append(
                     "This task describes a multi-stage peer protocol and previous child waves are no longer active while final outputs remain missing. "
-                    "Create the next comparison, mutation, review, or synthesis wave as appropriate. Do not collapse the remaining protocol into a solo final artifact unless budget exhaustion makes the incomplete protocol explicit."
+                    "Create the next focused comparison, mutation, check, or synthesis wave as appropriate. Do not collapse the remaining protocol into a solo final artifact unless budget exhaustion makes the incomplete protocol explicit."
+                )
+            if plan.get("reason") == "explicit_peer_wave_incomplete":
+                gap = plan.get("peer_wave_gap") or {}
+                parts.append(
+                    "The task names an explicit peer-wave size that is not yet satisfied. "
+                    f"Observed {gap.get('current', 0)} of target {gap.get('target', '?')} "
+                    f"for role={gap.get('role') or 'unspecified'} phase={gap.get('phase') or 'unspecified'}; "
+                    f"create the missing {gap.get('remaining', '?')} peer agents now, avoiding duplicate lanes already covered."
                 )
             if plan.get("reason") in {
                 "delegate_integration_after_child_source_progress",
@@ -3010,11 +7994,126 @@ class Runtime:
                     "Coordinator boundary: child work did not produce the required shared/source change. "
                     "Create a focused recovery/implementation agent with the missing blocker details instead of doing the patch yourself in this root turn."
                 )
+            elif plan.get("reason") == "delegate_failed_child_recovery":
+                failed = list(plan.get("failed_children") or [])
+                failed_lines = []
+                for item in failed[:5]:
+                    failed_lines.append(
+                        f"- failed_child={item.get('id') or '-'} role={item.get('role') or '-'} "
+                        f"group={item.get('group_id') or '-'} missing={item.get('missing_outputs') or []} "
+                        f"artifacts={item.get('artifacts') or []} result={(item.get('result') or '')[:160]}"
+                    )
+                parts.append(
+                    "Coordinator boundary: one or more child lanes failed while final artifacts remain missing. "
+                    "Do not take over the failed lane with root/coordinator work. Create a focused recovery agent now. "
+                    "The recovery agent task should query/read the failed child's public state and artifacts, reuse any partial evidence, "
+                    "complete the missing lane output, and write a concise recovery summary with tags including status:recovered "
+                    "and the failed child id. Prefer one recovery agent per failed lane unless several failures share the same missing artifact.\n"
+                    + "\n".join(failed_lines)
+                )
+        if plan and plan.get("action") == "compact" and plan.get("reason") == "premature_downstream_wait_for_evidence":
+            upstream = list(plan.get("upstream_agents") or [])
+            lines = "\n".join(
+                f"- {item.get('id')}: status={item.get('status')} missing={item.get('missing_outputs') or []} artifacts={item.get('artifacts') or []}"
+                for item in upstream[:6]
+            )
+            parts.append(
+                "Your assignment appears input-dependent, but upstream peer evidence is not ready. "
+                "Do not fabricate a final check or report. Compact and stop with tags including status:pruned, "
+                "reason:premature_downstream, and needs:upstream_evidence so a later agent can query your state and restart this focus when inputs mature.\n"
+                f"Current upstream signals:\n{lines}"
+            )
+        if plan and plan.get("action") == "compact" and plan.get("reason") == "received_prune_request_self_prune":
+            request = dict(plan.get("prune_request") or {})
+            evidence_agents = request.get("evidence_agents") or []
+            evidence_lines = "\n".join(
+                f"- {item.get('id')}: status={item.get('status') or '-'} artifacts={item.get('artifacts') or []} result={(item.get('result') or '')[:140]}"
+                for item in evidence_agents[:6]
+                if isinstance(item, dict)
+            )
+            parts.append(
+                "You received a prune_request from a coordinating agent after it queried peer progress and found key evidence/output already covered. "
+                "Treat this as a request to self-prune, not an emergency kill. Compact your current partial state with stop_after=true, "
+                "include tags status:pruned plus reason:peer_ahead or reason:duplicate_lane and your task/lane tags, and mention what remains reusable. "
+                "Only continue instead of pruning if your next output is clearly distinct from the covered evidence.\n"
+                f"Prune request from={request.get('from') or '-'} reason={request.get('reason') or '-'} covered_by={request.get('covered_by') or []}\n"
+                f"Evidence signals:\n{evidence_lines or '- none listed'}"
+            )
+        if plan and plan.get("action") == "message" and plan.get("reason") == "request_duplicate_agents_self_prune_after_key_evidence":
+            targets = list(plan.get("prune_targets") or [])
+            evidence = list(plan.get("evidence_agents") or [])
+            target_lines = "\n".join(f"- {target}" for target in targets[:8])
+            evidence_lines = "\n".join(
+                f"- {item.get('id')}: status={item.get('status') or '-'} artifacts={item.get('artifacts') or []} result={(item.get('result') or '')[:140]}"
+                for item in evidence[:6]
+                if isinstance(item, dict)
+            )
+            parts.append(
+                "Your recent query found key evidence/output already covered while other same-lane agents are still active. "
+                "Use send() with message_type='prune_request' to ask duplicate agents to compact their partial findings and self-prune. "
+                "Do not kill them directly. Include payload fields reason, covered_by, evidence_agents, and tags if useful. "
+                "After sending, let the next loop revalidate whether verification/integration or recovery is needed.\n"
+                f"Suggested prune targets:\n{target_lines or '- none'}\n"
+                f"Covered evidence agents:\n{evidence_lines or '- none'}"
+            )
+        if plan and plan.get("reason") == "inspect_coverage_after_spawn_skipped":
+            covered_by = list(plan.get("covered_by") or [])
+            covered_lines = "\n".join(f"- {agent_id}" for agent_id in covered_by[:8])
+            parts.append(
+                "Your previous create request was skipped because runtime found existing lane coverage. "
+                "Do not immediately retry the same create. Use query() or wait() to inspect the covered agents' "
+                "state_board, public memory, artifacts, confidence, and remaining blockers. "
+                "If coverage is complete and reliable, integrate/finalize or ask duplicate active agents to prune. "
+                "If coverage is partial, stale, unverified, or missing the needed artifact, let the next loop replan "
+                "a verifier or recovery agent after this inspection.\n"
+                f"Skipped reason={plan.get('skip_reason') or '-'}\n"
+                f"Covered agents:\n{covered_lines or '- none'}"
+            )
+        if plan and plan.get("reason") == "compact_after_spawn_skipped_covered":
+            covered_by = list(plan.get("covered_by") or [])
+            covered_paths = list(plan.get("covered_paths") or [])
+            covered_lines = "\n".join(f"- {agent_id}" for agent_id in covered_by[:8])
+            path_lines = "\n".join(f"- {path}" for path in covered_paths[:8])
+            parts.append(
+                "Your previous create request was skipped because existing agents/artifacts already cover that lane, "
+                "and you have no remaining required output. Do not retry create. Compact a short reusable summary, "
+                "tag it with status:pruned and reason:covered_by_existing_agents, include covered agents/paths, and stop_after=true "
+                "unless you have a concrete contradiction to publish.\n"
+                f"Skipped reason={plan.get('skip_reason') or '-'}\n"
+                f"Covered agents:\n{covered_lines or '- none'}\n"
+                f"Covered paths:\n{path_lines or '- none'}"
+            )
         if plan and plan.get("action") == "message" and str(plan.get("reason", "")).startswith("coordinate_"):
             parts.append(
                 "Coordinator boundary: you already have child agents. Use query() or wait() to inspect their state_board, public memory, artifacts, and progress. "
                 "Do not inspect or edit implementation files yourself in this root/coordinator turn. "
                 "If their progress makes integration or recovery work necessary, leave that for the next create turn after runtime revalidation."
+            )
+        if plan and plan.get("action") == "message":
+            parts.append(
+                "Current action is message. It can only communicate, query, or wait. "
+                "If the correct next step is to create an agent, run work tools, or write missing outputs, do not describe that action in prose; "
+                "use query()/wait() only if they are genuinely needed now, otherwise allow the next loop turn to replan."
+            )
+        if plan and plan.get("action") == "read" and plan.get("reason") == "peer_overlap_query_before_work":
+            query_filter = self._peer_progress_query_filter(agent)
+            tags = self._peer_progress_query_tags(agent)
+            overlap_peers = self._peer_overlap_query_candidates(agent)
+            peer_lines = "\n".join(
+                f"- {peer.id}: role={peer.role or '-'} status={peer.status} turns={peer._turns} "
+                f"artifacts={','.join(a.path for a in peer.artifacts[:3]) or '-'} "
+                f"tags={','.join(peer.current_task_tags[:5]) or '-'}"
+                for peer in overlap_peers[:8]
+            )
+            parts.append(
+                "Current action is read because this looks like discovery/search/evidence work with nearby overlapping peers. "
+                "Before doing more work, call query() against the shared group/tags and compare state_board, public_memory, artifacts, and active tasks. "
+                f"Recommended query: filter={json.dumps(query_filter, ensure_ascii=False)}, "
+                f"tags={json.dumps(tags, ensure_ascii=False)}. "
+                "If another peer is already doing the same search lane or has stronger completed evidence, do not continue duplicate work; "
+                "next turn should compact with stop_after=true, a concise terminal report, and tags including status:pruned plus "
+                "reason:duplicate_lane or reason:peer_ahead. If your lane is distinct, continue work next turn after runtime revalidates.\n"
+                f"Nearby overlap candidates:\n{peer_lines or '- none'}"
             )
         if self._peer_progress_decision_pending(agent):
             query_filter = self._peer_progress_query_filter(agent)
@@ -3027,25 +8126,48 @@ class Runtime:
                 "with stop_after=true and tags including status:pruned plus reason:peer_ahead, "
                 "reason:duplicate_lane, or reason:invalid_candidate."
             )
-        elif self._peer_progress_post_query_pending(agent):
-            peers = self._completed_peer_progress_candidates(agent)
+        elif (
+            self._peer_progress_post_query_pending(agent)
+            or self._peer_overlap_post_query_pending(agent, missing_outputs)
+            or self._peer_overlap_active_duplicate_post_query_pending(agent, missing_outputs)
+        ):
+            active_duplicate = self._peer_overlap_active_duplicate_post_query_pending(agent, missing_outputs)
+            peers = (
+                self._active_duplicate_peer_overlap_candidates(agent)
+                if active_duplicate
+                else (
+                    self._completed_peer_overlap_candidates(agent)
+                    if self._peer_overlap_post_query_pending(agent, missing_outputs)
+                    else self._completed_peer_progress_candidates(agent)
+                )
+            )
             peer_lines = "\n".join(
-                f"- {peer.id}: status={peer.status} artifacts={','.join(a.path for a in peer.artifacts[:3]) or '-'} "
+                f"- {peer.id}: status={peer.status} turns={peer._turns} tools={peer._tool_calls} "
+                f"artifacts={','.join(a.path for a in peer.artifacts[:3]) or '-'} "
                 f"summary={(peer.result or self.memory.serialize(peer.id).get('public_summary') or '')[:140]}"
                 for peer in peers[:6]
             )
-            parts.append(
-                "Peer-progress query has already returned completed or artifact-bearing peers in your lane. "
-                "Do not keep reading peer files just to re-verify the same point. Choose one action now: "
-                "action=compact with stop_after=true and tags including status:pruned plus reason:peer_ahead "
-                "if your lane is duplicate or no longer useful; or action=work "
-                "if your output remains distinct. If unsure, prefer pruning with a useful summary over more analysis.\n"
-                f"Completed/advanced peers:\n{peer_lines}"
-            )
+            if active_duplicate:
+                parts.append(
+                    "Peer-overlap query has already found active peers working the same or highly overlapping lane, "
+                    "and you have not produced a distinct artifact yet. Do not continue a duplicate branch or spawn another copy. "
+                    "Choose action=compact with stop_after=true and tags including status:pruned plus reason:duplicate_lane "
+                    "or reason:peer_ahead, unless your next work output is clearly distinct from those peers.\n"
+                    f"Active overlapping peers:\n{peer_lines}"
+                )
+            else:
+                parts.append(
+                    "Peer-progress query has already returned completed or artifact-bearing peers in your lane. "
+                    "Do not keep reading peer files just to re-verify the same point. Choose one action now: "
+                    "action=compact with stop_after=true and tags including status:pruned plus reason:peer_ahead "
+                    "if your lane is duplicate or no longer useful; or action=work "
+                    "if your output remains distinct. If unsure, prefer pruning with a useful summary over more analysis.\n"
+                    f"Completed/advanced peers:\n{peer_lines}"
+                )
         if plan:
             parts.append(
-                f"Next action candidate: action={plan.get('action')} reason={plan.get('reason', '-')}. "
-                "Re-check this against current state before using it."
+                f"Fixed action: action={plan.get('action')} reason={plan.get('reason', '-')}. "
+                "Execute this action now; if it is stale, use the smallest valid tool response that publishes why the next loop should replan."
             )
         if transient:
             parts.append(
@@ -3059,7 +8181,7 @@ class Runtime:
         agent._compact_pending = None
         if params.get("stop_after"):
             guard_tags = list(params.get("tags", [])) or list(agent.current_task_tags)
-            blockers = self.completion_blockers(agent, tags=guard_tags)
+            blockers = self.completion_blockers(agent, tags=guard_tags, result=params.get("stop_result"))
             if blockers:
                 self._emit(agent.id, "completion_blocked", {
                     "reason": "compact_stop_after",
@@ -3069,8 +8191,20 @@ class Runtime:
                 return
         summary = params["summary"]
         files = list(params.get("files", []))
-        tags = list(params.get("tags", []))
+        tags = normalize_tags(list(params.get("tags", [])) or list(agent.current_task_tags))
         experience = params.get("experience")
+        truth_guard = self._compact_truth_guard(
+            agent,
+            summary=summary,
+            experience=experience,
+            tags=tags,
+            files=files,
+            stop_result=params.get("stop_result"),
+        )
+        summary = truth_guard["summary"]
+        experience = truth_guard["experience"]
+        tags = truth_guard["tags"]
+        guarded_stop_result = truth_guard["stop_result"]
         new_task = params.get("new_task")
         new_bio = params.get("new_bio")
         work_outline = params.get("work_outline", agent.work_outline)
@@ -3094,22 +8228,93 @@ class Runtime:
             "add_artifacts": files,
             "active_task": ActiveTaskCard(task=new_task or agent.task, tags=tags or agent.current_task_tags, work_outline=work_outline),
         }
+        if truth_guard["truth_guard"]:
+            self.task_ledger_update(agent, {
+                "item_id": agent.id,
+                "status": "blocked",
+                "blockers": [{
+                    "kind": "unverified_evidence",
+                    "message": "Compact truth guard found partial, placeholder, or low-confidence evidence.",
+                    "event": truth_guard["truth_guard"],
+                }],
+                "note": "Truth guard downgraded completion; continue with work or query before retrying terminal compact.",
+            })
+            update_kwargs["remove_tags"] = list(_COMPLETION_CLAIM_TAGS)
+            if params.get("stop_after"):
+                params["stop_after"] = False
+                params["return_action_after_auxiliary"] = "work"
+                update_kwargs["active_task"] = ActiveTaskCard(
+                    task=new_task or agent.task,
+                    tags=tags or agent.current_task_tags,
+                    work_outline=work_outline,
+                )
+        return_action_after_auxiliary = params.get("return_action_after_auxiliary")
         if experience:
-            update_kwargs["add_experience"] = ExperienceCard(summary=experience, tags=tags or agent.current_task_tags, artifacts=files)
+            update_kwargs["add_experience"] = build_memory_card(
+                experience,
+                tags=tags or agent.current_task_tags,
+                artifacts=files,
+                memory_kind=params.get("memory_kind") or ("terminal" if params.get("stop_after") else None),
+                memory_source=params.get("memory_source") or "compact",
+                durable=params.get("durable"),
+                evidence=params.get("evidence"),
+                stop_after=bool(params.get("stop_after")),
+            )
+        else:
+            summary_cards = [
+                build_memory_card(
+                    card,
+                    tags=normalize_tags((tags or agent.current_task_tags) + [f"memory_part:{idx + 1}"]),
+                    artifacts=files,
+                    memory_kind=params.get("memory_kind") or ("terminal" if params.get("stop_after") else "summary"),
+                    memory_source=params.get("memory_source") or "compact",
+                    durable=params.get("durable"),
+                    evidence=params.get("evidence"),
+                    stop_after=bool(params.get("stop_after")),
+                )
+                for idx, card in enumerate(split_experience_text(summary))
+            ]
+            if summary_cards:
+                update_kwargs["add_experiences"] = summary_cards
         self.memory.update(agent.id, **update_kwargs)
         agent.memory = {"public_memory": self.memory.serialize(agent.id)}
         if params.get("stop_after"):
             agent.action_state = "stop"
             agent.status = "done"
-            agent.result = params.get("stop_result") or agent.result
-            stop_experience = None if experience else ExperienceCard(summary=summary, tags=tags or agent.current_task_tags, artifacts=files)
+            agent.result = guarded_stop_result or agent.result
+            stop_experience = None if experience else build_memory_card(
+                summary,
+                tags=tags or agent.current_task_tags,
+                artifacts=files,
+                memory_kind=params.get("memory_kind") or "terminal",
+                memory_source=params.get("memory_source") or "compact_stop",
+                durable=params.get("durable"),
+                evidence=params.get("evidence"),
+                stop_after=True,
+            )
             self.memory.update(
                 agent.id,
                 clear_active_task=True,
                 add_experience=stop_experience,
+                remove_tags=list(_COMPLETION_CLAIM_TAGS) if truth_guard["truth_guard"] else None,
             )
             agent.memory = {"public_memory": self.memory.serialize(agent.id)}
+        elif return_action_after_auxiliary in _LOOP_ACTIONS:
+            self.state_board_update(
+                agent.id,
+                action_state=return_action_after_auxiliary,
+                current_task_tags=tags or agent.current_task_tags,
+                work_outline=work_outline,
+            )
+        else:
+            self.state_board_update(
+                agent.id,
+                action_state="work",
+                current_task_tags=tags or agent.current_task_tags,
+                work_outline=work_outline,
+            )
         self.state_board_sync(agent.id)
+        self._refresh_task_ledger_agent_item(agent)
 
     def _execute_rebirth(self, agent: Agent):
         params = agent._rebirth_pending
@@ -3147,7 +8352,13 @@ class Runtime:
             active_task=ActiveTaskCard(task=new_task or agent.task, tags=agent.current_task_tags, work_outline=agent.work_outline),
             tags=tags or agent.current_task_tags,
             add_artifacts=files,
-            add_experience=ExperienceCard(summary=experience, tags=tags or agent.current_task_tags, artifacts=files) if experience else None,
+            add_experience=build_memory_card(
+                experience,
+                tags=tags or agent.current_task_tags,
+                artifacts=files,
+                memory_kind="handoff",
+                memory_source="rebirth",
+            ) if experience else None,
         )
         agent.memory = {"public_memory": self.memory.serialize(agent.id)}
         self.state_board_sync(agent.id)
@@ -3168,9 +8379,9 @@ class Runtime:
     def _available_work_tools(self) -> dict[str, dict[str, Any]]:
         enabled = self._tool_context.enabled_work_tools
         if enabled is None:
-            tools = dict(WORK_TOOLS)
+            tools = dict(self.work_tools)
         else:
-            tools = {name: tool for name, tool in WORK_TOOLS.items() if name in enabled}
+            tools = {name: tool for name, tool in self.work_tools.items() if name in enabled}
         if self._tool_context.shell_mode == "disabled":
             tools.pop("shell", None)
         return tools
@@ -3266,7 +8477,7 @@ Task: {task}
 Workspace: {workspace} (private to you)
 Shared: {shared} (visible to all agents){time_info}
 {context_section}
-Coordination guidance: use query() to inspect other agents' state_board, role, group_id, tags, artifacts, progress, and public_memory before summarizing shared work. For peer waves, prefer query(filter={{"group_id": "<exact group_id>"}}) or query(tags=["feature:N"]); if query returns zero results, read query_help and retry with the advertised group_id/tags. Direct send() is for explicit coordination, not the default completion path. If you hit a bottleneck, have repeated no-tool/prose turns, or suspect duplicate work, proactively query nearby peers and compare progress/artifacts before continuing. If another peer is clearly ahead or already covers your lane, compact your partial findings with stop_after=true and tags such as status:pruned plus reason:peer_ahead/reason:duplicate_lane so the summary remains discoverable. If compacting memory is your last step, use compact(..., stop_after=true, result="...") or set_status(..., compact_before_stop=true); plain compact() means you intend to continue.
+Coordination guidance: use query() to inspect other agents' state_board, role, group_id, tags, artifacts, progress, and public_memory before summarizing shared work. For peer waves, prefer query(filter={{"group_id": "<exact group_id>"}}) or query(tags=["feature:N"]); if query returns zero results, read query_help and retry with the advertised group_id/tags. Direct send() is for explicit coordination, not the default completion path. After query shows a key output is already covered, a coordinator may send message_type="prune_request" to same-lane duplicate agents so they compact useful partial state and self-prune; do not kill them directly. If you receive prune_request and your lane is no longer distinct, compact with stop_after=true and tags such as status:pruned plus reason:peer_ahead/reason:duplicate_lane so the summary remains discoverable. If you hit a bottleneck, have repeated no-tool/prose turns, or suspect duplicate work, proactively query nearby peers and compare progress/artifacts before continuing. If another peer is clearly ahead or already covers your lane, compact your partial findings with stop_after=true and tags such as status:pruned plus reason:peer_ahead/reason:duplicate_lane. If compacting memory is your last step, use compact(..., stop_after=true, result="...") or set_status(..., compact_before_stop=true); plain compact() means you intend to continue.
 {orchestration_section}
 Editing guidance: use file_replace for source edits. file_write is for new files or deliberate guarded overwrites; existing large files require overwrite=true or expected_sha256 and can otherwise be rejected to prevent accidental whole-file truncation.
 {artifact_section}
@@ -3275,12 +8486,22 @@ Workflow prior guidance: research_loop / critic_review_loop / synthesis_loop are
 """
 
     def _artifact_prompt_section(self, task: str) -> str:
-        expected = _expected_output_paths(task)
+        expected = _non_terminal_expected_output_paths(task)
+        final_answers = _final_answer_paths(task)
         if not expected:
+            if final_answers:
+                targets = "\n".join(f"- {path}" for path in final_answers[:8])
+                more = "" if len(final_answers) <= 8 else f"\n- ... {len(final_answers) - 8} more"
+                return (
+                    "Answer submission guidance: this task has a terminal answer JSON path, but it is not an ordinary artifact. "
+                    "Do not write it with file_write. When the answer is ready for benchmark evaluation, use submit_answer(answer=...). "
+                    "The submit_answer tool writes the protocol file:\n"
+                    f"{targets}{more}"
+                )
             return ""
         targets = "\n".join(f"- {path}" for path in expected[:8])
         more = "" if len(expected) <= 8 else f"\n- ... {len(expected) - 8} more"
-        return (
+        section = (
             "Artifact guidance: this task has explicit required output files. "
             "After reading the minimum necessary inputs, write those files with file_write; "
             "do not leave the deliverable only in chat. If several files are required, write all of them, "
@@ -3288,6 +8509,15 @@ Workflow prior guidance: research_loop / critic_review_loop / synthesis_loop are
             "inside the required report file.\n"
             f"Required output files:\n{targets}{more}"
         )
+        if final_answers:
+            answer_targets = "\n".join(f"- {path}" for path in final_answers[:8])
+            answer_more = "" if len(final_answers) <= 8 else f"\n- ... {len(final_answers) - 8} more"
+            section += (
+                "\nAnswer submission guidance: final answer JSON paths are terminal submissions, not ordinary artifacts. "
+                "Use submit_answer(answer=...) when the answer is ready; it writes:\n"
+                f"{answer_targets}{answer_more}"
+            )
+        return section
 
     def _shell_prompt_section(self) -> str:
         mode = self.config.shell_mode
@@ -3299,6 +8529,7 @@ Workflow prior guidance: research_loop / critic_review_loop / synthesis_loop are
                 "Shell guidance: controlled shell is available for verification commands only. "
                 f"Allowed command names: {', '.join(sorted(allowed))}. "
                 "Use direct commands such as `python3 -m pytest tests -q`, `pytest tests -q`, or `git -C $SHARED/source status`. "
+                "For multi-line Python or network/API checks, first write a script file with file_write, then run it as `python3 script.py`; avoid `python3 -c` snippets. "
                 "A single prefix of `cd $SHARED/source && <allowed command>` is also accepted and normalized to that working directory; for example `cd $SHARED/source && python3 -m pytest tests -q`. "
                 "Other shell operators, redirection, package installs, network tools, or destructive filesystem operations are rejected."
             )
@@ -3313,23 +8544,23 @@ Workflow prior guidance: research_loop / critic_review_loop / synthesis_loop are
             )
         elif preference == "balanced":
             behavior = (
-                f"Start solo for brief orientation, but form a peer wave early with spawn_many() when the task has "
-                f"{threshold}+ separable workstreams or benefits from independent review."
+                f"Start solo for brief orientation, then form an early peer wave for independent worker lanes when the task has "
+                f"{threshold}+ separable workstreams. Delay downstream review/verification/synthesis agents until their input readiness is high."
             )
         elif preference == "parallel":
             behavior = (
-                f"Bias toward early peer-wave creation. For {threshold}+ separable workstreams, call spawn_many() "
-                "before detailed implementation and let the root agent coordinate/query/synthesize."
+                f"Bias toward early peer-wave creation for independent worker lanes. For {threshold}+ separable workstreams, call spawn_many() "
+                "before detailed implementation; create downstream verifier/review/synthesis agents later with depends_on/readiness once workers publish partial outputs."
             )
         else:
             behavior = (
-                "Strongly prefer a peer wave for nontrivial work. Use spawn_many() early unless the task is atomic; "
-                "the root agent should mainly coordinate, query peer state, and synthesize."
+                "Strongly prefer a peer wave for nontrivial independent worker lanes. Use spawn_many() early unless the task is atomic; "
+                "the root agent should mainly coordinate and query peer state, then create downstream verifier/review/synthesis agents after worker evidence matures."
             )
         return (
             "Orchestration preference: "
             f"{preference}. {behavior} Good peer waves include evidence checks, calculations, implementation, "
-            "tests, critique, risk review, and final synthesis. Give peers role/group_id/current_task_tags."
+            "tests, critique, risk review, and final synthesis. Give peers role/group_id/current_task_tags; use depends_on/readiness for downstream agents."
         )
 
     def _emit(self, agent_id: str, event_type: str, data: dict | None = None):

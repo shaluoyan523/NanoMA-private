@@ -38,7 +38,7 @@ class ModelRegistry:
             data = yaml.safe_load(f)
         for name, cfg in data.get("models", {}).items():
             p = cfg.get("pricing", {})
-            self.models[name] = ModelDef(
+            model = ModelDef(
                 name=name,
                 provider=cfg.get("provider", "unknown"),
                 context_limit=cfg.get("context_limit", _DEFAULT_CONTEXT_LIMIT),
@@ -47,6 +47,18 @@ class ModelRegistry:
                 price_output=p.get("output", _FALLBACK_PRICE_OUTPUT),
                 tier=cfg.get("tier", "mid"),
             )
+            self.models[name] = model
+            for alias in self._aliases_for(name):
+                self.models.setdefault(alias, model)
+
+    @staticmethod
+    def _aliases_for(name: str) -> set[str]:
+        aliases = {name}
+        no_tier = name.split(":", 1)[0]
+        aliases.add(no_tier)
+        if "/" in no_tier:
+            aliases.add(no_tier.rsplit("/", 1)[-1])
+        return {alias for alias in aliases if alias}
 
     def get(self, name: str) -> ModelDef | None:
         return self.models.get(name)

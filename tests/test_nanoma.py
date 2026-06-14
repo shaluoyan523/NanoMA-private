@@ -3,12 +3,46 @@
 import asyncio
 import json
 import subprocess
+from types import SimpleNamespace
 
+import httpx
 import pytest
 
-from nanoma.core import Artifact, Envelope, ResourceQuota, Runtime, RuntimeConfig, ToolContext
+from nanoma.core import (
+    Artifact,
+    Envelope,
+    ResourceQuota,
+    Runtime,
+    RuntimeConfig,
+    ToolContext,
+    _infer_task_orchestration_preference,
+    _explicit_peer_wave_requirements,
+    _task_has_multi_phase_peer_protocol,
+    _task_has_spawnable_workstreams,
+    _task_is_concrete_single_output_work,
+    _task_is_coordination_artifact_task,
+    _task_is_leaf_artifact_lane,
+    _task_prefers_query_before_artifact,
+)
 from nanoma.cost import CostLedger, UsageRecord
-from nanoma.llm import LLMResponse, ToolCall, estimate_tokens, count_message_tokens, _parse_text_tool_calls
+from nanoma.llm import (
+    LLMResponse,
+    RetryConfig,
+    ToolCall,
+    TransientEmptyLLMResponse,
+    TransientToolCallTransportMiss,
+    _adapt_tool_schemas_for_model,
+    _adapt_tool_choice_for_model,
+    _body_with_tool_retry_repair,
+    _model_needs_required_arg_tool_schema,
+    _parse_text_tool_calls,
+    _raise_for_transient_empty_response,
+    _raise_for_transient_tool_call_transport_miss,
+    _should_repair_tool_retry,
+    count_message_tokens,
+    estimate_tokens,
+    openai_compatible_call,
+)
 from nanoma.memory import ActiveTaskCard
 from nanoma.meta import (
     META_TOOLS,
@@ -25,6 +59,7 @@ from nanoma.meta import (
     meta_spawn,
     meta_spawn_many,
     meta_submit,
+    meta_submit_answer,
     meta_transfer,
     meta_wait,
 )
@@ -65,6 +100,20 @@ def _init_git_source(workspace, files: dict[str, str] | None = None):
     subprocess.run(["git", "add", "."], cwd=source, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
     subprocess.run(["git", "commit", "-m", "baseline"], cwd=source, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
     return source
+
+
+def test_model_registry_resolves_provider_and_tier_aliases():
+    from nanoma.models import get_registry
+
+    registry = get_registry()
+    full = registry.get("deepseek/deepseek-v4-flash:nitro")
+    provider_alias = registry.get("deepseek/deepseek-v4-flash")
+    short_alias = registry.get("deepseek-v4-flash")
+
+    assert full is not None
+    assert provider_alias is full
+    assert short_alias is full
+    assert registry.context_limit("deepseek-v4-flash") == full.context_limit
 
 
 @pytest.fixture
@@ -266,7 +315,39 @@ async def test_meta_spawn_peer_metadata_and_state_board(runtime):
     assert child.workflow_prior == "research_loop"
     assert child.orchestration_preference == "parallel"
     assert runtime.state_board_get(child.id)["action_state"] == "create"
-    assert runtime.memory.serialize(child.id)["active_task"]["tags"] == ["analysis", "docs"]
+    active_tags = runtime.memory.serialize(child.id)["active_task"]["tags"]
+    assert {"analysis", "docs"} <= set(active_tags)
+    assert f"agent:{child.id}" in active_tags
+
+
+@pytest.mark.asyncio
+async def test_meta_spawn_canonicalizes_descriptive_role_and_indexes_identity_tags(runtime):
+    parent = runtime.create_agent("parent task")
+    result = await meta_spawn(
+        {
+            "task": "Collect source evidence for lane one.",
+            "role": "Evidence collector - Lane 1",
+            "create_type": "peer_agent",
+            "relationship": "peer",
+            "group_id": "gaia-l2-c61d",
+            "current_task_tags": ["Benchmark:GAIA", "task:C61D"],
+        },
+        parent,
+        runtime,
+    )
+    child = runtime.agents[result["agent_id"]]
+
+    assert child.role == "evidence"
+    assert child.bio == "Evidence collector - Lane 1"
+    assert result["role"] == "evidence"
+    assert result["role_description"] == "Evidence collector - Lane 1"
+    tags = runtime.memory.serialize(child.id)["tags"]
+    assert f"agent:{child.id}" in tags
+    assert "role:evidence" in tags
+    assert "lane:1" in tags
+    assert "group:gaia-l2-c61d" in tags
+    assert "benchmark:gaia" in tags
+    assert "task:c61d" in tags
 
 
 @pytest.mark.asyncio
@@ -274,6 +355,41 @@ async def test_meta_create_agent_alias(runtime):
     parent = runtime.create_agent("parent task")
     result = await meta_create_agent({"task": "child task", "workflow_prior": "critic_review_loop"}, parent, runtime)
     assert result["agent_id"] in runtime.agents
+
+
+@pytest.mark.asyncio
+async def test_meta_spawn_rejects_agent_requested_unknown_model(tmp_workspace):
+    config = RuntimeConfig(workspace_root=tmp_workspace, log_dir=None, sandbox_backend="host", default_model="deepseek-v4-flash")
+    rt = Runtime(config=config)
+    parent = rt.create_agent("parent task")
+
+    result = await meta_spawn({"task": "child task", "model": "sonnet"}, parent, rt)
+    child = rt.agents[result["agent_id"]]
+
+    assert child.model == "deepseek-v4-flash"
+    assert result["requested_model"] == "sonnet"
+    assert result["model_fallback_reason"] == "agent_model_override_disabled"
+    spawn_event = [e for e in rt._events if e["event"] == "spawn" and e["data"].get("child") == child.id][0]
+    assert spawn_event["data"]["model_fallback_reason"] == "agent_model_override_disabled"
+
+
+@pytest.mark.asyncio
+async def test_meta_spawn_allows_configured_model_override(tmp_workspace):
+    config = RuntimeConfig(
+        workspace_root=tmp_workspace,
+        log_dir=None,
+        sandbox_backend="host",
+        default_model="deepseek-v4-flash",
+        allow_agent_model_override=True,
+    )
+    rt = Runtime(config=config)
+    parent = rt.create_agent("parent task")
+
+    result = await meta_spawn({"task": "child task", "model": "claude-sonnet-4-6"}, parent, rt)
+    child = rt.agents[result["agent_id"]]
+
+    assert child.model == "claude-sonnet-4-6"
+    assert result["model_fallback_reason"] == ""
 
 
 @pytest.mark.asyncio
@@ -296,7 +412,379 @@ async def test_meta_spawn_many_creates_peer_wave(runtime):
     assert {child.role for child in children} == {"requirements", "tester"}
     assert all(child.create_type == "peer_agent" for child in children)
     assert all(child.group_id == "wave-1" for child in children)
-    assert all(child.orchestration_preference == "solo" for child in children)
+    assert all(item["result"]["requested_orchestration_preference"] is None for item in result["results"])
+    assert all(child.orchestration_preference != "solo" for child in children)
+
+
+@pytest.mark.asyncio
+async def test_spawn_many_solo_default_does_not_freeze_research_workers(tmp_workspace):
+    config = RuntimeConfig(
+        workspace_root=tmp_workspace,
+        log_dir=None,
+        sandbox_backend="host",
+        orchestration_preference="aggressive",
+        child_orchestration_preference=None,
+    )
+    rt = Runtime(config=config)
+    parent = rt.create_agent("Coordinate GAIA research lanes.")
+
+    result = await meta_spawn_many(
+        {
+            "defaults": {
+                "create_type": "peer_agent",
+                "relationship": "peer",
+                "group_id": "gaia_l2_c61d",
+                "orchestration_preference": "solo",
+            },
+            "agents": [
+                {
+                    "task": (
+                        "Find the paper about AI regulation originally submitted to arXiv.org in June 2022. "
+                        "Report the arXiv ID, title, all six axis endpoint labels, and write "
+                        "shared/gaia_l2/c61d/paper_2022_evidence.md."
+                    ),
+                    "role": "paper_finder_2022",
+                    "current_task_tags": ["benchmark:gaia", "lane:2022_paper"],
+                }
+            ],
+        },
+        parent,
+        rt,
+    )
+
+    child = rt.agents[result["results"][0]["result"]["agent_id"]]
+
+    assert result["results"][0]["result"]["requested_orchestration_preference"] is None
+    assert child.orchestration_preference != "solo"
+
+
+@pytest.mark.asyncio
+async def test_meta_spawn_many_defers_low_readiness_downstream_agent(runtime):
+    parent = runtime.create_agent("parent task")
+    worker = runtime.create_agent("Find evidence and write shared/evidence.md", parent=parent.id, role="worker")
+    parent.children.add(worker.id)
+
+    result = await meta_spawn_many(
+        {
+            "agents": [
+                {
+                    "task": "Verify the worker evidence and summarize the answer",
+                    "role": "verifier",
+                    "depends_on": [worker.id],
+                    "readiness": 0.1,
+                }
+            ],
+        },
+        parent,
+        runtime,
+    )
+
+    assert result["created"] == 0
+    assert result["deferred"] == 1
+    assert parent._deferred_spawn_requests
+    assert [e for e in runtime._events if e["event"] == "spawn_deferred"]
+
+
+@pytest.mark.asyncio
+async def test_meta_spawn_many_starts_independent_evidence_workers_without_readiness(runtime):
+    parent = runtime.create_agent("parent task")
+
+    result = await meta_spawn_many(
+        {
+            "agents": [
+                {
+                    "task": (
+                        "Find the Physics and Society article submitted to arXiv on August 11, 2016. "
+                        "Identify society descriptors and write shared/gaia/paper_2016_report.md with confidence."
+                    ),
+                    "role": "paper_2016_finder",
+                    "current_task_tags": ["lane:2016_paper", "role:evidence"],
+                },
+                {
+                    "task": (
+                        "Find the AI regulation paper submitted to arXiv in June 2022. "
+                        "Identify all figure axis words and write shared/gaia/paper_2022_report.md with confidence."
+                    ),
+                    "role": "paper_2022_finder",
+                    "current_task_tags": ["lane:2022_paper", "role:evidence"],
+                },
+            ],
+            "defaults": {"group_id": "gaia-workers", "create_type": "peer_agent"},
+        },
+        parent,
+        runtime,
+    )
+
+    assert result["created"] == 2
+    assert result["deferred"] == 0
+    assert not parent._deferred_spawn_requests
+
+
+@pytest.mark.asyncio
+async def test_meta_spawn_defers_input_dependent_focus_without_explicit_depends_on(runtime):
+    parent = runtime.create_agent("parent task")
+    worker = runtime.create_agent("Find source evidence and write shared/evidence.md", parent=parent.id, role="source")
+    parent.children.add(worker.id)
+
+    result = await meta_spawn(
+        {
+            "task": "Cross-check the source evidence and produce a final confidence note.",
+            "role": "open-focus",
+            "current_task_tags": ["phase:confidence-check"],
+            "readiness": 0.3,
+        },
+        parent,
+        runtime,
+    )
+
+    assert result["deferred"] is True
+    assert result["downstream_focus"] is True
+    assert result["readiness"] < runtime.config.spawn_readiness_threshold
+
+
+@pytest.mark.asyncio
+async def test_meta_spawn_many_defers_downstream_agent_despite_model_lowered_threshold(runtime):
+    parent = runtime.create_agent("parent task")
+    worker = runtime.create_agent("Find evidence and write shared/evidence.md", parent=parent.id, role="worker")
+    parent.children.add(worker.id)
+
+    result = await meta_spawn_many(
+        {
+            "agents": [
+                {
+                    "task": "Verify worker evidence and produce final answer",
+                    "role": "verifier",
+                    "depends_on": [worker.id],
+                    "readiness": 0.95,
+                    "readiness_threshold": 0.2,
+                }
+            ],
+        },
+        parent,
+        runtime,
+    )
+
+    assert result["created"] == 0
+    assert result["deferred"] == 1
+    deferred = result["results"][0]["result"]
+    assert deferred["readiness"] < runtime.config.spawn_readiness_threshold
+    assert deferred["readiness_threshold"] == runtime.config.spawn_readiness_threshold
+
+
+@pytest.mark.asyncio
+async def test_meta_spawn_allows_downstream_agent_when_dependency_ready(runtime):
+    parent = runtime.create_agent("parent task")
+    worker = runtime.create_agent("Find evidence and write shared/evidence.md", parent=parent.id, role="worker")
+    parent.children.add(worker.id)
+    worker.status = "done"
+    worker.result = "evidence ready"
+
+    result = await meta_spawn(
+        {
+            "task": "Verify the worker evidence and summarize the answer",
+            "role": "verifier",
+            "depends_on": [worker.id],
+            "readiness": 0.1,
+        },
+        parent,
+        runtime,
+    )
+
+    assert "agent_id" in result
+    assert result["role"] == "verifier"
+    assert result["readiness"] == 1.0
+
+
+@pytest.mark.asyncio
+async def test_meta_spawn_allows_self_verifier_when_current_agent_has_artifact(runtime, tmp_workspace):
+    parent = runtime.create_agent("parent task")
+    worker = runtime.create_agent(
+        "Find evidence and write shared/evidence.md.",
+        parent=parent.id,
+        role="researcher",
+        group_id="lane",
+        current_task_tags=["lane:evidence"],
+    )
+    parent.children.add(worker.id)
+    artifact_path = tmp_workspace / "shared" / "evidence.md"
+    artifact_path.write_text("Status: evidence-pending\nCandidate: egalitarian\n")
+    worker.artifacts.append(Artifact("shared/evidence.md", artifact_path, agent_id=worker.id))
+
+    result = await meta_spawn(
+        {
+            "task": "Verify and correct delta evidence, then write shared/evidence.md.",
+            "role": "verifier",
+            "depends_on": [worker.id],
+            "readiness": 0.9,
+            "group_id": "lane",
+            "current_task_tags": ["role:verifier", "lane:evidence"],
+        },
+        worker,
+        runtime,
+    )
+
+    assert "agent_id" in result
+    child = runtime.agents[result["agent_id"]]
+    assert child.parent == worker.id
+    assert child.role == "verifier"
+    assert result["readiness"] >= runtime.config.spawn_readiness_threshold
+
+
+@pytest.mark.asyncio
+async def test_meta_spawn_many_skips_verified_duplicate_lane(runtime, tmp_workspace):
+    parent = runtime.create_agent("Coordinate GAIA evidence and verification.", group_id="gaia-c61")
+    report = tmp_workspace / "shared" / "gaia_l2" / "c61d" / "researcher2_evidence.md"
+    report.parent.mkdir(parents=True)
+    report.write_text("Status: verified\nTotal Results: 8\nConfidence: High\n")
+    verifier = runtime.create_agent(
+        "Verify shared/gaia_l2/c61d/researcher2_evidence.md against arXiv physics.soc-ph 2016-08-11.",
+        parent=parent.id,
+        role="verifier",
+        group_id="verification_gaia_l2",
+        current_task_tags=["benchmark:gaia", "lane:phys-soc-2016", "role:verifier"],
+    )
+    parent.children.add(verifier.id)
+    verifier.status = "done"
+    verifier.result = "Verified physics.soc-ph report."
+    verifier.artifacts.append(Artifact("shared/gaia_l2/c61d/researcher2_evidence.md", report, agent_id=verifier.id))
+    runtime.memory.update(verifier.id, add_artifacts=["shared/gaia_l2/c61d/researcher2_evidence.md"], tags=verifier.current_task_tags)
+
+    result = await meta_spawn_many(
+        {
+            "defaults": {
+                "create_type": "peer_agent",
+                "relationship": "peer",
+                "group_id": "verification_gaia_l2",
+            },
+            "agents": [
+                {
+                    "task": (
+                        "Read shared/gaia_l2/c61d/researcher2_evidence.md. Verify completeness and accuracy "
+                        "for all physics.soc-ph papers submitted on 2016-08-11."
+                    ),
+                    "role": "verifier",
+                    "current_task_tags": ["benchmark:gaia", "lane:phys-soc-2016", "role:verifier"],
+                }
+            ],
+        },
+        parent,
+        runtime,
+    )
+
+    assert result["created"] == 0
+    assert result["skipped"] == 1
+    skipped = result["results"][0]["result"]
+    assert skipped["reason"] == "verified_lane_already_covered"
+    assert skipped["covered_by"][0]["id"] == verifier.id
+    assert len(runtime.agents) == 2
+    assert any(e["event"] == "spawn_skipped" for e in runtime._events)
+
+
+@pytest.mark.asyncio
+async def test_meta_spawn_many_does_not_skip_final_delivery_due_to_evidence_lane(runtime, tmp_workspace):
+    parent = runtime.create_agent(
+        'Question requires submit_answer(answer="<answer-only string>").',
+        group_id="gaia-c61",
+        orchestration_preference="parallel",
+    )
+    report = tmp_workspace / "shared" / "gaia_l2" / "c61d" / "bravo_evidence.md"
+    report.parent.mkdir(parents=True)
+    report.write_text("Status: verified\nSix words: Standardized, Localized, Utilitarian, Egalitarian.\n")
+    worker = runtime.create_agent(
+        "Collect evidence for lane:ai-regulation-2022 and write shared/gaia_l2/c61d/bravo_evidence.md.",
+        parent=parent.id,
+        role="evidence",
+        group_id="gaia-c61",
+        current_task_tags=["benchmark:gaia", "lane:ai-regulation-2022", "role:evidence"],
+    )
+    parent.children.add(worker.id)
+    worker.status = "done"
+    worker.result = "Verified evidence: Egalitarian is one candidate word."
+    worker.artifacts.append(Artifact("shared/gaia_l2/c61d/bravo_evidence.md", report, agent_id=worker.id))
+    runtime.memory.update(
+        worker.id,
+        public_summary=worker.result,
+        add_artifacts=["shared/gaia_l2/c61d/bravo_evidence.md"],
+        tags=worker.current_task_tags + ["status:done", "confidence:high"],
+    )
+
+    result = await meta_spawn_many(
+        {
+            "defaults": {
+                "create_type": "peer_agent",
+                "relationship": "downstream",
+                "group_id": "gaia-c61",
+            },
+            "agents": [
+                {
+                    "task": (
+                        "You are the final delivery agent. Query/read the evidence reports, "
+                        "verify the supported answer, and call submit_answer(answer=\"<answer-only string>\")."
+                    ),
+                    "role": "delivery",
+                    "current_task_tags": ["final_delivery", "synthesis", "answer_submission"],
+                    "depends_on": [worker.id],
+                    "readiness": 1.0,
+                }
+            ],
+        },
+        parent,
+        runtime,
+    )
+
+    assert result["created"] == 1
+    assert result["skipped"] == 0
+    child_id = result["results"][0]["result"]["agent_id"]
+    assert runtime._agent_focus_class(runtime.agents[child_id]) == "final_delivery"
+
+
+@pytest.mark.asyncio
+async def test_meta_spawn_many_allows_verifier_when_existing_coverage_is_incomplete_trace_only(runtime, tmp_workspace):
+    parent = runtime.create_agent("Coordinate evidence and verification.", group_id="gaia-c61")
+    worker = runtime.create_agent(
+        "Collect evidence for lane:phys-soc-2016 and write shared/researcher2_evidence.md.",
+        parent=parent.id,
+        role="researcher",
+        group_id="verification_gaia_l2",
+        current_task_tags=["benchmark:gaia", "lane:phys-soc-2016", "role:evidence", "status:incomplete", "needs_verification"],
+    )
+    parent.children.add(worker.id)
+    trace = tmp_workspace / "shared" / ".nanoma" / "evidence" / worker.id / "turn_1.txt"
+    trace.parent.mkdir(parents=True)
+    trace.write_text("Candidate evidence found, needs verification.\n")
+    worker.artifacts.append(Artifact(f"shared/.nanoma/evidence/{worker.id}/turn_1.txt", trace, agent_id=worker.id))
+    runtime.memory.update(
+        worker.id,
+        add_artifacts=[f"shared/.nanoma/evidence/{worker.id}/turn_1.txt"],
+        tags=worker.current_task_tags,
+    )
+
+    result = await meta_spawn_many(
+        {
+            "defaults": {
+                "create_type": "peer_agent",
+                "relationship": "peer",
+                "group_id": "verification_gaia_l2",
+                "readiness": 1.0,
+            },
+            "agents": [
+                {
+                    "task": (
+                        "Independently verify lane:phys-soc-2016 evidence using primary sources "
+                        "and write shared/verification.md."
+                    ),
+                    "role": "verifier",
+                    "current_task_tags": ["benchmark:gaia", "lane:phys-soc-2016", "role:verifier"],
+                }
+            ],
+        },
+        parent,
+        runtime,
+    )
+
+    assert result["created"] == 1
+    assert result["skipped"] == 0
+    assert runtime._agent_has_verified_coverage(worker) is False
 
 
 @pytest.mark.asyncio
@@ -318,6 +806,93 @@ async def test_meta_spawn_many_accepts_json_string_args(runtime):
     children = [runtime.agents[item["result"]["agent_id"]] for item in result["results"]]
     assert {child.role for child in children} == {"requirements", "tester"}
     assert all(child.group_id == "wave-json" for child in children)
+
+
+@pytest.mark.asyncio
+async def test_meta_spawn_many_recovers_top_level_raw_json_args(runtime):
+    parent = runtime.create_agent("parent task")
+    raw_args = json.dumps({
+        "defaults": {"create_type": "peer_agent", "relationship": "peer", "group_id": "wave-raw"},
+        "agents": [
+            {"task": "check requirements", "role": "requirements"},
+            {"task": "write tests", "role": "tester"},
+        ],
+    })
+
+    result = await meta_spawn_many({"_raw": raw_args}, parent, runtime)
+
+    assert result["created"] == 2
+    children = [runtime.agents[item["result"]["agent_id"]] for item in result["results"]]
+    assert {child.role for child in children} == {"requirements", "tester"}
+    assert all(child.group_id == "wave-raw" for child in children)
+
+
+@pytest.mark.asyncio
+async def test_meta_spawn_many_merges_agents_and_tasks(runtime):
+    parent = runtime.create_agent("parent task")
+    result = await meta_spawn_many(
+        {
+            "defaults": {"create_type": "peer_agent", "group_id": "wave-merge"},
+            "agents": [{"task": "candidate 00", "role": "generator"}],
+            "tasks": ["candidate 01", "candidate 02"],
+        },
+        parent,
+        runtime,
+    )
+
+    assert result["created"] == 3
+    children = [runtime.agents[item["result"]["agent_id"]] for item in result["results"]]
+    assert [child.task for child in children] == ["candidate 00", "candidate 01", "candidate 02"]
+    assert {child.group_id for child in children} == {"wave-merge"}
+
+
+@pytest.mark.asyncio
+async def test_meta_spawn_many_recovers_agents_string_with_embedded_defaults(runtime):
+    parent = runtime.create_agent("parent task")
+    agents_string = (
+        json.dumps([
+            {"task": "Generate candidate 00", "role": "generator", "current_task_tags": ["candidate:00"]},
+            {"task": "Generate candidate 01", "role": "generator", "current_task_tags": ["candidate:01"]},
+        ])
+        + ', "defaults": {"create_type": "peer_agent", "relationship": "peer", "group_id": "gen0-2161F"}'
+    )
+
+    result = await meta_spawn_many({"agents": agents_string}, parent, runtime)
+
+    assert result["created"] == 2
+    children = [runtime.agents[item["result"]["agent_id"]] for item in result["results"]]
+    assert all(child.create_type == "peer_agent" for child in children)
+    assert all(child.relationship == "peer" for child in children)
+    assert all(child.group_id == "gen0-2161F" for child in children)
+    child_tags = [set(child.current_task_tags) for child in children]
+    assert {"candidate:00", "candidate:01"} == {tag for tags in child_tags for tag in tags if tag.startswith("candidate:")}
+    assert all(f"agent:{child.id}" in child.current_task_tags for child in children)
+    assert all("role:generator" in child.current_task_tags for child in children)
+
+
+@pytest.mark.asyncio
+async def test_meta_spawn_many_recovers_complete_prefix_from_truncated_agents_string(runtime):
+    parent = runtime.create_agent("parent task")
+    agents_string = (
+        '['
+        '{"task": "Generate candidate 00", "role": "generator-00"},'
+        '{"task": "Generate candidate 01", "role": "generator-01"},'
+        '{"task": "Generate candidate 02", "role": "generator-02"'
+    )
+
+    result = await meta_spawn_many(
+        {
+            "agents": agents_string,
+            "defaults": {"create_type": "peer_agent", "relationship": "peer", "group_id": "gen0-prefix"},
+        },
+        parent,
+        runtime,
+    )
+
+    assert result["created"] == 2
+    children = [runtime.agents[item["result"]["agent_id"]] for item in result["results"]]
+    assert {child.role for child in children} == {"generator-00", "generator-01"}
+    assert all(child.group_id == "gen0-prefix" for child in children)
 
 
 @pytest.mark.asyncio
@@ -485,7 +1060,7 @@ async def test_spawn_orchestration_preference_overrides_adaptive_default(tmp_wor
 
 
 @pytest.mark.asyncio
-async def test_explicit_aggressive_leaf_artifact_lane_is_downgraded_to_solo(tmp_workspace):
+async def test_explicit_aggressive_leaf_artifact_lane_is_not_forced_to_solo(tmp_workspace):
     config = RuntimeConfig(
         workspace_root=tmp_workspace,
         log_dir=None,
@@ -514,8 +1089,98 @@ async def test_explicit_aggressive_leaf_artifact_lane_is_downgraded_to_solo(tmp_
     child = rt.agents[result["agent_id"]]
 
     assert result["requested_orchestration_preference"] == "aggressive"
-    assert child.orchestration_preference == "solo"
-    assert result["orchestration_preference"] == "solo"
+    assert child.orchestration_preference == "aggressive"
+    assert result["orchestration_preference"] == "aggressive"
+
+
+def test_english_benchmark_protocol_keywords_trigger_spawnable_workstreams():
+    task = (
+        "Run an OpenDeepThink-style benchmark suite with an initial candidate pool, "
+        "20 independent candidates, a pairwise comparison graph, Bradley-Terry ranking, "
+        "top 5 elites, bottom 5 mutation wave, gen1 population, tournament selection, "
+        "and final synthesis."
+    )
+
+    preference, reasons = _infer_task_orchestration_preference(
+        parent_preference="balanced",
+        task=task,
+        workflow_prior="benchmark_protocol",
+        current_task_tags=["benchmark:cf73", "scope:full"],
+    )
+
+    assert _task_has_multi_phase_peer_protocol(task)
+    assert _task_has_spawnable_workstreams(task, min_streams=3)
+    assert preference == "aggressive"
+    assert any("parallel_score" in reason for reason in reasons)
+
+
+def test_explicit_peer_wave_requirement_detects_gen0_generators():
+    requirements = _explicit_peer_wave_requirements(
+        "Spawn 20 independent gen-0 generator agents in parallel for candidate IDs 00..19."
+    )
+
+    assert requirements
+    assert requirements[0]["target"] == 20
+    assert requirements[0]["role"] == "generator"
+    assert requirements[0]["phase"] == "gen0"
+
+
+def test_single_english_candidate_artifact_keywords_stay_leaf_but_do_not_force_solo():
+    task = (
+        "Generate one candidate solution and save "
+        "shared/cf73_top10/2161F/gen0/candidate_07.cpp and "
+        "shared/cf73_top10/2161F/gen0/candidate_07.md."
+    )
+
+    preference, reasons = _infer_task_orchestration_preference(
+        parent_preference="aggressive",
+        task=task,
+        role="generator",
+        group_id="cf73-2161f-gen0",
+        current_task_tags=["benchmark:cf73", "phase:gen0", "role:generator", "candidate:07"],
+    )
+
+    assert _task_is_leaf_artifact_lane(
+        task=task,
+        role="generator",
+        group_id="cf73-2161f-gen0",
+        current_task_tags=["benchmark:cf73", "phase:gen0", "role:generator", "candidate:07"],
+    )
+    assert not _task_has_multi_phase_peer_protocol(task)
+    assert not _task_has_spawnable_workstreams(task, min_streams=3)
+    assert preference == "aggressive"
+    assert "leaf artifact lane" in reasons
+
+
+def test_concrete_single_output_discovery_work_balances_without_forcing_solo():
+    task = (
+        "Query the arXiv API for the August 11 2016 physics.soc-ph article, "
+        "extract the article title and relevant society descriptor, and write "
+        "shared/gaia_l2/c61d/evidence_society_words.md."
+    )
+
+    preference, reasons = _infer_task_orchestration_preference(
+        parent_preference="aggressive",
+        task=task,
+        role="researcher",
+        group_id="gaia-l2-c61d",
+        current_task_tags=["benchmark:gaia", "phase:evidence", "topic:physics_society"],
+    )
+
+    assert _task_is_concrete_single_output_work(task)
+    assert not _task_has_spawnable_workstreams(task, min_streams=3)
+    assert preference == "balanced"
+    assert "concrete single-output work" in reasons
+
+
+def test_english_peer_state_keywords_prefer_query_before_artifact():
+    task = (
+        "Before final synthesis, inspect peer state_board, public_memory, memory tags, "
+        "completed peers, and artifact paths, then write shared/cf73_top10/2161F/report.md."
+    )
+
+    assert _task_prefers_query_before_artifact(task)
+    assert _task_is_coordination_artifact_task(task)
 
 
 def test_orchestration_preference_prompt_sections(tmp_workspace):
@@ -569,6 +1234,32 @@ async def test_orchestration_nudge_sent_once_for_parallel_agent(tmp_workspace):
     assert not agent._steer_inbox.empty()
 
 
+def test_orchestration_nudge_skips_concrete_single_output_work(tmp_workspace):
+    config = RuntimeConfig(
+        workspace_root=tmp_workspace,
+        log_dir=None,
+        sandbox_backend="host",
+        orchestration_preference="aggressive",
+        spawn_before_turn=1,
+        max_solo_tool_calls_before_spawn=1,
+    )
+    rt = Runtime(config=config)
+    agent = rt.create_agent(
+        "Query the arXiv API for the August 11 2016 physics.soc-ph article, "
+        "extract the article title and relevant society descriptor, and write "
+        "shared/gaia_l2/c61d/evidence_society_words.md.",
+        model="test",
+        orchestration_preference="aggressive",
+    )
+    agent._turns = 2
+    agent._tool_calls = 2
+
+    rt._check_orchestration_nudge(agent)
+
+    assert not [e for e in rt._events if e["event"] == "orchestration_nudge"]
+    assert agent._steer_inbox.empty()
+
+
 @pytest.mark.asyncio
 async def test_spawnable_parallel_task_gets_create_action_scope(tmp_workspace):
     calls = []
@@ -578,6 +1269,7 @@ async def test_spawnable_parallel_task_gets_create_action_scope(tmp_workspace):
             "tools": [t["function"]["name"] for t in (tools or [])],
             "messages": messages,
             "tool_choice": kwargs.get("tool_choice"),
+            "max_tokens": kwargs.get("max_tokens"),
         })
         return LLMResponse(
             tool_calls=[ToolCall(id="tc1", name="get_cost", arguments={})],
@@ -592,6 +1284,7 @@ async def test_spawnable_parallel_task_gets_create_action_scope(tmp_workspace):
         spawn_before_turn=1,
         max_turns=1,
         min_spawnable_workstreams=3,
+        create_action_max_tokens=15000,
     )
     rt = Runtime(config=config, llm_call=mock_llm)
 
@@ -600,8 +1293,9 @@ async def test_spawnable_parallel_task_gets_create_action_scope(tmp_workspace):
         "focused tests, and risk review."
     )
 
-    assert {"spawn_many", "spawn", "create_agent", "query", "compact", "set_status", "get_cost"} == set(calls[0]["tools"])
-    assert "file_read" not in calls[0]["tools"]
+    assert {"spawn_many", "spawn", "create_agent", "compact", "set_status", "get_cost"} == set(calls[0]["tools"])
+    assert calls[0]["tool_choice"] is None
+    assert calls[0]["max_tokens"] == 15000
     card = "\n".join(m.get("content") or "" for m in calls[0]["messages"])
     assert "Current action is create" in card
     assert [e for e in rt._events if e["event"] == "orchestration_nudge" and e["data"].get("spawnable_task")]
@@ -669,7 +1363,7 @@ async def test_create_action_scope_persists_until_spawn_or_solo_decision(tmp_wor
 
     await rt.run("Patch shared/source with separable audit, patch, test, and review workstreams.")
 
-    create_tools = {"spawn", "create_agent", "spawn_many", "query", "compact", "set_status", "get_cost"}
+    create_tools = {"spawn", "create_agent", "spawn_many", "compact", "set_status", "get_cost"}
     assert set(calls[0]) == create_tools
     assert set(calls[1]) == {"spawn", "create_agent", "spawn_many"}
     assert set(calls[2]) == {"spawn", "create_agent", "spawn_many"}
@@ -726,12 +1420,69 @@ async def test_create_miss_retries_with_spawn_tools_only(tmp_workspace):
 
     await rt.run("Patch shared/source with separable audit and patch workstreams.")
 
-    assert set(calls[0]["tools"]) == {"spawn", "create_agent", "spawn_many", "query", "compact", "set_status", "get_cost"}
+    assert set(calls[0]["tools"]) == {"spawn", "create_agent", "spawn_many", "compact", "set_status", "get_cost"}
+    assert calls[0]["tool_choice"] is None
     assert set(calls[1]["tools"]) == {"spawn", "create_agent", "spawn_many"}
     assert calls[1]["tool_choice"] == {"type": "function", "function": {"name": "spawn_many"}}
     card = "\n".join(m.get("content") or "" for m in calls[1]["messages"])
     assert "retry_spawn_after_create_miss" in card
     assert len(rt.agents) == 3
+
+
+@pytest.mark.asyncio
+async def test_create_action_set_status_work_does_not_retry_spawn(tmp_workspace):
+    calls = []
+
+    async def mock_llm(messages, model, tools=None, **kwargs):
+        calls.append({
+            "tools": [t["function"]["name"] for t in (tools or [])],
+            "tool_choice": kwargs.get("tool_choice"),
+            "messages": messages,
+        })
+        if len(calls) == 1:
+            return LLMResponse(
+                tool_calls=[ToolCall(
+                    id="tc1",
+                    name="set_status",
+                    arguments={
+                        "action": "work",
+                        "current_task_tags": ["status:solo-decision", "phase:artifact"],
+                        "work_outline": "Handle this leaf artifact directly before any handoff.",
+                    },
+                )],
+                usage=UsageRecord(input_tokens=10, output_tokens=5, model=model),
+            )
+        return LLMResponse(
+            tool_calls=[ToolCall(
+                id="tc2",
+                name="file_write",
+                arguments={"path": "shared/final.md", "content": "done\n"},
+            )],
+            usage=UsageRecord(input_tokens=10, output_tokens=5, model=model),
+        )
+
+    config = RuntimeConfig(
+        workspace_root=tmp_workspace,
+        log_dir=None,
+        sandbox_backend="host",
+        loop_action_policy="constraint",
+        orchestration_preference="parallel",
+        spawn_before_turn=1,
+        max_turns=3,
+        max_agents=10,
+        min_spawnable_workstreams=2,
+    )
+    rt = Runtime(config=config, llm_call=mock_llm)
+
+    await rt.run("Patch shared/source with separable audit and patch workstreams. Write shared/final.md.")
+
+    assert set(calls[0]["tools"]) == {"spawn", "create_agent", "spawn_many", "compact", "set_status", "get_cost"}
+    assert "spawn_many" not in set(calls[1]["tools"])
+    assert "file_write" in set(calls[1]["tools"])
+    assert len(rt.agents) == 1
+    root = rt.agents["alpha"]
+    assert root._create_action_filtered_count == 0
+    assert any(e["event"] == "tool_call" and e["data"]["tool"] == "file_write" for e in rt._events)
 
 
 @pytest.mark.asyncio
@@ -783,10 +1534,1696 @@ async def test_set_status_create_counts_as_create_miss_until_spawn(tmp_workspace
 
     await rt.run("Patch shared/source with separable audit and patch workstreams.")
 
+    assert set(calls[0]["tools"]) == {"spawn", "create_agent", "spawn_many", "compact", "set_status", "get_cost"}
+    assert calls[0]["tool_choice"] is None
     assert set(calls[1]["tools"]) == {"spawn", "create_agent", "spawn_many"}
     assert calls[1]["tool_choice"] == {"type": "function", "function": {"name": "spawn_many"}}
     assert [e for e in rt._events if e["event"] == "create_action_miss" and e["data"].get("reason") == "no_child_created_in_create_action"]
+    assert [e for e in rt._events if e["event"] == "loop_action_auxiliary_only_miss" and e["data"].get("action") == "create"]
     assert len(rt.agents) == 3
+
+
+def test_constraint_loop_action_policy_scores_candidates(tmp_workspace):
+    async def mock_llm(messages, model, tools=None, **kwargs):
+        return LLMResponse(
+            tool_calls=[ToolCall(id="tc1", name="set_status", arguments={"status": "done", "result": "ok"})],
+            usage=UsageRecord(input_tokens=10, output_tokens=5, model=model),
+        )
+
+    config = RuntimeConfig(
+        workspace_root=tmp_workspace,
+        log_dir=None,
+        sandbox_backend="host",
+        loop_action_policy="constraint",
+    )
+    rt = Runtime(config=config, llm_call=mock_llm)
+    parent = rt.create_agent(
+        "Coordinate child work, then write shared/final.md",
+        model="test",
+        orchestration_preference="parallel",
+    )
+    child = rt.create_agent("Write shared/child.md", model="test", parent=parent.id)
+    parent.children.add(child.id)
+
+    rt._refresh_loop_action_plan(parent, ["shared/final.md"])
+
+    assert parent._loop_action_plan["action"] == "message"
+    assert parent._loop_action_plan["reason"] == "coordinate_unfinished_children_before_artifacts"
+    assert "constraints" in parent._loop_action_plan
+    assert parent._loop_action_plan["candidate_scores"][0]["action"] == "message"
+
+
+def test_constraint_loop_action_keeps_structure_before_root_artifacts(tmp_workspace):
+    async def mock_llm(messages, model, tools=None, **kwargs):
+        return LLMResponse(
+            tool_calls=[ToolCall(id="tc1", name="set_status", arguments={"status": "done", "result": "ok"})],
+            usage=UsageRecord(input_tokens=10, output_tokens=5, model=model),
+        )
+
+    config = RuntimeConfig(
+        workspace_root=tmp_workspace,
+        log_dir=None,
+        sandbox_backend="host",
+        loop_action_policy="constraint",
+        orchestration_preference="aggressive",
+        spawn_before_turn=1,
+        max_solo_tool_calls_before_spawn=1,
+    )
+    rt = Runtime(config=config, llm_call=mock_llm)
+    agent = rt.create_agent(
+        "Run a benchmark with generator, comparator, mutation, synthesis, and report workstreams. "
+        "Write shared/final.md.",
+        model="test",
+        orchestration_preference="aggressive",
+    )
+    agent._turns = 1
+    agent._orchestration_nudge_sent = True
+
+    rt._refresh_loop_action_plan(agent, ["shared/final.md"])
+
+    assert agent._loop_action_plan["action"] == "create"
+    assert agent._loop_action_plan["reason"] == "spawnable_workstreams_before_solo_execution"
+    assert agent._loop_action_plan["candidate_scores"][0]["action"] == "create"
+
+
+def test_worker_role_is_not_forced_solo_but_self_work_decision_blocks_create(tmp_workspace):
+    config = RuntimeConfig(
+        workspace_root=tmp_workspace,
+        log_dir=None,
+        sandbox_backend="host",
+        loop_action_policy="constraint",
+        orchestration_preference="parallel",
+        spawn_before_turn=1,
+        max_solo_tool_calls_before_spawn=1,
+        max_agents=10,
+    )
+    rt = Runtime(config=config)
+    worker = rt.create_agent(
+        "Run a benchmark with independent search, implementation, validation, and synthesis workstreams. "
+        "Write shared/final.md.",
+        model="test",
+        role="worker",
+        orchestration_preference="parallel",
+    )
+    worker._turns = 1
+    worker._orchestration_nudge_sent = True
+
+    assert rt._can_create_child(worker)
+    rt._refresh_loop_action_plan(worker, ["shared/final.md"])
+    assert worker._loop_action_plan["action"] == "create"
+
+    rt.state_board_update(
+        worker.id,
+        action_state="work",
+        current_task_tags=["status:solo-decision", "phase:artifact"],
+    )
+    worker._create_action_filtered_count = 1
+    rt._refresh_loop_action_plan(worker, ["shared/final.md"])
+
+    assert not rt._can_create_child(worker)
+    assert worker._loop_action_plan["action"] == "work"
+    assert worker._loop_action_plan["reason"] == "solo_decision_after_create_miss"
+
+
+def test_constraint_loop_action_preserves_query_before_artifact(tmp_workspace):
+    async def mock_llm(messages, model, tools=None, **kwargs):
+        return LLMResponse(
+            tool_calls=[ToolCall(id="tc1", name="set_status", arguments={"status": "done", "result": "ok"})],
+            usage=UsageRecord(input_tokens=10, output_tokens=5, model=model),
+        )
+
+    config = RuntimeConfig(
+        workspace_root=tmp_workspace,
+        log_dir=None,
+        sandbox_backend="host",
+        loop_action_policy="constraint",
+    )
+    rt = Runtime(config=config, llm_call=mock_llm)
+    agent = rt.create_agent(
+        "Query peers by group_id before writing shared/final.md.",
+        model="test",
+        orchestration_preference="solo",
+    )
+
+    rt._refresh_loop_action_plan(agent, ["shared/final.md"])
+
+    assert agent._loop_action_plan["action"] == "read"
+    assert agent._loop_action_plan["reason"] == "task_requests_peer_query_before_artifact"
+
+
+def test_constraint_loop_action_queries_overlap_before_discovery_work(tmp_workspace):
+    config = RuntimeConfig(
+        workspace_root=tmp_workspace,
+        log_dir=None,
+        sandbox_backend="host",
+        loop_action_policy="constraint",
+    )
+    rt = Runtime(config=config)
+    parent = rt.create_agent("Coordinate GAIA evidence search.", model="test", orchestration_preference="parallel")
+    agent = rt.create_agent(
+        "Search arXiv and collect evidence about AI regulation papers; write shared/lane_alpha.md.",
+        model="test",
+        parent=parent.id,
+        group_id="gaia-c61",
+        role="researcher",
+        current_task_tags=["benchmark:gaia", "problem:c61", "phase:evidence", "topic:ai_regulation"],
+        orchestration_preference="parallel",
+    )
+    rt.create_agent(
+        "Search arXiv for AI regulation evidence and sources; write shared/lane_bravo.md.",
+        model="test",
+        parent=parent.id,
+        group_id="gaia-c61",
+        role="researcher",
+        current_task_tags=["benchmark:gaia", "problem:c61", "phase:evidence", "topic:ai_regulation"],
+        orchestration_preference="parallel",
+    )
+
+    rt._refresh_loop_action_plan(agent, ["shared/lane_alpha.md"])
+
+    assert agent._loop_action_plan["action"] == "read"
+    assert agent._loop_action_plan["reason"] == "peer_overlap_query_before_work"
+    assert agent._peer_overlap_query_turn == agent._turns
+    assert agent._loop_action_plan["candidate_scores"][0]["action"] == "read"
+
+
+def test_constraint_loop_action_does_not_query_before_leaf_candidate_work(tmp_workspace):
+    config = RuntimeConfig(
+        workspace_root=tmp_workspace,
+        log_dir=None,
+        sandbox_backend="host",
+        loop_action_policy="constraint",
+    )
+    rt = Runtime(config=config)
+    parent = rt.create_agent("Coordinate candidates.", model="test", orchestration_preference="parallel")
+    agent = rt.create_agent(
+        "Write shared/cf73_top10/2161F/gen0/candidate_02.cpp and "
+        "shared/cf73_top10/2161F/gen0/candidate_02.md.",
+        model="test",
+        parent=parent.id,
+        group_id="wave",
+        role="generator",
+        current_task_tags=["phase:gen0", "role:generator", "candidate:02"],
+        orchestration_preference="parallel",
+    )
+    rt.create_agent(
+        "Write shared/cf73_top10/2161F/gen0/candidate_00.cpp and "
+        "shared/cf73_top10/2161F/gen0/candidate_00.md.",
+        model="test",
+        parent=parent.id,
+        group_id="wave",
+        role="generator",
+        current_task_tags=["phase:gen0", "role:generator", "candidate:00"],
+        orchestration_preference="parallel",
+    )
+
+    rt._refresh_loop_action_plan(agent, [
+        "shared/cf73_top10/2161F/gen0/candidate_02.cpp",
+        "shared/cf73_top10/2161F/gen0/candidate_02.md",
+    ])
+
+    assert agent._loop_action_plan["action"] != "read"
+    assert agent._loop_action_plan["reason"] != "peer_overlap_query_before_work"
+
+
+def test_overlap_post_query_ignores_completed_peer_from_different_discovery_lane(tmp_workspace):
+    config = RuntimeConfig(
+        workspace_root=tmp_workspace,
+        log_dir=None,
+        sandbox_backend="host",
+        loop_action_policy="constraint",
+    )
+    rt = Runtime(config=config)
+    parent = rt.create_agent("Coordinate broad evidence search.", model="test", orchestration_preference="parallel")
+    agent = rt.create_agent(
+        "Search arXiv for AI regulation papers from June 2022; write shared/ai_regulation.md.",
+        model="test",
+        parent=parent.id,
+        group_id="gaia-c61",
+        role="researcher",
+        current_task_tags=["benchmark:gaia", "problem:c61", "phase:evidence", "topic:ai_regulation"],
+        orchestration_preference="parallel",
+    )
+    peer = rt.create_agent(
+        "Search arXiv for physics and society papers from August 2016; write shared/physics_society.md.",
+        model="test",
+        parent=parent.id,
+        group_id="gaia-c61",
+        role="researcher",
+        current_task_tags=["benchmark:gaia", "problem:c61", "phase:evidence", "topic:physics_society"],
+        orchestration_preference="parallel",
+    )
+    peer.status = "done"
+    peer.artifacts.append(Artifact("shared/physics_society.md", tmp_workspace / "shared" / "physics_society.md"))
+    agent._peer_overlap_query_turn = 1
+    agent._last_query_turn = 1
+    agent._turns = 2
+
+    rt._refresh_loop_action_plan(agent, ["shared/ai_regulation.md"])
+
+    assert agent._loop_action_plan["action"] == "work"
+    assert agent._loop_action_plan["reason"] != "peer_query_found_completed_peers_prune_or_summarize"
+
+
+def test_overlap_post_query_does_not_prune_active_duplicate_without_artifact(tmp_workspace):
+    config = RuntimeConfig(
+        workspace_root=tmp_workspace,
+        log_dir=None,
+        sandbox_backend="host",
+        loop_action_policy="constraint",
+    )
+    rt = Runtime(config=config)
+    parent = rt.create_agent("Coordinate GAIA evidence search.", model="test", orchestration_preference="parallel")
+    agent = rt.create_agent(
+        "Search arXiv for physics and society papers from August 11 2016; write shared/physics_society.md.",
+        model="test",
+        parent=parent.id,
+        group_id="gaia-c61",
+        role="researcher",
+        current_task_tags=["benchmark:gaia", "problem:c61", "phase:evidence", "topic:physics_society"],
+        orchestration_preference="parallel",
+    )
+    peer = rt.create_agent(
+        "Search arXiv for physics and society papers from August 11 2016; write shared/physics_society.md.",
+        model="test",
+        parent=parent.id,
+        group_id="gaia-c61",
+        role="researcher",
+        current_task_tags=["benchmark:gaia", "problem:c61", "phase:evidence", "topic:physics_society"],
+        orchestration_preference="parallel",
+    )
+    peer._turns = 5
+    peer._tool_calls = 3
+    peer._last_query_turn = 4
+    agent._peer_overlap_query_turn = 1
+    agent._last_query_turn = 1
+    agent._turns = 2
+    agent._tool_calls = 1
+
+    rt._refresh_loop_action_plan(agent, ["shared/physics_society.md"])
+
+    assert agent._loop_action_plan["action"] == "work"
+    assert agent._loop_action_plan["reason"] != "peer_query_found_active_duplicate_prune_or_summarize"
+    assert not rt._active_duplicate_peer_overlap_candidates(agent)
+
+
+def test_overlap_post_query_prunes_active_duplicate_with_real_artifact(tmp_workspace):
+    config = RuntimeConfig(
+        workspace_root=tmp_workspace,
+        log_dir=None,
+        sandbox_backend="host",
+        loop_action_policy="constraint",
+    )
+    rt = Runtime(config=config)
+    parent = rt.create_agent("Coordinate GAIA evidence search.", model="test", orchestration_preference="parallel")
+    agent = rt.create_agent(
+        "Search arXiv for physics and society papers from August 11 2016; write shared/physics_society.md.",
+        model="test",
+        parent=parent.id,
+        group_id="gaia-c61",
+        role="researcher",
+        current_task_tags=["benchmark:gaia", "problem:c61", "phase:evidence", "topic:physics_society"],
+        orchestration_preference="parallel",
+    )
+    peer = rt.create_agent(
+        "Search arXiv for physics and society papers from August 11 2016; write shared/physics_society.md.",
+        model="test",
+        parent=parent.id,
+        group_id="gaia-c61",
+        role="researcher",
+        current_task_tags=["benchmark:gaia", "problem:c61", "phase:evidence", "topic:physics_society"],
+        orchestration_preference="parallel",
+    )
+    artifact_path = tmp_workspace / "shared" / "physics_society.md"
+    artifact_path.parent.mkdir(parents=True, exist_ok=True)
+    artifact_path.write_text("arXiv evidence collected from source page.\n")
+    peer.artifacts.append(Artifact("shared/physics_society.md", artifact_path, agent_id=peer.id))
+    rt.memory.update(peer.id, add_artifacts=["shared/physics_society.md"], tags=peer.current_task_tags)
+    peer._turns = 5
+    peer._tool_calls = 3
+    peer._last_query_turn = 4
+    peer._last_artifact_turn = 4
+    agent._peer_overlap_query_turn = 1
+    agent._last_query_turn = 1
+    agent._turns = 2
+    agent._tool_calls = 1
+
+    rt._refresh_loop_action_plan(agent, ["shared/physics_society.md"])
+
+    assert agent._loop_action_plan["action"] == "compact"
+    assert agent._loop_action_plan["reason"] == "peer_query_found_active_duplicate_prune_or_summarize"
+    assert agent._loop_action_plan["candidate_scores"][0]["action"] == "compact"
+
+
+def test_overlap_post_query_does_not_prune_active_duplicate_with_placeholder_artifact(tmp_workspace):
+    config = RuntimeConfig(
+        workspace_root=tmp_workspace,
+        log_dir=None,
+        sandbox_backend="host",
+        loop_action_policy="constraint",
+    )
+    rt = Runtime(config=config)
+    parent = rt.create_agent("Coordinate GAIA evidence search.", model="test", orchestration_preference="parallel")
+    agent = rt.create_agent(
+        "Search arXiv for physics and society papers from August 11 2016; write shared/physics_society.md.",
+        model="test",
+        parent=parent.id,
+        group_id="gaia-c61",
+        role="researcher",
+        current_task_tags=["benchmark:gaia", "problem:c61", "phase:evidence", "topic:physics_society"],
+        orchestration_preference="parallel",
+    )
+    peer = rt.create_agent(
+        "Search arXiv for physics and society papers from August 11 2016; write shared/physics_society.md.",
+        model="test",
+        parent=parent.id,
+        group_id="gaia-c61",
+        role="researcher",
+        current_task_tags=["benchmark:gaia", "problem:c61", "phase:evidence", "topic:physics_society"],
+        orchestration_preference="parallel",
+    )
+    artifact_path = tmp_workspace / "shared" / "physics_society.md"
+    artifact_path.parent.mkdir(parents=True, exist_ok=True)
+    artifact_path.write_text("Results pending API execution.\n")
+    peer.artifacts.append(Artifact("shared/physics_society.md", artifact_path, agent_id=peer.id))
+    rt.memory.update(peer.id, add_artifacts=["shared/physics_society.md"], tags=peer.current_task_tags)
+    peer._turns = 5
+    peer._tool_calls = 3
+    peer._last_query_turn = 4
+    peer._last_artifact_turn = 4
+    agent._peer_overlap_query_turn = 1
+    agent._last_query_turn = 1
+    agent._turns = 2
+    agent._tool_calls = 1
+
+    rt._refresh_loop_action_plan(agent, ["shared/physics_society.md"])
+
+    assert agent._loop_action_plan["action"] == "work"
+    assert agent._loop_action_plan["reason"] != "peer_query_found_active_duplicate_prune_or_summarize"
+    assert not rt._active_duplicate_peer_overlap_candidates(agent)
+
+
+def test_constraint_loop_action_creates_when_deferred_spawn_ready(tmp_workspace):
+    config = RuntimeConfig(
+        workspace_root=tmp_workspace,
+        log_dir=None,
+        sandbox_backend="host",
+        loop_action_policy="constraint",
+        spawn_readiness_threshold=0.6,
+        max_agents=10,
+    )
+    rt = Runtime(config=config)
+    parent = rt.create_agent(
+        "Coordinate workers, then create downstream verifier when evidence is ready. Write shared/final.md.",
+        model="test",
+        orchestration_preference="parallel",
+    )
+    worker = rt.create_agent("Find evidence", model="test", parent=parent.id, role="worker")
+    parent.children.add(worker.id)
+    worker.status = "done"
+    worker.result = "evidence ready"
+    parent._deferred_spawn_requests.append({
+        "task": "Verify worker evidence",
+        "role": "verifier",
+        "depends_on": [worker.id],
+        "readiness": 0.1,
+        "readiness_threshold": 0.6,
+    })
+
+    rt._refresh_loop_action_plan(parent, ["shared/final.md"])
+
+    assert parent._loop_action_plan["action"] == "message"
+    assert parent._loop_action_plan["root_steward"] is True
+    assert parent._loop_action_plan["steward_replaced_action"] == "create"
+    assert parent._loop_action_plan["constraints"]["deferred_spawn_readiness"] == 1.0
+
+
+def test_nested_constraint_loop_action_creates_when_deferred_spawn_ready(tmp_workspace):
+    config = RuntimeConfig(
+        workspace_root=tmp_workspace,
+        log_dir=None,
+        sandbox_backend="host",
+        loop_action_policy="constraint",
+        spawn_readiness_threshold=0.6,
+        max_agents=10,
+    )
+    rt = Runtime(config=config)
+    root = rt.create_agent("Root bootstrap.", model="test", orchestration_preference="parallel")
+    parent = rt.create_agent(
+        "Coordinate workers, then create downstream verifier when evidence is ready. Write shared/final.md.",
+        model="test",
+        parent=root.id,
+        role="coordinator",
+        group_id="nested",
+        orchestration_preference="parallel",
+    )
+    worker = rt.create_agent("Find evidence", model="test", parent=parent.id, role="worker")
+    parent.children.add(worker.id)
+    worker.status = "done"
+    worker.result = "evidence ready"
+    parent._deferred_spawn_requests.append({
+        "task": "Verify worker evidence",
+        "role": "verifier",
+        "depends_on": [worker.id],
+        "readiness": 0.1,
+        "readiness_threshold": 0.6,
+    })
+
+    rt._refresh_loop_action_plan(parent, ["shared/final.md"])
+
+    assert parent._loop_action_plan["action"] == "create"
+    assert parent._loop_action_plan["reason"] == "deferred_spawn_readiness_met"
+    assert parent._loop_action_plan["constraints"]["deferred_spawn_readiness"] == 1.0
+
+
+def test_parent_checks_child_artifact_before_deferred_spawn(tmp_workspace):
+    config = RuntimeConfig(
+        workspace_root=tmp_workspace,
+        log_dir=None,
+        sandbox_backend="host",
+        loop_action_policy="constraint",
+        spawn_readiness_threshold=0.6,
+        max_agents=10,
+    )
+    rt = Runtime(config=config)
+    parent = rt.create_agent(
+        "Coordinate workers, then create downstream verifier when evidence is ready. Write shared/final.md.",
+        model="test",
+        orchestration_preference="parallel",
+    )
+    worker = rt.create_agent("Find evidence and write shared/evidence.md", model="test", parent=parent.id, role="worker")
+    parent.children.add(worker.id)
+    evidence_path = tmp_workspace / "shared" / "evidence.md"
+    evidence_path.write_text("verified child evidence\n")
+    worker.status = "done"
+    worker.artifacts.append(Artifact("shared/evidence.md", evidence_path, agent_id=worker.id))
+    rt.memory.update(worker.id, add_artifacts=["shared/evidence.md"], tags=worker.current_task_tags)
+    parent._deferred_spawn_requests.append({
+        "task": "Verify worker evidence",
+        "role": "verifier",
+        "depends_on": [worker.id],
+        "readiness": 0.1,
+        "readiness_threshold": 0.6,
+    })
+
+    rt._refresh_loop_action_plan(parent, ["shared/final.md"])
+
+    assert parent._loop_action_plan["action"] == "read"
+    assert parent._loop_action_plan["reason"] == "child_or_peer_evidence_inspect_before_artifact"
+    assert parent._loop_action_plan["constraints"]["evidence_integration_pressure"] == 1.0
+    assert parent._loop_action_plan["evidence_agents"][0]["id"] == worker.id
+
+
+def test_parent_integrates_child_artifact_after_recent_inspection(tmp_workspace):
+    config = RuntimeConfig(
+        workspace_root=tmp_workspace,
+        log_dir=None,
+        sandbox_backend="host",
+        loop_action_policy="constraint",
+        max_agents=10,
+    )
+    rt = Runtime(config=config)
+    parent = rt.create_agent(
+        "Coordinate worker evidence and write shared/final.md.",
+        model="test",
+        orchestration_preference="parallel",
+    )
+    worker = rt.create_agent("Find evidence and write shared/evidence.md", model="test", parent=parent.id, role="worker")
+    parent.children.add(worker.id)
+    evidence_path = tmp_workspace / "shared" / "evidence.md"
+    evidence_path.write_text("verified child evidence\n")
+    worker.status = "done"
+    worker.artifacts.append(Artifact("shared/evidence.md", evidence_path, agent_id=worker.id))
+    rt.memory.update(worker.id, add_artifacts=["shared/evidence.md"], tags=worker.current_task_tags)
+    parent._turns = 6
+    parent._last_query_evidence_turn = 5
+
+    rt._refresh_loop_action_plan(parent, ["shared/final.md"])
+    allowed, scope = rt._tools_for_loop_turn(parent, parent._loop_action_plan["action"], ["shared/final.md"])
+
+    assert parent._loop_action_plan["action"] == "message"
+    assert parent._loop_action_plan["reason"] == "root_steward_query_and_update_ledger"
+    assert parent._loop_action_plan["steward_replaced_action"] == "work"
+    assert scope == "root_steward"
+    assert {"query", "ledger_read", "ledger_update"} <= allowed
+    assert "file_write" not in allowed
+    assert "spawn" not in allowed
+    assert "shell" not in allowed
+
+
+def test_deferred_spawn_readiness_matches_lane_tags(tmp_workspace):
+    config = RuntimeConfig(
+        workspace_root=tmp_workspace,
+        log_dir=None,
+        sandbox_backend="host",
+        loop_action_policy="constraint",
+        spawn_readiness_threshold=0.6,
+        max_agents=10,
+    )
+    rt = Runtime(config=config)
+    parent = rt.create_agent(
+        "Coordinate lane evidence, create verifier when both lanes are ready, and write shared/final.md.",
+        model="test",
+        orchestration_preference="parallel",
+    )
+    figure = rt.create_agent(
+        "Find figure evidence.",
+        model="test",
+        parent=parent.id,
+        role="lane1_figure",
+        group_id="gaia_l2_c61d",
+        current_task_tags=["lane:figure", "feature:2022_paper"],
+    )
+    society = rt.create_agent(
+        "Find society evidence.",
+        model="test",
+        parent=parent.id,
+        role="lane2_society",
+        group_id="gaia_l2_c61d",
+        current_task_tags=["lane:society", "feature:2016_article"],
+    )
+    parent.children.update({figure.id, society.id})
+    figure.status = "done"
+    society.status = "done"
+    parent._deferred_spawn_requests.append({
+        "task": "Verify overlap after lane evidence is ready.",
+        "role": "verifier",
+        "depends_on": ["lane:figure", "lane:society"],
+        "readiness": 0.0,
+        "readiness_threshold": 0.6,
+        "downstream_focus": True,
+    })
+
+    rt._refresh_loop_action_plan(parent, ["shared/final.md"])
+
+    assert parent._loop_action_plan["action"] == "message"
+    assert parent._loop_action_plan["root_steward"] is True
+    assert parent._loop_action_plan["steward_replaced_action"] == "create"
+    assert parent._loop_action_plan["constraints"]["deferred_spawn_readiness"] == 1.0
+
+
+def test_nested_deferred_spawn_readiness_matches_lane_tags(tmp_workspace):
+    config = RuntimeConfig(
+        workspace_root=tmp_workspace,
+        log_dir=None,
+        sandbox_backend="host",
+        loop_action_policy="constraint",
+        spawn_readiness_threshold=0.6,
+        max_agents=10,
+    )
+    rt = Runtime(config=config)
+    root = rt.create_agent("Root bootstrap.", model="test", orchestration_preference="parallel")
+    parent = rt.create_agent(
+        "Coordinate lane evidence, create verifier when both lanes are ready, and write shared/final.md.",
+        model="test",
+        parent=root.id,
+        role="coordinator",
+        group_id="gaia_l2_c61d",
+        orchestration_preference="parallel",
+    )
+    figure = rt.create_agent(
+        "Find figure evidence.",
+        model="test",
+        parent=parent.id,
+        role="lane1_figure",
+        group_id="gaia_l2_c61d",
+        current_task_tags=["lane:figure", "feature:2022_paper"],
+    )
+    society = rt.create_agent(
+        "Find society evidence.",
+        model="test",
+        parent=parent.id,
+        role="lane2_society",
+        group_id="gaia_l2_c61d",
+        current_task_tags=["lane:society", "feature:2016_article"],
+    )
+    parent.children.update({figure.id, society.id})
+    figure.status = "done"
+    society.status = "done"
+    parent._deferred_spawn_requests.append({
+        "task": "Verify overlap after lane evidence is ready.",
+        "role": "verifier",
+        "depends_on": ["lane:figure", "lane:society"],
+        "readiness": 0.0,
+        "readiness_threshold": 0.6,
+        "downstream_focus": True,
+    })
+
+    rt._refresh_loop_action_plan(parent, ["shared/final.md"])
+
+    assert parent._loop_action_plan["action"] == "create"
+    assert parent._loop_action_plan["reason"] == "deferred_spawn_readiness_met"
+    assert parent._loop_action_plan["constraints"]["deferred_spawn_readiness"] == 1.0
+
+
+def test_constraint_loop_action_avoids_duplicate_covered_lanes(tmp_workspace):
+    config = RuntimeConfig(
+        workspace_root=tmp_workspace,
+        log_dir=None,
+        sandbox_backend="host",
+        loop_action_policy="constraint",
+        orchestration_preference="aggressive",
+        max_agents=12,
+        handoff_child_count_threshold=2,
+    )
+    rt = Runtime(config=config)
+    parent = rt.create_agent(
+        "GAIA research task with suggested lanes: identify June 2022 AI regulation paper, "
+        "identify August 11 2016 physics society article, verify overlap, then write shared/answer.json.",
+        model="test",
+        orchestration_preference="aggressive",
+    )
+    for idx, lane in enumerate(["lane:ai-regulation-2022", "lane:phys-soc-2016", "lane:ai-regulation-2022"], start=1):
+        child = rt.create_agent(
+            f"Evidence lane {idx} for {lane}.",
+            model="test",
+            parent=parent.id,
+            role="evidence",
+            group_id="gaia-l2-c61d",
+            current_task_tags=[lane, "benchmark:gaia", "role:evidence"],
+        )
+        parent.children.add(child.id)
+        child.status = "done"
+        child.result = f"{lane} evidence ready"
+
+    rt._refresh_loop_action_plan(parent, ["shared/answer.json"])
+
+    assert parent._loop_action_plan["action"] == "create"
+    assert parent._loop_action_plan["reason"] == "delegate_final_delivery"
+    assert parent._loop_action_plan["constraints"]["lane_coverage_pressure"] >= 0.95
+
+
+def test_constraint_loop_action_worker_handoffs_after_mature_evidence(tmp_workspace):
+    config = RuntimeConfig(
+        workspace_root=tmp_workspace,
+        log_dir=None,
+        sandbox_backend="host",
+        loop_action_policy="constraint",
+        max_agents=12,
+    )
+    rt = Runtime(config=config)
+    parent = rt.create_agent(
+        'GAIA question. When ready call submit_answer(answer="<answer-only string>").',
+        model="test",
+        orchestration_preference="aggressive",
+    )
+    bravo = rt.create_agent(
+        "Identify June 2022 AI regulation figure words.",
+        model="test",
+        parent=parent.id,
+        role="evidence",
+        group_id="gaia-c61",
+        current_task_tags=["lane:ai-regulation-2022", "benchmark:gaia", "role:evidence"],
+        orchestration_preference="aggressive",
+    )
+    charlie = rt.create_agent(
+        "Identify August 11 2016 physics.soc-ph society descriptors.",
+        model="test",
+        parent=parent.id,
+        role="evidence",
+        group_id="gaia-c61",
+        current_task_tags=["lane:phys-soc-2016", "benchmark:gaia", "role:evidence"],
+        orchestration_preference="aggressive",
+    )
+    parent.children.update({bravo.id, charlie.id})
+    for agent, result in [
+        (bravo, "Axis words include Egalitarian."),
+        (charlie, "Society descriptors include egalitarian."),
+    ]:
+        agent.status = "done" if agent is charlie else "running"
+        agent.result = result
+        agent._tool_calls = 6
+        rt.memory.update(
+            agent.id,
+            public_summary=result,
+            tags=agent.current_task_tags + ["status:done", "confidence:high"],
+        )
+
+    rt._refresh_loop_action_plan(bravo, [])
+
+    assert bravo._loop_action_plan["action"] == "create"
+    assert bravo._loop_action_plan["reason"] == "handoff_after_evidence_maturity"
+    assert bravo._loop_action_plan["target_agent"] == parent.id
+    assert {item["id"] for item in bravo._loop_action_plan["evidence_agents"]} == {bravo.id, charlie.id}
+
+
+def test_constraint_loop_action_releases_create_when_child_running(tmp_workspace):
+    config = RuntimeConfig(
+        workspace_root=tmp_workspace,
+        log_dir=None,
+        sandbox_backend="host",
+        loop_action_policy="constraint",
+        max_agents=10,
+    )
+    rt = Runtime(config=config)
+    parent = rt.create_agent(
+        "Coordinate worker evidence and write shared/final.md.",
+        model="test",
+        orchestration_preference="parallel",
+    )
+    child = rt.create_agent("Verify evidence", model="test", parent=parent.id, role="verifier")
+    parent.children.add(child.id)
+    parent.action_state = "create"
+    parent._create_action_filtered_count = 2
+
+    rt._refresh_loop_action_plan(parent, ["shared/final.md"])
+
+    assert parent._loop_action_plan["action"] == "message"
+    assert parent._loop_action_plan["reason"] in {
+        "coordinate_unfinished_children_before_artifacts",
+        "wait_after_create_miss_with_active_children",
+        "default_task_progress",
+    }
+
+
+def test_create_skip_followup_inspects_coverage_before_retrying_create(tmp_workspace):
+    config = RuntimeConfig(
+        workspace_root=tmp_workspace,
+        log_dir=None,
+        sandbox_backend="host",
+        loop_action_policy="constraint",
+        max_agents=10,
+    )
+    rt = Runtime(config=config)
+    parent = rt.create_agent(
+        "Coordinate worker evidence, verify coverage, and write shared/final.md.",
+        model="test",
+        orchestration_preference="parallel",
+    )
+    child = rt.create_agent("Collect evidence", model="test", parent=parent.id, role="evidence", group_id="wave")
+    parent.children.add(child.id)
+    parent.action_state = "create"
+    parent._turns = 4
+    parent._create_action_filtered_count = 1
+    parent._last_spawn_skipped_turn = 4
+    parent._last_spawn_skipped_reason = "verified_lane_already_covered"
+    parent._last_spawn_skipped_covered_by = [child.id]
+
+    rt._refresh_loop_action_plan(parent, ["shared/final.md"])
+
+    assert parent._loop_action_plan["action"] == "message"
+    assert parent._loop_action_plan["reason"] == "inspect_coverage_after_spawn_skipped"
+    assert parent._loop_action_plan["covered_by"] == [child.id]
+
+
+@pytest.mark.asyncio
+async def test_spawn_skipped_covered_resolves_create_without_retry(tmp_workspace):
+    calls = []
+
+    async def mock_llm(messages, model, tools=None, **kwargs):
+        calls.append({
+            "tools": [t["function"]["name"] for t in (tools or [])],
+            "tool_choice": kwargs.get("tool_choice"),
+        })
+        if len(calls) == 1:
+            return LLMResponse(
+                tool_calls=[ToolCall(
+                    id="tc1",
+                    name="spawn_many",
+                    arguments={"agents": [{
+                        "task": "Verify already covered evidence lane.",
+                        "role": "verifier",
+                        "group_id": "wave",
+                        "readiness": 1.0,
+                    }]},
+                )],
+                usage=UsageRecord(input_tokens=10, output_tokens=5, model=model),
+            )
+        return LLMResponse(
+            tool_calls=[ToolCall(
+                id="tc2",
+                name="compact",
+                arguments={
+                    "summary": "Pruned after runtime reported the verifier lane was already covered.",
+                    "tags": ["status:pruned", "reason:covered_by_existing_agents"],
+                    "stop_after": True,
+                    "result": "covered by existing agent",
+                },
+            )],
+            usage=UsageRecord(input_tokens=10, output_tokens=5, model=model),
+        )
+
+    config = RuntimeConfig(
+        workspace_root=tmp_workspace,
+        log_dir=None,
+        sandbox_backend="host",
+        loop_action_policy="constraint",
+        max_turns=4,
+        max_agents=10,
+    )
+    rt = Runtime(config=config, llm_call=mock_llm)
+    root = rt.create_agent("Root coordination.", model="test", orchestration_preference="parallel")
+    parent = rt.create_agent(
+        "Create independent verifier and reviewer agents for separable workstreams, then compact.",
+        model="test",
+        parent=root.id,
+        depth=1,
+        role="coordinator",
+        group_id="wave",
+        current_task_tags=["role:coordinator", "group:wave"],
+        orchestration_preference="parallel",
+    )
+    root.children.add(parent.id)
+    covered = rt.create_agent(
+        "Verify already covered evidence lane.",
+        model="test",
+        parent=root.id,
+        depth=1,
+        role="verifier",
+        group_id="wave",
+        current_task_tags=["role:verifier", "status:verified"],
+    )
+    root.children.add(covered.id)
+    artifact_path = tmp_workspace / "shared" / "coverage.md"
+    artifact_path.write_text("verified coverage\n")
+    covered.status = "done"
+    covered.result = "verified coverage"
+    covered.artifacts.append(Artifact("shared/coverage.md", artifact_path, agent_id=covered.id))
+    rt.memory.update(
+        covered.id,
+        public_summary="verified coverage",
+        add_artifacts=["shared/coverage.md"],
+        tags=covered.current_task_tags,
+    )
+
+    await rt._agent_loop(parent)
+
+    assert parent.status == "done"
+    assert parent._create_action_filtered_count == 0
+    assert parent._last_create_resolution == "skipped_covered"
+    assert [e for e in rt._events if e["event"] == "create_action_resolved"]
+    assert not [e for e in rt._events if e["event"] == "create_action_miss"]
+    assert any(
+        e["event"] == "llm_done" and e["data"].get("loop_action") == "compact"
+        for e in rt._events
+    )
+
+
+def test_create_miss_with_completed_children_retries_create_instead_of_work(tmp_workspace):
+    config = RuntimeConfig(
+        workspace_root=tmp_workspace,
+        log_dir=None,
+        sandbox_backend="host",
+        loop_action_policy="constraint",
+        max_agents=10,
+    )
+    rt = Runtime(config=config)
+    parent = rt.create_agent(
+        "Coordinate worker evidence, hand off remaining verification, and write shared/final.md.",
+        model="test",
+        orchestration_preference="parallel",
+    )
+    child = rt.create_agent("Collect evidence", model="test", parent=parent.id, role="evidence", group_id="wave")
+    parent.children.add(child.id)
+    child.status = "done"
+    child.result = "partial evidence"
+    parent.action_state = "create"
+    parent._create_action_filtered_count = 1
+
+    rt._refresh_loop_action_plan(parent, ["shared/final.md"])
+    allowed, scope = rt._tools_for_loop_turn(parent, parent._loop_action_plan["action"], ["shared/final.md"])
+
+    assert parent._loop_action_plan["action"] in {"message", "compact"}
+    assert parent._loop_action_plan["root_steward"] is True
+    assert scope == "root_steward"
+    assert {"query", "ledger_read", "ledger_update"} & allowed
+    assert not {"spawn", "create_agent", "spawn_many"} & allowed
+
+
+@pytest.mark.asyncio
+async def test_premature_input_dependent_agent_compacts_and_stops(tmp_workspace):
+    config = RuntimeConfig(
+        workspace_root=tmp_workspace,
+        log_dir=None,
+        sandbox_backend="host",
+        max_agents=10,
+    )
+    rt = Runtime(config=config)
+    parent = rt.create_agent("Coordinate evidence and confidence check.", model="test")
+    worker = rt.create_agent(
+        "Find source evidence and write shared/evidence.md.",
+        model="test",
+        parent=parent.id,
+        role="source",
+        group_id="wave",
+    )
+    checker = rt.create_agent(
+        "Cross-check source evidence and write shared/check.md.",
+        model="test",
+        parent=parent.id,
+        role="open-focus",
+        group_id="wave",
+        current_task_tags=["phase:confidence-check"],
+    )
+    parent.children.update({worker.id, checker.id})
+
+    rt._refresh_loop_action_plan(checker, ["shared/check.md"])
+    result = await meta_compact(
+        {
+            "summary": "Started too early; upstream evidence is not ready.",
+            "stop_after": True,
+            "result": "pruned until upstream evidence exists",
+            "tags": ["status:pruned", "reason:premature_downstream", "needs:upstream_evidence", "phase:confidence-check"],
+        },
+        checker,
+        rt,
+    )
+
+    assert checker._loop_action_plan["action"] == "compact"
+    assert checker._loop_action_plan["reason"] == "premature_downstream_wait_for_evidence"
+    assert result["scheduled"] is True
+    assert not rt.completion_blockers(
+        checker,
+        tags=["status:pruned", "reason:premature_downstream", "needs:upstream_evidence"],
+    )
+
+
+def test_input_dependent_agent_runs_after_upstream_evidence_ready(tmp_workspace):
+    config = RuntimeConfig(
+        workspace_root=tmp_workspace,
+        log_dir=None,
+        sandbox_backend="host",
+        max_agents=10,
+    )
+    rt = Runtime(config=config)
+    parent = rt.create_agent("Coordinate evidence and confidence check.", model="test")
+    worker = rt.create_agent(
+        "Find source evidence and write shared/evidence.md.",
+        model="test",
+        parent=parent.id,
+        role="source",
+        group_id="wave",
+    )
+    checker = rt.create_agent(
+        "Cross-check source evidence and write shared/check.md.",
+        model="test",
+        parent=parent.id,
+        role="open-focus",
+        group_id="wave",
+        current_task_tags=["phase:confidence-check"],
+    )
+    parent.children.update({worker.id, checker.id})
+    worker.status = "done"
+    worker.result = "source evidence ready"
+    evidence_path = tmp_workspace / "shared" / "evidence.md"
+    evidence_path.write_text("source evidence ready\n")
+    worker.artifacts.append(Artifact(path="shared/evidence.md", absolute_path=evidence_path, agent_id=worker.id))
+
+    rt._refresh_loop_action_plan(checker, ["shared/check.md"])
+
+    assert checker._loop_action_plan["reason"] != "premature_downstream_wait_for_evidence"
+
+
+def test_child_agent_can_create_handoff_after_partial_progress(tmp_workspace):
+    config = RuntimeConfig(
+        workspace_root=tmp_workspace,
+        log_dir=None,
+        sandbox_backend="host",
+        loop_action_policy="constraint",
+        max_agents=10,
+        max_solo_tool_calls_before_spawn=4,
+    )
+    rt = Runtime(config=config)
+    root = rt.create_agent("Root coordinates a research task.", model="test")
+    child = rt.create_agent(
+        "Investigate sources, then hand off remaining confidence check before writing shared/lane.md.",
+        model="test",
+        parent=root.id,
+        role="open-focus",
+        group_id="wave",
+        current_task_tags=["phase:source-lane"],
+        orchestration_preference="parallel",
+    )
+    root.children.add(child.id)
+    child._tool_calls = 4
+    child._last_read_evidence_turn = 2
+    child._artifact_nudge_count = 2
+
+    rt._refresh_loop_action_plan(child, ["shared/lane.md"])
+
+    assert child._loop_action_plan["action"] == "create"
+    assert child._loop_action_plan["reason"] == "handoff_after_partial_progress"
+
+
+def test_reliable_peer_progress_after_query_suppresses_ordinary_create(tmp_workspace):
+    config = RuntimeConfig(
+        workspace_root=tmp_workspace,
+        log_dir=None,
+        sandbox_backend="host",
+        loop_action_policy="constraint",
+        max_agents=10,
+        max_solo_tool_calls_before_spawn=4,
+    )
+    rt = Runtime(config=config)
+    root = rt.create_agent("Root coordinates a research task.", model="test")
+    child = rt.create_agent(
+        "Investigate sources, then hand off remaining confidence check before writing shared/lane.md.",
+        model="test",
+        parent=root.id,
+        role="open-focus",
+        group_id="wave",
+        current_task_tags=["phase:source-lane"],
+        orchestration_preference="parallel",
+    )
+    peer = rt.create_agent(
+        "Completed related source evidence.",
+        model="test",
+        parent=root.id,
+        role="researcher",
+        group_id="wave",
+        current_task_tags=["phase:source-lane"],
+    )
+    root.children.update({child.id, peer.id})
+    child._turns = 5
+    child._tool_calls = 4
+    child._last_read_evidence_turn = 2
+    child._last_query_turn = 4
+    child._artifact_nudge_count = 2
+    peer.status = "done"
+    peer.result = "Reliable source evidence ready"
+
+    rt._refresh_loop_action_plan(child, ["shared/lane.md"])
+
+    assert child._loop_action_plan["action"] != "create"
+    reasons = {item["reason"] for item in child._loop_action_plan["candidate_scores"]}
+    assert "handoff_after_partial_progress" not in reasons
+    assert "constraint_alternative_create" not in reasons
+
+
+def test_middle_agent_with_child_artifact_integrates_before_new_handoff(tmp_workspace):
+    config = RuntimeConfig(
+        workspace_root=tmp_workspace,
+        log_dir=None,
+        sandbox_backend="host",
+        loop_action_policy="constraint",
+        max_agents=10,
+        max_solo_tool_calls_before_spawn=4,
+    )
+    rt = Runtime(config=config)
+    root = rt.create_agent("Root coordinates a research task.", model="test")
+    middle = rt.create_agent(
+        "Investigate sources, delegate as useful, then write shared/lane.md.",
+        model="test",
+        parent=root.id,
+        role="open-focus",
+        group_id="wave",
+        current_task_tags=["phase:source-lane"],
+        orchestration_preference="parallel",
+    )
+    leaf = rt.create_agent(
+        "Find source evidence and write shared/leaf-evidence.md.",
+        model="test",
+        parent=middle.id,
+        role="researcher",
+        group_id="wave",
+        current_task_tags=["phase:source-lane", "role:evidence"],
+    )
+    root.children.add(middle.id)
+    middle.children.add(leaf.id)
+    evidence_path = tmp_workspace / "shared" / "leaf-evidence.md"
+    evidence_path.write_text("verified leaf evidence\n")
+    leaf.status = "done"
+    leaf.artifacts.append(Artifact("shared/leaf-evidence.md", evidence_path, agent_id=leaf.id))
+    rt.memory.update(leaf.id, add_artifacts=["shared/leaf-evidence.md"], tags=leaf.current_task_tags)
+    middle._turns = 5
+    middle._tool_calls = 4
+    middle._last_read_evidence_turn = 2
+    middle._artifact_nudge_count = 2
+
+    rt._refresh_loop_action_plan(middle, ["shared/lane.md"])
+
+    assert middle._loop_action_plan["action"] in {"read", "work"}
+    assert middle._loop_action_plan["reason"] in {
+        "child_or_peer_evidence_inspect_before_artifact",
+        "integrate_child_or_peer_evidence_into_artifact",
+    }
+    reasons = {item["reason"] for item in middle._loop_action_plan["candidate_scores"]}
+    assert "handoff_after_partial_progress" not in reasons
+
+
+def test_peer_overlap_respects_distinct_lane_tags_even_with_shared_feature(tmp_workspace):
+    config = RuntimeConfig(workspace_root=tmp_workspace, log_dir=None, sandbox_backend="host")
+    rt = Runtime(config=config)
+    parent = rt.create_agent("Coordinate GAIA evidence search.", model="test")
+    figure = rt.create_agent(
+        "Search AI regulation paper evidence and write shared/figure.md.",
+        model="test",
+        parent=parent.id,
+        group_id="gaia-c61",
+        current_task_tags=["benchmark:gaia", "feature:search", "lane:ai_regulation_paper"],
+    )
+    society = rt.create_agent(
+        "Search physics.soc-ph society article evidence and write shared/society.md.",
+        model="test",
+        parent=parent.id,
+        group_id="gaia-c61",
+        current_task_tags=["benchmark:gaia", "feature:search", "lane:physics_society_2016"],
+    )
+    parent.children.update({figure.id, society.id})
+
+    assert society not in rt._peer_overlap_query_candidates(figure)
+    assert not rt._peer_overlap_query_before_work_pending(figure, ["shared/figure.md"])
+
+
+@pytest.mark.asyncio
+async def test_pruned_compact_missing_artifact_requires_real_overlap(tmp_workspace):
+    config = RuntimeConfig(workspace_root=tmp_workspace, log_dir=None, sandbox_backend="host")
+    rt = Runtime(config=config)
+    parent = rt.create_agent("Coordinate GAIA evidence search.", model="test")
+    agent = rt.create_agent(
+        "Search AI regulation paper evidence and write shared/figure.md.",
+        model="test",
+        parent=parent.id,
+        group_id="gaia-c61",
+        current_task_tags=["benchmark:gaia", "feature:search", "lane:ai_regulation_paper"],
+    )
+    other = rt.create_agent(
+        "Search physics.soc-ph society article evidence and write shared/society.md.",
+        model="test",
+        parent=parent.id,
+        group_id="gaia-c61",
+        current_task_tags=["benchmark:gaia", "feature:search", "lane:physics_society_2016"],
+    )
+    parent.children.update({agent.id, other.id})
+    agent._last_query_turn = 2
+    other.status = "done"
+    other.result = "different lane complete"
+
+    result = await meta_compact(
+        {
+            "summary": "Pruning as duplicate, but peer is a different lane.",
+            "tags": ["status:pruned", "reason:duplicate_lane", "lane:ai_regulation_paper"],
+            "stop_after": True,
+            "result": "pruned",
+        },
+        agent,
+        rt,
+    )
+
+    assert result["blocked"] == "completion_evidence"
+    assert any(blocker["kind"] == "missing_outputs" for blocker in result["blockers"])
+    assert agent.status == "running"
+
+
+def test_status_only_query_does_not_satisfy_discovery_report_evidence(tmp_workspace):
+    config = RuntimeConfig(workspace_root=tmp_workspace, log_dir=None, sandbox_backend="host")
+    rt = Runtime(config=config)
+    agent = rt.create_agent("Search arXiv and write evidence report `shared/report.md`.", model="test")
+    agent._turns = 4
+    agent._last_query_turn = 3
+
+    assert rt._artifact_write_needs_more_evidence(agent, ["shared/report.md"])
+
+
+def test_query_with_reliable_peer_evidence_satisfies_discovery_report_evidence(tmp_workspace):
+    config = RuntimeConfig(workspace_root=tmp_workspace, log_dir=None, sandbox_backend="host")
+    rt = Runtime(config=config)
+    agent = rt.create_agent("Search arXiv and write evidence report `shared/report.md`.", model="test")
+    agent._turns = 4
+
+    result = {
+        "agents": [
+            {
+                "id": "peer",
+                "status": "done",
+                "result": "verified evidence",
+                "artifacts": ["shared/evidence.md"],
+                "progress": {"outputs_complete": True},
+            }
+        ]
+    }
+
+    assert rt._query_result_has_reliable_evidence(result)
+    agent._last_query_turn = 3
+    agent._last_query_evidence_turn = 3
+    assert not rt._artifact_write_needs_more_evidence(agent, ["shared/report.md"])
+
+
+def test_concrete_single_output_child_keeps_work_instead_of_recursive_handoff(tmp_workspace):
+    config = RuntimeConfig(
+        workspace_root=tmp_workspace,
+        log_dir=None,
+        sandbox_backend="host",
+        loop_action_policy="constraint",
+        max_agents=10,
+        max_solo_tool_calls_before_spawn=1,
+    )
+    rt = Runtime(config=config)
+    root = rt.create_agent("Root coordinates GAIA evidence lanes.", model="test")
+    child = rt.create_agent(
+        "Query the arXiv API for the August 11 2016 physics.soc-ph article, "
+        "extract the article title and relevant society descriptor, and write "
+        "shared/gaia_l2/c61d/evidence_society_words.md.",
+        model="test",
+        parent=root.id,
+        role="researcher",
+        group_id="gaia-l2-c61d",
+        current_task_tags=["benchmark:gaia", "phase:evidence", "topic:physics_society"],
+        orchestration_preference="aggressive",
+    )
+    root.children.add(child.id)
+    child._tool_calls = 3
+    child._last_read_evidence_turn = 2
+    child._artifact_nudge_count = 2
+
+    rt._refresh_loop_action_plan(child, ["shared/gaia_l2/c61d/evidence_society_words.md"])
+
+    assert child._loop_action_plan["action"] == "work"
+    reasons = {item["reason"] for item in child._loop_action_plan["candidate_scores"]}
+    assert "handoff_after_partial_progress" not in reasons
+    assert "constraint_alternative_create" not in reasons
+
+
+def test_concrete_single_output_uncertain_placeholder_repairs_with_work_not_create(tmp_workspace):
+    config = RuntimeConfig(
+        workspace_root=tmp_workspace,
+        log_dir=None,
+        sandbox_backend="host",
+        loop_action_policy="constraint",
+        max_agents=10,
+    )
+    rt = Runtime(config=config)
+    root = rt.create_agent("Root coordinates GAIA evidence lanes.", model="test")
+    child = rt.create_agent(
+        "Search arXiv for the Physics and Society article and write shared/gaia/paper_2016_report.md.",
+        model="test",
+        parent=root.id,
+        role="researcher",
+        group_id="gaia-l2-c61d",
+        current_task_tags=["benchmark:gaia", "phase:evidence", "topic:physics_society"],
+        orchestration_preference="parallel",
+    )
+    root.children.add(child.id)
+    artifact_path = tmp_workspace / "shared" / "gaia" / "paper_2016_report.md"
+    artifact_path.parent.mkdir(parents=True, exist_ok=True)
+    artifact_path.write_text("Status: EVIDENCE-PENDING\nConfidence: Low\nUnverified placeholder.\n")
+    child.artifacts.append(Artifact(path="shared/gaia/paper_2016_report.md", absolute_path=artifact_path, agent_id=child.id))
+    child._tool_calls = 5
+    child._artifact_nudge_count = 3
+
+    assert rt._agent_has_uncertain_evidence(child)
+
+    rt._refresh_loop_action_plan(child, [])
+
+    assert child._loop_action_plan["action"] == "work"
+    assert child._loop_action_plan["reason"] == "uncertain_evidence_needs_primary_work"
+    reasons = {item["reason"] for item in child._loop_action_plan["candidate_scores"]}
+    assert "delegate_uncertain_evidence_recovery" not in reasons
+
+
+def test_evidence_report_placeholder_content_blocks_completion(tmp_workspace):
+    config = RuntimeConfig(
+        workspace_root=tmp_workspace,
+        log_dir=None,
+        sandbox_backend="host",
+        loop_action_policy="constraint",
+    )
+    rt = Runtime(config=config)
+    agent = rt.create_agent(
+        "Search arXiv and write shared/gaia/paper_2022_findings.md.",
+        model="test",
+        current_task_tags=["benchmark:gaia", "role:evidence"],
+    )
+    artifact_path = tmp_workspace / "shared" / "gaia" / "paper_2022_findings.md"
+    artifact_path.parent.mkdir(parents=True, exist_ok=True)
+    artifact_path.write_text(
+        "# Paper Findings\n\n"
+        "## Search in Progress\n\n"
+        "Status: Actively searching arXiv. This file will be updated once the paper is identified.\n"
+    )
+    agent.artifacts.append(Artifact(path="shared/gaia/paper_2022_findings.md", absolute_path=artifact_path, agent_id=agent.id))
+
+    assert rt.missing_expected_outputs(agent) == []
+    assert not rt.outputs_complete(agent)
+    blockers = rt.completion_blockers(agent, include_missing_outputs=False)
+    assert any(blocker["kind"] == "uncertain_evidence" for blocker in blockers)
+
+    rt._refresh_loop_action_plan(agent, [])
+
+    assert agent._loop_action_plan["action"] == "work"
+    assert agent._loop_action_plan["reason"] == "uncertain_evidence_needs_primary_work"
+
+
+@pytest.mark.asyncio
+async def test_compact_stop_after_blocked_by_pending_evidence_report(runtime, tmp_workspace):
+    a = runtime.create_agent("Search arXiv and write shared/gaia/paper_2016_findings.md.")
+    artifact_path = tmp_workspace / "shared" / "gaia" / "paper_2016_findings.md"
+    artifact_path.parent.mkdir(parents=True, exist_ok=True)
+    artifact_path.write_text(
+        "# Physics and Society Articles\n\n"
+        "## Results\n"
+        "*Pending: Python query to arXiv API needed. Will populate after execution.*\n"
+    )
+    a.artifacts.append(Artifact("shared/gaia/paper_2016_findings.md", artifact_path, agent_id=a.id))
+
+    result = await meta_compact(
+        {
+            "summary": "Findings document is complete.",
+            "files": ["shared/gaia/paper_2016_findings.md"],
+            "tags": ["status:complete", "role:evidence"],
+            "stop_after": True,
+            "result": "ready",
+        },
+        a,
+        runtime,
+    )
+    assert result["blocked"] == "completion_evidence"
+    assert any(blocker["kind"] == "uncertain_evidence" for blocker in result["blockers"])
+    assert a.status == "running"
+    assert a.action_state == "work"
+    assert a._compact_pending is None
+
+
+def test_uncertain_leaf_child_can_create_verifier_recovery(tmp_workspace):
+    config = RuntimeConfig(
+        workspace_root=tmp_workspace,
+        log_dir=None,
+        sandbox_backend="host",
+        loop_action_policy="constraint",
+        max_agents=10,
+    )
+    rt = Runtime(config=config)
+    root = rt.create_agent("Root coordinates evidence lanes.", model="test")
+    child = rt.create_agent(
+        "Write candidate evidence to shared/lane.md.",
+        model="test",
+        parent=root.id,
+        role="generator",
+        group_id="lane",
+        current_task_tags=["candidate:1", "lane:evidence"],
+        orchestration_preference="parallel",
+    )
+    root.children.add(child.id)
+    artifact_path = tmp_workspace / "shared" / "lane.md"
+    artifact_path.parent.mkdir(parents=True, exist_ok=True)
+    artifact_path.write_text("Status: EVIDENCE-PENDING / PARTIAL\nConfidence: Low\n")
+    child.artifacts.append(Artifact(path="shared/lane.md", absolute_path=artifact_path, agent_id=child.id))
+    child._tool_calls = 3
+
+    assert child.orchestration_preference == "parallel"
+    assert not rt.outputs_complete(child)
+    assert any(b["kind"] == "uncertain_evidence" for b in rt.completion_blockers(child, include_missing_outputs=False))
+
+    rt._refresh_loop_action_plan(child, [])
+
+    assert child._loop_action_plan["action"] == "create"
+    assert child._loop_action_plan["reason"] == "delegate_uncertain_evidence_recovery"
+    assert child._loop_action_plan["constraints"]["uncertain_evidence_pressure"] == 1.0
+
+
+def test_explicit_solo_uncertain_child_still_cannot_create(tmp_workspace):
+    config = RuntimeConfig(
+        workspace_root=tmp_workspace,
+        log_dir=None,
+        sandbox_backend="host",
+        loop_action_policy="constraint",
+        max_agents=10,
+    )
+    rt = Runtime(config=config)
+    root = rt.create_agent("Root coordinates evidence lanes.", model="test")
+    child = rt.create_agent(
+        "Write candidate evidence to shared/lane.md.",
+        model="test",
+        parent=root.id,
+        role="generator",
+        group_id="lane",
+        current_task_tags=["candidate:1", "lane:evidence"],
+        orchestration_preference="solo",
+    )
+    root.children.add(child.id)
+    artifact_path = tmp_workspace / "shared" / "lane.md"
+    artifact_path.parent.mkdir(parents=True, exist_ok=True)
+    artifact_path.write_text("Status: EVIDENCE-PENDING / PARTIAL\nConfidence: Low\n")
+    child.artifacts.append(Artifact(path="shared/lane.md", absolute_path=artifact_path, agent_id=child.id))
+    child._tool_calls = 3
+
+    rt._refresh_loop_action_plan(child, [])
+
+    assert child.orchestration_preference == "solo"
+    assert child._loop_action_plan["action"] != "create"
+
+
+def test_constraint_loop_action_handoff_lowers_parent_create_after_child_wave(tmp_workspace):
+    config = RuntimeConfig(
+        workspace_root=tmp_workspace,
+        log_dir=None,
+        sandbox_backend="host",
+        loop_action_policy="constraint",
+        orchestration_preference="aggressive",
+        handoff_child_count_threshold=2,
+        max_agents=20,
+    )
+    rt = Runtime(config=config)
+    parent = rt.create_agent(
+        "Coordinate benchmark implementation, tests, review, synthesis, and write shared/final.md.",
+        model="test",
+        orchestration_preference="aggressive",
+    )
+    first = rt.create_agent("Implement lane A", model="test", parent=parent.id, role="worker", group_id="wave")
+    second = rt.create_agent("Implement lane B", model="test", parent=parent.id, role="worker", group_id="wave")
+    parent.children.update({first.id, second.id})
+    first.status = "done"
+    second.status = "done"
+    parent.action_state = "create"
+    parent._turns = 6
+
+    rt._refresh_loop_action_plan(parent, ["shared/final.md"])
+
+    assert parent._loop_action_plan["constraints"]["handoff_pressure"] == 1.0
+    assert parent._loop_action_plan["action"] != "create"
+    create_scores = [
+        item for item in parent._loop_action_plan["candidate_scores"]
+        if item["action"] == "create"
+    ]
+    assert not create_scores
+    assert parent._loop_action_plan["root_steward"] is True
+
+
+def test_constraint_loop_action_handoff_lowers_non_root_parent_create_after_child_wave(tmp_workspace):
+    config = RuntimeConfig(
+        workspace_root=tmp_workspace,
+        log_dir=None,
+        sandbox_backend="host",
+        loop_action_policy="constraint",
+        orchestration_preference="aggressive",
+        child_orchestration_preference=None,
+        handoff_child_count_threshold=2,
+        max_agents=20,
+    )
+    rt = Runtime(config=config)
+    root = rt.create_agent("Root should bootstrap workers and avoid owning implementation.", model="test")
+    parent = rt.create_agent(
+        "Coordinate nested benchmark implementation, tests, review, synthesis, and write shared/nested.md.",
+        model="test",
+        parent=root.id,
+        role="coordinator",
+        group_id="nested",
+        current_task_tags=["phase:nested", "role:coordinator"],
+    )
+    child_a = rt.create_agent("Implement nested lane A", model="test", parent=parent.id, role="worker", group_id="nested")
+    child_b = rt.create_agent("Implement nested lane B", model="test", parent=parent.id, role="worker", group_id="nested")
+    parent.children.update({child_a.id, child_b.id})
+    child_a.status = "done"
+    child_b.status = "done"
+    parent.action_state = "create"
+    parent._turns = 6
+
+    rt._refresh_loop_action_plan(parent, ["shared/nested.md"])
+
+    assert parent._loop_action_plan["constraints"]["handoff_pressure"] == 1.0
+    assert parent._loop_action_plan["action"] != "create"
+
+
+def test_constraint_loop_action_biases_complex_child_before_own_child_wave(tmp_workspace):
+    config = RuntimeConfig(
+        workspace_root=tmp_workspace,
+        log_dir=None,
+        sandbox_backend="host",
+        loop_action_policy="constraint",
+        orchestration_preference="balanced",
+        child_orchestration_preference=None,
+        spawn_before_turn=1,
+        max_solo_tool_calls_before_spawn=1,
+        max_agents=20,
+    )
+    rt = Runtime(config=config)
+    root = rt.create_agent("Root bootstrap task.", model="test", orchestration_preference="balanced")
+    child = rt.create_agent(
+        "Run a full benchmark subtask with implementation, tests, review, synthesis, and integration. "
+        "Write shared/child-final.md.",
+        model="test",
+        parent=root.id,
+        role="coordinator",
+        current_task_tags=["benchmark:subtask", "scope:full"],
+    )
+    child._turns = 1
+    child._tool_calls = 1
+    child._orchestration_nudge_sent = True
+
+    rt._refresh_loop_action_plan(child, ["shared/child-final.md"])
+
+    assert child.orchestration_preference == "aggressive"
+    assert child._loop_action_plan["constraints"]["offspring_create_bias"] > 0
+    assert child._loop_action_plan["action"] == "create"
+    assert child._loop_action_plan["reason"] == "spawnable_workstreams_before_solo_execution"
+
+
+def test_constraint_loop_action_delegates_failed_child_recovery(tmp_workspace):
+    config = RuntimeConfig(
+        workspace_root=tmp_workspace,
+        log_dir=None,
+        sandbox_backend="host",
+        loop_action_policy="constraint",
+        max_agents=10,
+    )
+    rt = Runtime(config=config)
+    parent = rt.create_agent(
+        "Coordinate evidence lanes and write `shared/final.json`.",
+        model="test",
+        orchestration_preference="parallel",
+    )
+    child = rt.create_agent(
+        "Find lane one evidence and write `shared/lane1.md`.",
+        model="test",
+        parent=parent.id,
+        role="lane1",
+        group_id="evidence",
+    )
+    child.status = "failed"
+    child.result = "Crash: provider 400"
+    child._turns = 4
+
+    rt._refresh_loop_action_plan(parent, ["shared/final.json", "shared/lane1.md"])
+
+    assert parent._loop_action_plan["action"] in {"message", "read"}
+    assert parent._loop_action_plan["root_steward"] is True
+    assert parent._loop_action_plan["constraints"]["failed_child_pressure"] == 1.0
+    assert parent._loop_action_plan.get("steward_replaced_action") in {None, "create", "work"}
+
+
+@pytest.mark.asyncio
+async def test_failed_child_recovery_create_turn_recommends_spawn_many(tmp_workspace):
+    calls = []
+
+    async def mock_llm(messages, model, tools=None, **kwargs):
+        calls.append({
+            "messages": messages,
+            "tools": [t["function"]["name"] for t in (tools or [])],
+            "tool_choice": kwargs.get("tool_choice"),
+        })
+        return LLMResponse(
+            tool_calls=[ToolCall(
+                id="tc1",
+                name="spawn_many",
+                arguments={
+                    "agents": [{
+                        "task": "Recover failed child bravo; write shared/lane1.md.",
+                        "role": "recovery",
+                        "group_id": "evidence",
+                        "current_task_tags": ["status:recovery", "bravo"],
+                    }],
+                },
+            )],
+            usage=UsageRecord(input_tokens=10, output_tokens=5, model=model),
+        )
+
+    config = RuntimeConfig(
+        workspace_root=tmp_workspace,
+        log_dir=None,
+        sandbox_backend="host",
+        loop_action_policy="constraint",
+        max_turns=1,
+        max_agents=10,
+    )
+    rt = Runtime(config=config, llm_call=mock_llm)
+    parent = rt.create_agent(
+        "Coordinate evidence lanes and write `shared/final.json`.",
+        model="test",
+        orchestration_preference="parallel",
+    )
+    child = rt.create_agent(
+        "Find lane one evidence and write `shared/lane1.md`.",
+        model="test",
+        parent=parent.id,
+        role="lane1",
+        group_id="evidence",
+    )
+    child.status = "failed"
+    child.result = "Crash: provider 400"
+
+    await rt._agent_loop(parent)
+
+    assert {"query", "ledger_read", "ledger_update"} & set(calls[0]["tools"])
+    assert not {"spawn_many", "spawn", "create_agent"} & set(calls[0]["tools"])
+    assert calls[0]["tool_choice"] is None
+    card = "\n".join(m.get("content") or "" for m in calls[0]["messages"])
+    assert "Root steward boundary" in card
+    assert len(rt.agents) == 2
+
+
+@pytest.mark.asyncio
+async def test_nested_failed_child_recovery_create_turn_recommends_spawn_many(tmp_workspace):
+    calls = []
+
+    async def mock_llm(messages, model, tools=None, **kwargs):
+        calls.append({
+            "messages": messages,
+            "tools": [t["function"]["name"] for t in (tools or [])],
+            "tool_choice": kwargs.get("tool_choice"),
+        })
+        return LLMResponse(
+            tool_calls=[ToolCall(
+                id="tc1",
+                name="spawn_many",
+                arguments={
+                    "agents": [{
+                        "task": "Recover failed child charlie; write shared/lane1.md.",
+                        "role": "recovery",
+                        "group_id": "evidence",
+                        "current_task_tags": ["status:recovery", "charlie"],
+                    }],
+                },
+            )],
+            usage=UsageRecord(input_tokens=10, output_tokens=5, model=model),
+        )
+
+    config = RuntimeConfig(
+        workspace_root=tmp_workspace,
+        log_dir=None,
+        sandbox_backend="host",
+        loop_action_policy="constraint",
+        max_turns=1,
+        max_agents=10,
+    )
+    rt = Runtime(config=config, llm_call=mock_llm)
+    root = rt.create_agent("Root bootstrap.", model="test", orchestration_preference="parallel")
+    parent = rt.create_agent(
+        "Coordinate evidence lanes and write `shared/final.json`.",
+        model="test",
+        parent=root.id,
+        role="coordinator",
+        group_id="evidence",
+        orchestration_preference="parallel",
+    )
+    child = rt.create_agent(
+        "Find lane one evidence and write `shared/lane1.md`.",
+        model="test",
+        parent=parent.id,
+        role="lane1",
+        group_id="evidence",
+    )
+    child.status = "failed"
+    child.result = "Crash: provider 400"
+
+    await rt._agent_loop(parent)
+
+    assert set(calls[0]["tools"]) >= {"spawn_many", "spawn", "create_agent"}
+    assert calls[0]["tool_choice"] == {"type": "function", "function": {"name": "spawn_many"}}
+    card = "\n".join(m.get("content") or "" for m in calls[0]["messages"])
+    assert "delegate_failed_child_recovery" in card
+    assert "failed_child=" in card
+    assert "Do not take over the failed lane" in card
+    assert len(rt.agents) == 4
 
 
 @pytest.mark.asyncio
@@ -828,7 +3265,7 @@ async def test_degraded_spawn_many_result_keeps_create_retry(tmp_workspace):
 
 
 @pytest.mark.asyncio
-async def test_set_status_read_revalidates_create_scope_next_turn(tmp_workspace):
+async def test_set_status_read_is_allowed_but_does_not_satisfy_create(tmp_workspace):
     (tmp_workspace / "shared" / "input.txt").write_text("hello")
     calls = []
 
@@ -837,26 +3274,72 @@ async def test_set_status_read_revalidates_create_scope_next_turn(tmp_workspace)
             "tools": [t["function"]["name"] for t in (tools or [])],
             "messages": messages,
         })
+        return LLMResponse(
+            tool_calls=[ToolCall(
+                id="tc1",
+                name="set_status",
+                arguments={"action": "read", "status": "reading", "current_task_tags": ["phase:audit"]},
+            )],
+            usage=UsageRecord(input_tokens=10, output_tokens=5, model=model),
+        )
+
+    config = RuntimeConfig(
+        workspace_root=tmp_workspace,
+        log_dir=None,
+        sandbox_backend="host",
+        orchestration_preference="parallel",
+        spawn_before_turn=1,
+        max_turns=1,
+        min_spawnable_workstreams=3,
+    )
+    rt = Runtime(config=config, llm_call=mock_llm)
+
+    await rt.run("Audit `shared/input.txt` with separable research, review, and report workstreams.")
+
+    create_tools = {"spawn", "create_agent", "spawn_many", "compact", "set_status", "get_cost"}
+    assert set(calls[0]["tools"]) == create_tools
+    assert [e for e in rt._events if e["event"] == "tool_call" and e["data"].get("tool") == "set_status"]
+    assert [e for e in rt._events if e["event"] == "create_action_miss"]
+    assert [e for e in rt._events if e["event"] == "loop_action_auxiliary_only_miss"]
+
+
+@pytest.mark.asyncio
+async def test_compact_in_create_scope_is_allowed_but_does_not_satisfy_create(tmp_workspace):
+    calls = []
+
+    async def mock_llm(messages, model, tools=None, **kwargs):
+        task_prompt = messages[0].get("content", "")
+        if "Task: audit source" in task_prompt or "Task: patch source" in task_prompt:
+            return LLMResponse(
+                tool_calls=[ToolCall(id="child-done", name="set_status", arguments={"status": "done", "result": "child done"})],
+                usage=UsageRecord(input_tokens=10, output_tokens=5, model=model),
+            )
+        calls.append({
+            "tools": [t["function"]["name"] for t in (tools or [])],
+            "tool_choice": kwargs.get("tool_choice"),
+            "messages": messages,
+        })
         if len(calls) == 1:
             return LLMResponse(
                 tool_calls=[ToolCall(
                     id="tc1",
-                    name="set_status",
-                    arguments={"action": "read", "status": "reading", "current_task_tags": ["phase:audit"]},
+                    name="compact",
+                    arguments={"summary": "still deciding", "tags": ["status:planning"]},
                 )],
                 usage=UsageRecord(input_tokens=10, output_tokens=5, model=model),
             )
-        if len(calls) == 2:
-            content = (
-                "<｜DSML｜tool_calls>\n"
-                "<｜DSML｜invoke name=\"read_file\">\n"
-                "<｜DSML｜parameter name=\"filePath\" string=\"true\">shared/input.txt</｜DSML｜parameter>\n"
-                "</｜DSML｜invoke>\n"
-                "</｜DSML｜tool_calls>"
-            )
-            return LLMResponse(content=content, usage=UsageRecord(input_tokens=10, output_tokens=5, model=model))
         return LLMResponse(
-            tool_calls=[ToolCall(id="tc3", name="set_status", arguments={"status": "done", "result": "read done"})],
+            tool_calls=[ToolCall(
+                id="tc2",
+                name="spawn_many",
+                arguments={
+                    "defaults": {"create_type": "peer_agent", "relationship": "peer", "group_id": "wave"},
+                    "agents": [
+                        {"task": "audit source", "role": "auditor"},
+                        {"task": "patch source", "role": "patcher"},
+                    ],
+                },
+            )],
             usage=UsageRecord(input_tokens=10, output_tokens=5, model=model),
         )
 
@@ -867,27 +3350,161 @@ async def test_set_status_read_revalidates_create_scope_next_turn(tmp_workspace)
         orchestration_preference="parallel",
         spawn_before_turn=1,
         max_turns=4,
-        min_spawnable_workstreams=3,
+        max_agents=10,
+        min_spawnable_workstreams=2,
     )
     rt = Runtime(config=config, llm_call=mock_llm)
 
-    await rt.run("Audit `shared/input.txt` with separable research, review, and report workstreams.")
+    await rt.run("Patch shared/source with separable audit and patch workstreams.")
 
-    create_tools = {"spawn", "create_agent", "spawn_many", "query", "compact", "set_status", "get_cost"}
+    create_tools = {"spawn", "create_agent", "spawn_many", "compact", "set_status", "get_cost"}
     assert set(calls[0]["tools"]) == create_tools
-    assert {"file_read", "file_list", "grep", "query", "set_status", "get_cost"} <= set(calls[1]["tools"])
-    assert "spawn_many" not in calls[1]["tools"]
-    assert [e for e in rt._events if e["event"] == "text_tool_call_recovered"]
-    assert [e for e in rt._events if e["event"] == "tool_call" and e["data"]["tool"] == "file_read"]
+    assert calls[0]["tool_choice"] is None
+    assert set(calls[1]["tools"]) == {"spawn", "create_agent", "spawn_many"}
+    assert calls[1]["tool_choice"] == {"type": "function", "function": {"name": "spawn_many"}}
+    assert [e for e in rt._events if e["event"] == "loop_action_auxiliary_only_miss" and e["data"].get("tools") == ["compact"]]
+    assert len(rt.agents) == 3
 
 
 @pytest.mark.asyncio
-async def test_filtered_read_intent_releases_create_scope_next_turn(tmp_workspace):
+async def test_work_auxiliary_only_turn_retries_with_primary_tools(tmp_workspace):
+    calls = []
+
+    async def mock_llm(messages, model, tools=None, **kwargs):
+        calls.append({
+            "tools": [t["function"]["name"] for t in (tools or [])],
+            "messages": messages,
+        })
+        if len(calls) == 1:
+            return LLMResponse(
+                tool_calls=[ToolCall(id="tc1", name="get_cost", arguments={})],
+                usage=UsageRecord(input_tokens=10, output_tokens=5, model=model),
+            )
+        return LLMResponse(
+            tool_calls=[ToolCall(id="tc2", name="file_write", arguments={"path": "shared/out.txt", "content": "done"})],
+            usage=UsageRecord(input_tokens=10, output_tokens=5, model=model),
+        )
+
+    config = RuntimeConfig(
+        workspace_root=tmp_workspace,
+        log_dir=None,
+        sandbox_backend="host",
+        max_turns=3,
+    )
+    rt = Runtime(config=config, llm_call=mock_llm)
+
+    await rt.run("Create `shared/out.txt`.")
+
+    assert "get_cost" in calls[0]["tools"]
+    assert "get_cost" not in calls[1]["tools"]
+    assert {"file_write", "file_read", "file_list", "grep"} <= set(calls[1]["tools"])
+    second_card = "\n".join(m.get("content") or "" for m in calls[1]["messages"])
+    assert "only used auxiliary tools" in second_card
+    assert [e for e in rt._events if e["event"] == "loop_action_auxiliary_only_miss" and e["data"].get("action") == "work"]
+    assert (tmp_workspace / "shared" / "out.txt").read_text() == "done"
+
+
+@pytest.mark.asyncio
+async def test_stale_message_action_replans_to_missing_output_work(tmp_workspace):
+    calls = []
+
+    async def mock_llm(messages, model, tools=None, **kwargs):
+        tool_names = [t["function"]["name"] for t in (tools or [])]
+        calls.append({
+            "tools": tool_names,
+            "messages": messages,
+            "tool_choice": kwargs.get("tool_choice"),
+        })
+        if "file_write" in tool_names:
+            return LLMResponse(
+                tool_calls=[ToolCall(id="write", name="file_write", arguments={"path": "shared/final.md", "content": "done"})],
+                usage=UsageRecord(input_tokens=10, output_tokens=5, model=model),
+            )
+        return LLMResponse(
+            content="I need to create a verifier or write the final output, but this is a message turn.",
+            usage=UsageRecord(input_tokens=10, output_tokens=5, model=model),
+        )
+
+    config = RuntimeConfig(
+        workspace_root=tmp_workspace,
+        log_dir=None,
+        sandbox_backend="host",
+        loop_action_policy="constraint",
+        max_turns=5,
+    )
+    rt = Runtime(config=config, llm_call=mock_llm)
+    parent = rt.create_agent("Write `shared/final.md`.", model="test")
+    child = rt.create_agent("Finished child", model="test", parent=parent.id)
+    parent.children.add(child.id)
+    child.status = "done"
+    parent.action_state = "message"
+    parent._state_action_version = 1
+    parent._deferred_spawn_requests.append({
+        "task": "Verify after missing dependency is ready.",
+        "role": "verifier",
+        "depends_on": ["lane:missing"],
+        "readiness": 0.0,
+        "readiness_threshold": 0.6,
+        "downstream_focus": True,
+    })
+
+    await rt._agent_loop(parent)
+
+    assert not (tmp_workspace / "shared" / "final.md").exists()
+    assert [e for e in rt._events if e["event"] == "loop_action_replan" and e["data"].get("from_action") == "message"]
+    assert all("file_write" not in call["tools"] for call in calls)
+    assert any({"query", "ledger_read", "ledger_update"} & set(call["tools"]) for call in calls)
+
+
+@pytest.mark.asyncio
+async def test_stop_action_empty_turn_retries_with_set_status(tmp_workspace):
+    (tmp_workspace / "shared" / "final.md").write_text("done")
+    calls = []
+
+    async def mock_llm(messages, model, tools=None, **kwargs):
+        calls.append({
+            "tools": [t["function"]["name"] for t in (tools or [])],
+            "tool_choice": kwargs.get("tool_choice"),
+        })
+        if len(calls) == 1:
+            return LLMResponse(
+                usage=UsageRecord(input_tokens=10, output_tokens=5, model=model),
+            )
+        return LLMResponse(
+            tool_calls=[ToolCall(id="done", name="set_status", arguments={"action": "done", "result": "done"})],
+            usage=UsageRecord(input_tokens=10, output_tokens=5, model=model),
+        )
+
+    config = RuntimeConfig(workspace_root=tmp_workspace, log_dir=None, sandbox_backend="host", max_turns=4)
+    rt = Runtime(config=config, llm_call=mock_llm)
+    agent = rt.create_agent("Create `shared/final.md`.")
+    agent.action_state = "stop"
+    agent._state_action_version = 1
+
+    await rt._agent_loop(agent)
+
+    assert calls[0]["tool_choice"] is None
+    assert set(calls[1]["tools"]) == {"set_status", "compact"}
+    assert calls[1]["tool_choice"] == {"type": "function", "function": {"name": "set_status"}}
+    assert agent.status == "done"
+    assert [e for e in rt._events if e["event"] == "loop_action_miss" and e["data"].get("action") == "stop"]
+
+
+@pytest.mark.asyncio
+async def test_pre_create_reference_read_runs_before_create(tmp_workspace):
     (tmp_workspace / "shared" / "input.txt").write_text("hello")
     calls = []
 
     async def mock_llm(messages, model, tools=None, **kwargs):
-        calls.append([t["function"]["name"] for t in (tools or [])])
+        calls.append({
+            "tool_choice": kwargs.get("tool_choice"),
+            "tools": [t["function"]["name"] for t in (tools or [])],
+        })
+        if "Task: audit source" in (messages[0].get("content") or "") or "Task: patch source" in (messages[0].get("content") or ""):
+            return LLMResponse(
+                tool_calls=[ToolCall(id=f"child-{len(calls)}", name="set_status", arguments={"status": "done", "result": "child done"})],
+                usage=UsageRecord(input_tokens=10, output_tokens=5, model=model),
+            )
         if len(calls) == 1:
             content = (
                 "I need source context before deciding whether to spawn.\n"
@@ -900,7 +3517,17 @@ async def test_filtered_read_intent_releases_create_scope_next_turn(tmp_workspac
             return LLMResponse(content=content, usage=UsageRecord(input_tokens=10, output_tokens=5, model=model))
         if len(calls) == 2:
             return LLMResponse(
-                tool_calls=[ToolCall(id="tc2", name="file_read", arguments={"path": "shared/input.txt"})],
+                tool_calls=[ToolCall(
+                    id="tc2",
+                    name="spawn_many",
+                    arguments={
+                        "defaults": {"create_type": "peer_agent", "relationship": "peer", "group_id": "wave"},
+                        "agents": [
+                            {"task": "audit source", "role": "auditor"},
+                            {"task": "patch source", "role": "patcher"},
+                        ],
+                    },
+                )],
                 usage=UsageRecord(input_tokens=10, output_tokens=5, model=model),
             )
         return LLMResponse(
@@ -919,13 +3546,15 @@ async def test_filtered_read_intent_releases_create_scope_next_turn(tmp_workspac
     )
     rt = Runtime(config=config, llm_call=mock_llm)
 
-    await rt.run("Coordinate separable research, review, and report workstreams. Inspect `shared/input.txt` before deciding.")
+    await rt.run(
+        "Coordinate separable research, review, and report workstreams. "
+        "Public files: `shared/input.txt`. Inspect it before deciding."
+    )
 
-    create_tools = {"spawn", "create_agent", "spawn_many", "query", "compact", "set_status", "get_cost"}
-    assert set(calls[0]) == create_tools
-    assert {"file_read", "file_list", "grep", "query", "set_status", "get_cost"} <= set(calls[1])
-    assert "spawn_many" not in calls[1]
-    assert [e for e in rt._events if e["event"] == "create_action_miss"]
+    assert {"file_read", "file_list", "grep", "query", "set_status", "get_cost"} <= set(calls[0]["tools"])
+    assert set(calls[1]["tools"]) == {"spawn", "create_agent", "spawn_many"}
+    assert not [e for e in rt._events if e["event"] == "create_action_miss" and e["agent"] == "alpha"]
+    assert [e for e in rt._events if e["event"] == "pre_action_read" and e["data"].get("target_action") == "create"]
     assert [e for e in rt._events if e["event"] == "tool_call" and e["data"]["tool"] == "file_read"]
 
 
@@ -959,12 +3588,8 @@ async def test_create_read_orientation_resumes_create_before_artifact_work(tmp_w
             return LLMResponse(content=content, usage=UsageRecord(input_tokens=10, output_tokens=5, model=model))
         if len(calls) == 2:
             return LLMResponse(
-                tool_calls=[ToolCall(id="tc2", name="file_read", arguments={"path": "shared/cf73_top10/problems/2161F/statement.md"})],
-                usage=UsageRecord(input_tokens=10, output_tokens=5, model=model),
-            )
-        return LLMResponse(
-            tool_calls=[ToolCall(
-                id="tc3",
+                tool_calls=[ToolCall(
+                id="tc2",
                 name="spawn_many",
                 arguments={
                     "defaults": {"create_type": "peer_agent", "relationship": "peer", "group_id": "cf73-2161F-gen0"},
@@ -973,7 +3598,11 @@ async def test_create_read_orientation_resumes_create_before_artifact_work(tmp_w
                         {"task": "Generate candidate 01", "role": "generator-01"},
                     ],
                 },
-            )],
+                )],
+                usage=UsageRecord(input_tokens=10, output_tokens=5, model=model),
+            )
+        return LLMResponse(
+            tool_calls=[ToolCall(id="tc3", name="set_status", arguments={"status": "done", "result": "done"})],
             usage=UsageRecord(input_tokens=10, output_tokens=5, model=model),
         )
 
@@ -992,16 +3621,14 @@ async def test_create_read_orientation_resumes_create_before_artifact_work(tmp_w
         "Run OpenDeepThink n=20 K=4 T=3 M=10 for CF73 problem 2161F. "
         "Public files: `shared/cf73_top10/problems/2161F/metadata.json`, "
         "`shared/cf73_top10/problems/2161F/statement.md`, `shared/cf73_top10/README.md`. "
-        "Spawn 20 independent gen-0 generators. Write `shared/cf73_top10/2161F/final/bt.json`, "
-        "`shared/cf73_top10/2161F/selected_solution.cpp`, and `shared/cf73_top10/2161F/report.md`."
+        "Spawn independent generator workstreams for candidates 00 and 01."
     )
 
-    create_tools = {"spawn", "create_agent", "spawn_many", "query", "compact", "set_status", "get_cost"}
-    assert set(calls[0]["tools"]) == create_tools
-    assert "file_read" in calls[1]["tools"]
-    assert set(calls[2]["tools"]) == {"spawn", "create_agent", "spawn_many"}
-    card = "\n".join(m.get("content") or "" for m in calls[2]["messages"])
+    assert {"file_read", "file_list", "grep", "query", "set_status", "get_cost"} <= set(calls[0]["tools"])
+    assert set(calls[1]["tools"]) == {"spawn", "create_agent", "spawn_many"}
+    card = "\n".join(m.get("content") or "" for m in calls[1]["messages"])
     assert "resume_create_after_read_orientation" in card
+    assert [e for e in rt._events if e["event"] == "pre_action_read" and e["data"].get("target_action") == "create"]
     assert len(rt.agents) == 3
 
 
@@ -1010,7 +3637,10 @@ async def test_create_action_recovers_spawn_many_typo_from_text(tmp_workspace):
     calls = []
 
     async def mock_llm(messages, model, tools=None, **kwargs):
-        calls.append([t["function"]["name"] for t in (tools or [])])
+        calls.append({
+            "tool_choice": kwargs.get("tool_choice"),
+            "tools": [t["function"]["name"] for t in (tools or [])],
+        })
         if "Task: Generate candidate" in (messages[0].get("content") or ""):
             return LLMResponse(
                 tool_calls=[ToolCall(id=f"child-{len(calls)}", name="set_status", arguments={"status": "done", "result": "candidate done"})],
@@ -1039,19 +3669,16 @@ async def test_create_action_recovers_spawn_many_typo_from_text(tmp_workspace):
     rt = Runtime(config=config, llm_call=mock_llm)
     await rt.run("Coordinate separable generator workstreams for candidates 00 and 01.")
 
-    create_tools = {"spawn", "create_agent", "spawn_many", "query", "compact", "set_status", "get_cost"}
-    assert set(calls[0]) == create_tools
+    create_tools = {"spawn", "create_agent", "spawn_many", "compact", "set_status", "get_cost"}
+    assert set(calls[0]["tools"]) == create_tools
     assert len(rt.agents) == 3
     assert [e for e in rt._events if e["event"] == "text_tool_call_recovered" and "spawn_many" in e["data"]["tool_calls"]]
     assert [e for e in rt._events if e["event"] == "spawn"]
 
 
 @pytest.mark.asyncio
-async def test_set_status_read_from_create_resumes_create_after_orientation(tmp_workspace):
-    (tmp_workspace / "shared" / "cf73_top10" / "problems" / "2161F").mkdir(parents=True)
-    (tmp_workspace / "shared" / "cf73_top10" / "README.md").write_text("public benchmark\n")
-    (tmp_workspace / "shared" / "cf73_top10" / "problems" / "2161F" / "metadata.json").write_text("{}\n")
-    (tmp_workspace / "shared" / "cf73_top10" / "problems" / "2161F" / "statement.md").write_text("statement\n")
+async def test_pre_create_read_plan_resumes_create_after_orientation(tmp_workspace):
+    (tmp_workspace / "shared" / "input.txt").write_text("benchmark notes\n")
     calls = []
 
     async def mock_llm(messages, model, tools=None, **kwargs):
@@ -1066,12 +3693,7 @@ async def test_set_status_read_from_create_resumes_create_after_orientation(tmp_
             )
         if len(calls) == 1:
             return LLMResponse(
-                tool_calls=[ToolCall(id="tc1", name="set_status", arguments={"action": "read"})],
-                usage=UsageRecord(input_tokens=10, output_tokens=5, model=model),
-            )
-        if len(calls) == 2:
-            return LLMResponse(
-                tool_calls=[ToolCall(id="tc2", name="file_read", arguments={"path": "shared/cf73_top10/problems/2161F/statement.md"})],
+                tool_calls=[ToolCall(id="tc2", name="file_read", arguments={"path": "shared/input.txt"})],
                 usage=UsageRecord(input_tokens=10, output_tokens=5, model=model),
             )
         return LLMResponse(
@@ -1101,20 +3723,72 @@ async def test_set_status_read_from_create_resumes_create_after_orientation(tmp_
     )
     rt = Runtime(config=config, llm_call=mock_llm)
     await rt.run(
-        "Run OpenDeepThink n=20 K=4 T=3 M=10 for CF73 problem 2161F. "
-        "Public files: `shared/cf73_top10/problems/2161F/metadata.json`, "
-        "`shared/cf73_top10/problems/2161F/statement.md`, `shared/cf73_top10/README.md`. "
-        "Spawn 20 independent gen-0 generators. Write `shared/cf73_top10/2161F/final/bt.json`, "
-        "`shared/cf73_top10/2161F/selected_solution.cpp`, and `shared/cf73_top10/2161F/report.md`."
+        "Coordinate separable generator workstreams for candidates 00 and 01. "
+        "Public files: `shared/input.txt`. Inspect it before spawning."
     )
 
-    create_tools = {"spawn", "create_agent", "spawn_many", "query", "compact", "set_status", "get_cost"}
-    assert set(calls[0]["tools"]) == create_tools
-    assert "file_read" in calls[1]["tools"]
-    assert set(calls[2]["tools"]) == create_tools
-    card = "\n".join(m.get("content") or "" for m in calls[2]["messages"])
+    assert "file_read" in calls[0]["tools"]
+    assert set(calls[1]["tools"]) == {"spawn", "create_agent", "spawn_many"}
+    card = "\n".join(m.get("content") or "" for m in calls[1]["messages"])
     assert "resume_create_after_read_orientation" in card
     assert len(rt.agents) == 3
+
+
+@pytest.mark.asyncio
+async def test_cf73_generator_leaf_reads_then_writes_without_create_retry(tmp_workspace):
+    (tmp_workspace / "shared" / "cf73_top10" / "problems" / "2161F").mkdir(parents=True)
+    (tmp_workspace / "shared" / "cf73_top10" / "problems" / "2161F" / "statement.md").write_text("statement\n")
+    (tmp_workspace / "shared" / "cf73_top10" / "problems" / "2161F" / "metadata.json").write_text("{}\n")
+    calls = []
+
+    async def mock_llm(messages, model, tools=None, **kwargs):
+        calls.append({
+            "tools": [t["function"]["name"] for t in (tools or [])],
+            "messages": messages,
+            "tool_choice": kwargs.get("tool_choice"),
+        })
+        if len(calls) == 1:
+            return LLMResponse(
+                tool_calls=[
+                    ToolCall(id="r1", name="file_read", arguments={"path": "shared/cf73_top10/problems/2161F/statement.md"}),
+                    ToolCall(id="r2", name="file_read", arguments={"path": "shared/cf73_top10/problems/2161F/metadata.json"}),
+                ],
+                usage=UsageRecord(input_tokens=10, output_tokens=5, model=model),
+            )
+        return LLMResponse(
+            tool_calls=[
+                ToolCall(id="w1", name="file_write", arguments={"path": "shared/cf73_top10/2161F/gen0/candidate_01.cpp", "content": "// candidate\n"}),
+                ToolCall(id="w2", name="file_write", arguments={"path": "shared/cf73_top10/2161F/gen0/candidate_01.md", "content": "candidate notes\n"}),
+            ],
+            usage=UsageRecord(input_tokens=10, output_tokens=5, model=model),
+        )
+
+    config = RuntimeConfig(
+        workspace_root=tmp_workspace,
+        log_dir=None,
+        sandbox_backend="host",
+        orchestration_preference="aggressive",
+        spawn_before_turn=1,
+        max_turns=3,
+        min_spawnable_workstreams=2,
+    )
+    rt = Runtime(config=config, llm_call=mock_llm)
+
+    await rt.run(
+        "You are generator candidate 01 for CF-73 problem 2161F. "
+        "Read `shared/cf73_top10/problems/2161F/statement.md` and "
+        "`shared/cf73_top10/problems/2161F/metadata.json`. "
+        "Write `shared/cf73_top10/2161F/gen0/candidate_01.cpp` and "
+        "`shared/cf73_top10/2161F/gen0/candidate_01.md`.",
+    )
+
+    assert {"file_read", "file_list", "grep", "query", "file_write", "file_replace"} & set(calls[0]["tools"])
+    assert "spawn_many" not in calls[0]["tools"]
+    assert "spawn_many" not in calls[1]["tools"]
+    assert "file_write" in calls[1]["tools"]
+    assert not [e for e in rt._events if e["event"] == "create_action_miss"]
+    assert (tmp_workspace / "shared" / "cf73_top10" / "2161F" / "gen0" / "candidate_01.cpp").is_file()
+    assert (tmp_workspace / "shared" / "cf73_top10" / "2161F" / "gen0" / "candidate_01.md").is_file()
 
 
 @pytest.mark.asyncio
@@ -1391,6 +4065,316 @@ async def test_peer_progress_after_query_limits_more_peer_reading(tmp_workspace)
 
 
 @pytest.mark.asyncio
+async def test_overlap_query_before_work_then_prunes_duplicate_discovery_lane(tmp_workspace):
+    calls = []
+
+    async def mock_llm(messages, model, tools=None, **kwargs):
+        calls.append({
+            "tools": [t["function"]["name"] for t in (tools or [])],
+            "messages": messages,
+        })
+        if len(calls) == 1:
+            return LLMResponse(
+                tool_calls=[ToolCall(id="tc1", name="query", arguments={"filter": {"group_id": "gaia-c61"}})],
+                usage=UsageRecord(input_tokens=10, output_tokens=5, model=model),
+            )
+        return LLMResponse(
+            tool_calls=[
+                ToolCall(
+                    id="tc2",
+                    name="compact",
+                    arguments={
+                        "summary": "Stopping: peer bravo already has completed AI regulation evidence for this search lane.",
+                        "tags": [
+                            "benchmark:gaia",
+                            "problem:c61",
+                            "phase:evidence",
+                            "topic:ai_regulation",
+                            "status:pruned",
+                            "reason:duplicate_lane",
+                        ],
+                        "stop_after": True,
+                        "result": "pruned duplicate discovery lane",
+                    },
+                )
+            ],
+            usage=UsageRecord(input_tokens=10, output_tokens=5, model=model),
+        )
+
+    config = RuntimeConfig(
+        workspace_root=tmp_workspace,
+        log_dir=None,
+        sandbox_backend="host",
+        loop_action_policy="constraint",
+        max_turns=4,
+    )
+    rt = Runtime(config=config, llm_call=mock_llm)
+    parent = rt.create_agent("Coordinate GAIA evidence search.", model="test", orchestration_preference="parallel")
+    agent = rt.create_agent(
+        "Search arXiv and collect evidence about AI regulation papers; write shared/lane_alpha.md.",
+        model="test",
+        parent=parent.id,
+        group_id="gaia-c61",
+        role="researcher",
+        current_task_tags=["benchmark:gaia", "problem:c61", "phase:evidence", "topic:ai_regulation"],
+        orchestration_preference="parallel",
+    )
+    peer = rt.create_agent(
+        "Search arXiv for AI regulation evidence and sources; write shared/lane_bravo.md.",
+        model="test",
+        parent=parent.id,
+        group_id="gaia-c61",
+        role="researcher",
+        current_task_tags=["benchmark:gaia", "problem:c61", "phase:evidence", "topic:ai_regulation"],
+        orchestration_preference="parallel",
+    )
+    peer.status = "done"
+    peer.result = "Completed AI regulation evidence lane."
+    peer.artifacts.append(Artifact("shared/lane_bravo.md", tmp_workspace / "shared" / "lane_bravo.md"))
+
+    await rt._agent_loop(agent)
+
+    assert calls[0]["tools"]
+    assert "query" in calls[0]["tools"]
+    first_card = "\n".join(m.get("content") or "" for m in calls[0]["messages"])
+    assert "discovery/search/evidence work with nearby overlapping peers" in first_card
+    assert calls[1]["tools"]
+    assert "compact" in calls[1]["tools"]
+    second_card = "\n".join(m.get("content") or "" for m in calls[1]["messages"])
+    assert "Peer-progress query has already returned completed" in second_card
+    memory = rt.memory.serialize(agent.id)
+    assert agent.status == "done"
+    assert agent.result == "pruned duplicate discovery lane"
+    assert "status:pruned" in memory["tags"]
+    assert "reason:duplicate_lane" in memory["tags"]
+
+
+@pytest.mark.asyncio
+async def test_parent_query_can_request_duplicate_agents_self_prune(tmp_workspace):
+    calls = []
+
+    async def mock_llm(messages, model, tools=None, **kwargs):
+        calls.append({
+            "tools": [t["function"]["name"] for t in (tools or [])],
+            "messages": messages,
+        })
+        if len(calls) == 1:
+            return LLMResponse(
+                tool_calls=[ToolCall(id="tc1", name="query", arguments={"filter": {"group_id": "gaia-c61"}})],
+                usage=UsageRecord(input_tokens=10, output_tokens=5, model=model),
+            )
+        if len(calls) == 2:
+            return LLMResponse(
+                tool_calls=[
+                    ToolCall(
+                        id="tc2",
+                        name="send",
+                        arguments={
+                            "to": "charlie",
+                            "message_type": "prune_request",
+                            "mode": "steer",
+                            "urgency": "high",
+                            "message": "bravo already produced the AI regulation evidence; compact useful partials and self-prune if your lane is duplicate.",
+                            "payload": {
+                                "reason": "peer_ahead",
+                                "covered_by": ["bravo"],
+                                "evidence_agents": [{"id": "bravo", "artifacts": ["shared/lane_bravo.md"]}],
+                                "tags": ["benchmark:gaia", "problem:c61", "topic:ai_regulation"],
+                            },
+                        },
+                    )
+                ],
+                usage=UsageRecord(input_tokens=10, output_tokens=5, model=model),
+            )
+        return LLMResponse(
+            tool_calls=[ToolCall(id="tc3", name="set_status", arguments={"action": "stop", "result": "prune request sent"})],
+            usage=UsageRecord(input_tokens=10, output_tokens=5, model=model),
+        )
+
+    config = RuntimeConfig(
+        workspace_root=tmp_workspace,
+        log_dir=None,
+        sandbox_backend="host",
+        loop_action_policy="constraint",
+        max_turns=4,
+    )
+    rt = Runtime(config=config, llm_call=mock_llm)
+    parent = rt.create_agent(
+        "Coordinate GAIA evidence search; query worker state and prune duplicate work.",
+        model="test",
+        group_id="gaia-c61",
+        current_task_tags=["benchmark:gaia", "problem:c61"],
+        orchestration_preference="parallel",
+    )
+    producer = rt.create_agent(
+        "Search arXiv for AI regulation evidence; write shared/lane_bravo.md.",
+        model="test",
+        parent=parent.id,
+        group_id="gaia-c61",
+        role="researcher",
+        current_task_tags=["benchmark:gaia", "problem:c61", "phase:evidence", "topic:ai_regulation"],
+        orchestration_preference="parallel",
+    )
+    duplicate = rt.create_agent(
+        "Search arXiv for the same AI regulation evidence; write shared/lane_delta.md.",
+        model="test",
+        parent=parent.id,
+        group_id="gaia-c61",
+        role="researcher",
+        current_task_tags=["benchmark:gaia", "problem:c61", "phase:evidence", "topic:ai_regulation"],
+        orchestration_preference="parallel",
+    )
+    assert producer.id == "bravo"
+    assert duplicate.id == "charlie"
+    producer.status = "done"
+    producer.result = "Completed AI regulation evidence lane."
+    producer.artifacts.append(Artifact("shared/lane_bravo.md", tmp_workspace / "shared" / "lane_bravo.md"))
+
+    await rt._agent_loop(parent)
+
+    assert duplicate._pending_prune_requests
+    assert duplicate.action_state == "compact"
+    assert "charlie" in parent._prune_requests_sent_targets
+    assert any(e["event"] == "send" and e["data"].get("message_type") == "prune_request" for e in rt._events)
+    second_card = "\n".join(m.get("content") or "" for m in calls[1]["messages"])
+    assert "message_type='prune_request'" in second_card
+
+
+def test_prune_request_plan_covers_same_lane_active_agents_outside_last_query(tmp_workspace):
+    config = RuntimeConfig(
+        workspace_root=tmp_workspace,
+        log_dir=None,
+        sandbox_backend="host",
+        loop_action_policy="constraint",
+        max_agents=12,
+    )
+    rt = Runtime(config=config)
+    parent = rt.create_agent(
+        "Coordinate GAIA society evidence verification.",
+        model="test",
+        group_id="gaia-c61",
+        current_task_tags=["benchmark:gaia", "problem:c61"],
+        orchestration_preference="parallel",
+    )
+    report = tmp_workspace / "shared" / "gaia_l2" / "c61d" / "researcher2_evidence.md"
+    report.parent.mkdir(parents=True)
+    report.write_text("Status: verified\nTotal Results: 8\nConfidence: High\n")
+    completed = rt.create_agent(
+        "Verify shared/gaia_l2/c61d/researcher2_evidence.md for physics.soc-ph on August 11 2016.",
+        model="test",
+        parent=parent.id,
+        role="verifier",
+        group_id="verification_gaia_l2",
+        current_task_tags=["benchmark:gaia", "lane:phys-soc-2016", "role:verifier"],
+    )
+    duplicate = rt.create_agent(
+        "Read shared/gaia_l2/c61d/researcher2_evidence.md and re-verify physics.soc-ph papers from 2016-08-11.",
+        model="test",
+        parent=parent.id,
+        role="verifier",
+        group_id="verification_gaia_l2",
+        current_task_tags=["benchmark:gaia", "lane:phys-soc-2016", "role:verifier"],
+    )
+    parent.children.update({completed.id, duplicate.id})
+    completed.status = "done"
+    completed.result = "Verified the society report."
+    completed.artifacts.append(Artifact("shared/gaia_l2/c61d/researcher2_evidence.md", report, agent_id=completed.id))
+    rt.memory.update(completed.id, add_artifacts=["shared/gaia_l2/c61d/researcher2_evidence.md"], tags=completed.current_task_tags)
+    duplicate.status = "running"
+    duplicate._turns = 6
+    duplicate._tool_calls = 4
+
+    parent._turns = 2
+    parent._last_query_turn = parent._turns
+    parent._last_query_agent_ids = [completed.id]
+    parent._last_query_reliable_evidence_ids = [completed.id]
+
+    rt._refresh_loop_action_plan(parent, [])
+
+    assert parent._loop_action_plan["action"] == "message"
+    assert parent._loop_action_plan["reason"] == "request_duplicate_agents_self_prune_after_key_evidence"
+    assert parent._loop_action_plan["prune_targets"] == [duplicate.id]
+
+
+@pytest.mark.asyncio
+async def test_prune_request_receiver_compacts_and_self_prunes(tmp_workspace):
+    calls = []
+
+    async def mock_llm(messages, model, tools=None, **kwargs):
+        calls.append({
+            "tools": [t["function"]["name"] for t in (tools or [])],
+            "messages": messages,
+        })
+        return LLMResponse(
+            tool_calls=[
+                ToolCall(
+                    id="tc1",
+                    name="compact",
+                    arguments={
+                        "summary": "Self-pruned after coordinator prune_request: bravo already covers this evidence lane. Reusable note: search terms and candidate source overlap the completed lane.",
+                        "tags": [
+                            "benchmark:gaia",
+                            "problem:c61",
+                            "phase:evidence",
+                            "topic:ai_regulation",
+                            "status:pruned",
+                            "reason:peer_ahead",
+                        ],
+                        "stop_after": True,
+                        "result": "self-pruned duplicate lane after prune_request",
+                    },
+                )
+            ],
+            usage=UsageRecord(input_tokens=10, output_tokens=5, model=model),
+        )
+
+    config = RuntimeConfig(
+        workspace_root=tmp_workspace,
+        log_dir=None,
+        sandbox_backend="host",
+        loop_action_policy="constraint",
+        max_turns=3,
+    )
+    rt = Runtime(config=config, llm_call=mock_llm)
+    coordinator = rt.create_agent("coordinator", model="test")
+    worker = rt.create_agent(
+        "Search arXiv for AI regulation evidence and write shared/lane_delta.md.",
+        model="test",
+        parent=coordinator.id,
+        group_id="gaia-c61",
+        role="researcher",
+        current_task_tags=["benchmark:gaia", "problem:c61", "phase:evidence", "topic:ai_regulation"],
+    )
+
+    await rt.deliver(Envelope(
+        from_id=coordinator.id,
+        to_id=worker.id,
+        content="bravo already covers this lane; compact partials and self-prune if duplicate.",
+        tokens=12,
+        timestamp=0.0,
+        message_type="prune_request",
+        payload={
+            "reason": "peer_ahead",
+            "covered_by": ["bravo"],
+            "evidence_agents": [{"id": "bravo", "artifacts": ["shared/lane_bravo.md"]}],
+        },
+        urgency="high",
+        mode="steer",
+    ))
+
+    await rt._agent_loop(worker)
+
+    card = "\n".join(m.get("content") or "" for m in calls[0]["messages"])
+    memory = rt.memory.serialize(worker.id)
+    assert "prune_request" in card
+    assert worker.status == "done"
+    assert worker.result == "self-pruned duplicate lane after prune_request"
+    assert "status:pruned" in memory["tags"]
+    assert "reason:peer_ahead" in memory["tags"]
+    assert memory["active_task"] is None
+
+
+@pytest.mark.asyncio
 async def test_loop_action_plan_allows_multiple_tools_in_one_action_only(tmp_workspace):
     calls = []
 
@@ -1501,7 +4485,8 @@ async def test_peer_progress_nudge_does_not_override_work_action_plan(tmp_worksp
 
     card = "\n".join(m.get("content") or "" for m in calls[0])
     assert "Peer-progress risk is active" in card
-    assert "Next action candidate: action=work reason=default_task_progress" in card
+    assert "Current action is fixed by runtime: work" in card
+    assert "Fixed action: action=work reason=default_task_progress" in card
     assert "tool=" not in card
     assert [e for e in rt._events if e["event"] == "tool_call" and e["data"]["tool"] == "query"]
     assert not [e for e in rt._events if e["event"] == "tool_call_skipped" and e["data"]["tool"] == "query"]
@@ -1549,7 +4534,8 @@ async def test_coordination_artifact_task_queries_before_writing_report(tmp_work
     await rt._agent_loop(agent)
 
     card = "\n".join(m.get("content") or "" for m in calls[0]["messages"])
-    assert "Next action candidate: action=read reason=task_requests_peer_query_before_artifact" in card
+    assert "Current action is fixed by runtime: read" in card
+    assert "Fixed action: action=read reason=task_requests_peer_query_before_artifact" in card
     assert "tool=" not in card
     assert "query" in calls[0]["tools"]
     assert calls[0]["tool_choice"] is None
@@ -1565,7 +4551,7 @@ async def test_tool_calls_outside_current_action_are_skipped_until_next_loop(tmp
             usage=UsageRecord(input_tokens=10, output_tokens=5, model=model),
         )
 
-    config = RuntimeConfig(workspace_root=tmp_workspace, log_dir=None, sandbox_backend="host", max_turns=1)
+    config = RuntimeConfig(workspace_root=tmp_workspace, log_dir=None, sandbox_backend="host", max_turns=6)
     rt = Runtime(config=config, llm_call=mock_llm)
     agent = rt.create_agent("Inspect peers, then write `shared/report.md`.")
     agent._loop_action_plan = {
@@ -1697,6 +4683,82 @@ def test_coordinator_child_plan_overrides_stale_work_state_action(tmp_workspace)
     assert parent._state_action_consumed_version == 0
 
 
+def test_explicit_peer_wave_gap_returns_coordinator_to_create(tmp_workspace):
+    config = RuntimeConfig(workspace_root=tmp_workspace, log_dir=None, sandbox_backend="host", max_agents=100)
+    rt = Runtime(config=config)
+    parent = rt.create_agent(
+        "Run benchmark. Spawn 20 independent gen-0 generator agents in parallel for candidate IDs 00..19. "
+        "Write `shared/cf73_top10/2161F/report.md`.",
+        orchestration_preference="aggressive",
+    )
+    for idx in range(4):
+        child = rt.create_agent(
+            f"Write shared/cf73_top10/2161F/gen0/candidate_{idx:02d}.cpp.",
+            parent=parent.id,
+            role="generator",
+            group_id="cf73-gen0-2161F",
+            current_task_tags=["benchmark:cf73", "phase:gen0", "role:generator", f"candidate:{idx:02d}"],
+        )
+        child.status = "running" if idx == 0 else "done"
+
+    parent._turns = 6
+    parent._last_query_turn = 5
+    rt._refresh_loop_action_plan(parent, rt.missing_expected_outputs(parent))
+
+    assert parent._loop_action_plan["action"] == "create"
+    assert parent._loop_action_plan["reason"] == "explicit_peer_wave_incomplete"
+    assert parent._loop_action_plan["peer_wave_gap"]["target"] == 20
+    assert parent._loop_action_plan["peer_wave_gap"]["current"] == 4
+    assert parent._loop_action_plan["peer_wave_gap"]["unfinished"] == 1
+
+
+def test_explicit_peer_wave_gap_returns_initial_zero_wave(tmp_workspace):
+    config = RuntimeConfig(workspace_root=tmp_workspace, log_dir=None, sandbox_backend="host", max_agents=100)
+    rt = Runtime(config=config)
+    parent = rt.create_agent(
+        "Run benchmark. Spawn 20 independent gen-0 generator agents in parallel for candidate IDs 00..19. "
+        "Write `shared/cf73_top10/2161F/report.md`.",
+        orchestration_preference="aggressive",
+    )
+
+    rt._refresh_loop_action_plan(parent, rt.missing_expected_outputs(parent))
+    card = rt._build_loop_action_context(parent, rt.missing_expected_outputs(parent), [])
+
+    assert parent._loop_action_plan["action"] == "create"
+    assert parent._loop_action_plan["reason"] == "explicit_peer_wave_incomplete"
+    assert parent._loop_action_plan["peer_wave_gap"]["target"] == 20
+    assert parent._loop_action_plan["peer_wave_gap"]["current"] == 0
+    assert parent._loop_action_plan["peer_wave_gap"]["remaining"] == 20
+    assert "Observed 0 of target 20" in card["content"]
+
+
+def test_explicit_peer_wave_gap_still_creates_when_existing_wave_running(tmp_workspace):
+    config = RuntimeConfig(workspace_root=tmp_workspace, log_dir=None, sandbox_backend="host", max_agents=100)
+    rt = Runtime(config=config)
+    parent = rt.create_agent(
+        "Spawn 20 independent gen-0 generator agents in parallel for candidate IDs 00..19. "
+        "Write `shared/cf73_top10/2161F/report.md`.",
+        orchestration_preference="aggressive",
+    )
+    for idx in range(13):
+        rt.create_agent(
+            f"Write shared/cf73_top10/2161F/gen0/candidate_{idx:02d}.cpp.",
+            parent=parent.id,
+            role="generator",
+            group_id="cf73-2161f-gen0",
+            current_task_tags=["benchmark:cf73", "phase:gen0", "role:generator", f"candidate:{idx:02d}"],
+        )
+
+    parent._turns = 10
+    rt._refresh_loop_action_plan(parent, rt.missing_expected_outputs(parent))
+
+    assert parent._loop_action_plan["action"] == "create"
+    assert parent._loop_action_plan["reason"] == "explicit_peer_wave_incomplete"
+    assert parent._loop_action_plan["peer_wave_gap"]["current"] == 13
+    assert parent._loop_action_plan["peer_wave_gap"]["remaining"] == 7
+    assert parent._loop_action_plan["peer_wave_gap"]["unfinished"] == 13
+
+
 def test_coordinator_delegates_integration_after_child_source_progress(tmp_workspace):
     source = _init_git_source(tmp_workspace, {"pkg/mod.py": "VALUE = 1\n", "tests/test_mod.py": "def test_ok():\n    assert True\n"})
     (source / "pkg" / "mod.py").write_text("VALUE = 2\n")
@@ -1722,9 +4784,50 @@ def test_coordinator_delegates_integration_after_child_source_progress(tmp_works
     tools = rt._tools_for_loop_action(parent._loop_action_plan["action"])
     card = rt._build_loop_action_context(parent, missing, [])
 
+    allowed, scope = rt._tools_for_loop_turn(parent, parent._loop_action_plan["action"], missing)
+    assert parent._loop_action_plan["action"] == "message"
+    assert parent._loop_action_plan["root_steward"] is True
+    assert parent._loop_action_plan.get("steward_replaced_action") in {None, "create", "work"}
+    assert scope == "root_steward"
+    assert {"query", "ledger_read", "ledger_update"} <= allowed
+    assert "file_read" not in allowed
+    assert "shell" not in allowed
+    assert "Root steward boundary" in card["content"]
+
+
+def test_nested_coordinator_delegates_integration_after_child_source_progress(tmp_workspace):
+    source = _init_git_source(tmp_workspace, {"pkg/mod.py": "VALUE = 1\n", "tests/test_mod.py": "def test_ok():\n    assert True\n"})
+    (source / "pkg" / "mod.py").write_text("VALUE = 2\n")
+    config = RuntimeConfig(workspace_root=tmp_workspace, log_dir=None, sandbox_backend="host", max_agents=10)
+    rt = Runtime(config=config)
+    root = rt.create_agent("Root bootstrap.", orchestration_preference="parallel")
+    parent = rt.create_agent(
+        "Patch shared/source and run tests. After implementers finish, create integration/test review. "
+        "Write final report `shared/final_engineering_report.md`.",
+        parent=root.id,
+        role="coordinator",
+        group_id="wave",
+        orchestration_preference="parallel",
+    )
+    child = rt.create_agent(
+        "Implement feature work in shared/source.",
+        parent=parent.id,
+        role="implementer_feature",
+        group_id="wave",
+        current_task_tags=["phase:implementation"],
+    )
+    child.status = "running"
+    parent._turns = 4
+
+    missing = rt.missing_expected_outputs(parent)
+    rt._refresh_loop_action_plan(parent, missing)
+    tools = rt._tools_for_loop_action(parent._loop_action_plan["action"])
+    card = rt._build_loop_action_context(parent, missing, [])
+
     assert parent._loop_action_plan["action"] == "create"
     assert parent._loop_action_plan["reason"] == "delegate_integration_after_child_source_progress"
-    assert {"spawn", "create_agent", "spawn_many", "query", "set_status", "get_cost"} <= tools
+    assert {"spawn", "create_agent", "spawn_many", "compact", "set_status", "get_cost"} == tools
+    assert "query" not in tools
     assert "file_read" not in tools
     assert "shell" not in tools
     assert "Create one integration/test/review agent" in card["content"]
@@ -2078,13 +5181,13 @@ async def test_repeated_artifact_nudge_for_leaf_work_limits_to_file_write(tmp_wo
             "tool_choice": kwargs.get("tool_choice"),
         })
         return LLMResponse(
-            tool_calls=[ToolCall(id="tc1", name="file_write", arguments={"path": "shared/report.md", "content": "done"})],
+            tool_calls=[ToolCall(id="tc1", name="file_write", arguments={"path": "shared/out.txt", "content": "done"})],
             usage=UsageRecord(input_tokens=10, output_tokens=5, model=model),
         )
 
-    config = RuntimeConfig(workspace_root=tmp_workspace, log_dir=None, sandbox_backend="host", max_turns=4)
+    config = RuntimeConfig(workspace_root=tmp_workspace, log_dir=None, sandbox_backend="host", max_turns=5)
     rt = Runtime(config=config, llm_call=mock_llm)
-    agent = rt.create_agent("Create `shared/report.md`.")
+    agent = rt.create_agent("Create `shared/out.txt`.")
     agent._turns = 3
     agent._artifact_nudge_count = 3
 
@@ -2092,6 +5195,199 @@ async def test_repeated_artifact_nudge_for_leaf_work_limits_to_file_write(tmp_wo
 
     assert calls[0]["tools"] == ["file_write"]
     assert calls[0]["tool_choice"] == {"type": "function", "function": {"name": "file_write"}}
+
+
+@pytest.mark.asyncio
+async def test_repeated_artifact_nudge_keeps_final_report_read_write_without_evidence(tmp_workspace):
+    calls = []
+
+    async def mock_llm(messages, model, tools=None, **kwargs):
+        calls.append({
+            "messages": messages,
+            "tools": [t["function"]["name"] for t in (tools or [])],
+            "tool_choice": kwargs.get("tool_choice"),
+        })
+        return LLMResponse(
+            tool_calls=[ToolCall(id="tc1", name="file_list", arguments={"path": "shared"})],
+            usage=UsageRecord(input_tokens=10, output_tokens=5, model=model),
+        )
+
+    config = RuntimeConfig(workspace_root=tmp_workspace, log_dir=None, sandbox_backend="host", max_turns=5)
+    rt = Runtime(config=config, llm_call=mock_llm)
+    agent = rt.create_agent("Create final report `shared/final_report.md`.")
+    agent._turns = 3
+    agent._artifact_nudge_count = 3
+
+    await rt._agent_loop(agent)
+
+    assert {"file_read", "file_list", "grep", "query", "file_write"} <= set(calls[0]["tools"])
+    assert calls[0]["tool_choice"] is None
+    assert "file_write" in calls[0]["tools"]
+    llm_event = [e for e in rt._events if e["event"] == "llm_done"][0]
+    assert llm_event["data"]["tool_scope"] == "artifact_read_write"
+
+
+@pytest.mark.asyncio
+async def test_repeated_artifact_nudge_keeps_discovery_report_read_write_without_evidence(tmp_workspace):
+    calls = []
+
+    async def mock_llm(messages, model, tools=None, **kwargs):
+        calls.append({
+            "messages": messages,
+            "tools": [t["function"]["name"] for t in (tools or [])],
+            "tool_choice": kwargs.get("tool_choice"),
+        })
+        return LLMResponse(
+            tool_calls=[ToolCall(id="tc1", name="file_list", arguments={"path": "shared"})],
+            usage=UsageRecord(input_tokens=10, output_tokens=5, model=model),
+        )
+
+    config = RuntimeConfig(workspace_root=tmp_workspace, log_dir=None, sandbox_backend="host", max_turns=5)
+    rt = Runtime(config=config, llm_call=mock_llm)
+    agent = rt.create_agent(
+        "Search arXiv for the Physics and Society article and write shared/gaia/paper_2016_report.md."
+    )
+    agent._turns = 3
+    agent._artifact_nudge_count = 3
+
+    await rt._agent_loop(agent)
+
+    assert {"file_read", "file_list", "grep", "query", "shell", "file_write"} <= set(calls[0]["tools"])
+    assert calls[0]["tool_choice"] is None
+    card = "\n".join(m.get("content") or "" for m in calls[0]["messages"])
+    assert "Do not write a speculative placeholder" in card
+    llm_event = [e for e in rt._events if e["event"] == "llm_done"][0]
+    assert llm_event["data"]["tool_scope"] == "artifact_read_write"
+
+
+def test_plain_research_compact_returns_to_work_and_does_not_count_as_evidence(tmp_workspace):
+    config = RuntimeConfig(workspace_root=tmp_workspace, log_dir=None, sandbox_backend="host")
+    rt = Runtime(config=config)
+    agent = rt.create_agent(
+        "Search arXiv for the Physics and Society article and write shared/gaia/paper_2016_report.md."
+    )
+    agent._turns = 4
+    agent._artifact_nudge_count = 3
+    agent._compact_pending = {
+        "summary": "Researching; still need to search arXiv before writing the report.",
+        "tags": ["status:researching", "lane:paper_2016"],
+        "files": [],
+        "stop_after": False,
+    }
+
+    rt._execute_compact(agent)
+    allowed, scope = rt._tools_for_loop_turn(agent, "work", ["shared/gaia/paper_2016_report.md"])
+
+    assert agent.action_state == "work"
+    assert scope == "artifact_read_write"
+    assert "shell" in allowed
+    assert "file_write" in allowed
+
+
+@pytest.mark.asyncio
+async def test_repeated_artifact_nudge_allows_final_report_write_only_after_recent_evidence(tmp_workspace):
+    calls = []
+
+    async def mock_llm(messages, model, tools=None, **kwargs):
+        calls.append({
+            "tools": [t["function"]["name"] for t in (tools or [])],
+            "tool_choice": kwargs.get("tool_choice"),
+        })
+        return LLMResponse(
+            tool_calls=[ToolCall(id="tc1", name="file_write", arguments={"path": "shared/final_report.md", "content": "done"})],
+            usage=UsageRecord(input_tokens=10, output_tokens=5, model=model),
+        )
+
+    config = RuntimeConfig(workspace_root=tmp_workspace, log_dir=None, sandbox_backend="host", max_turns=5)
+    rt = Runtime(config=config, llm_call=mock_llm)
+    agent = rt.create_agent("Create final report `shared/final_report.md`.")
+    agent._turns = 3
+    agent._artifact_nudge_count = 3
+    agent._last_read_evidence_turn = 2
+
+    await rt._agent_loop(agent)
+
+    assert calls[0]["tools"] == ["file_write"]
+    assert calls[0]["tool_choice"] == {"type": "function", "function": {"name": "file_write"}}
+
+
+@pytest.mark.asyncio
+async def test_repeated_artifact_nudge_allows_discovery_report_write_only_after_shell_evidence(tmp_workspace):
+    calls = []
+
+    async def mock_llm(messages, model, tools=None, **kwargs):
+        calls.append({
+            "tools": [t["function"]["name"] for t in (tools or [])],
+            "tool_choice": kwargs.get("tool_choice"),
+        })
+        return LLMResponse(
+            tool_calls=[ToolCall(id="tc1", name="file_write", arguments={"path": "shared/gaia/paper_2016_report.md", "content": "verified"})],
+            usage=UsageRecord(input_tokens=10, output_tokens=5, model=model),
+        )
+
+    config = RuntimeConfig(workspace_root=tmp_workspace, log_dir=None, sandbox_backend="host", max_turns=5)
+    rt = Runtime(config=config, llm_call=mock_llm)
+    agent = rt.create_agent(
+        "Search arXiv for the Physics and Society article and write shared/gaia/paper_2016_report.md."
+    )
+    agent._turns = 3
+    agent._artifact_nudge_count = 3
+    agent._shell_commands.append("python3 search_arxiv.py")
+
+    await rt._agent_loop(agent)
+
+    assert calls[0]["tools"] == ["file_write"]
+    assert calls[0]["tool_choice"] == {"type": "function", "function": {"name": "file_write"}}
+
+
+@pytest.mark.asyncio
+async def test_successful_shell_result_is_published_as_queryable_evidence(tmp_workspace):
+    from nanoma.tools import WORK_TOOLS
+
+    calls = []
+
+    async def mock_llm(messages, model, tools=None, **kwargs):
+        calls.append([t["function"]["name"] for t in (tools or [])])
+        return LLMResponse(
+            tool_calls=[ToolCall(id="tc1", name="shell", arguments={"command": "python3 search.py"})],
+            usage=UsageRecord(input_tokens=10, output_tokens=5, model=model),
+        )
+
+    async def fake_shell(args, workspace, ctx):
+        return {
+            "exit_code": 0,
+            "stdout": "Found 8 entries; 1608.03637v1 mentions hierarchical and egalitarian societies.",
+            "stderr": "",
+        }
+
+    config = RuntimeConfig(
+        workspace_root=tmp_workspace,
+        log_dir=None,
+        sandbox_backend="host",
+        max_turns=1,
+        enabled_work_tools={"shell"},
+    )
+    rt = Runtime(config=config, llm_call=mock_llm)
+    rt.work_tools["shell"] = {"handler": fake_shell, "schema": WORK_TOOLS["shell"]["schema"]}
+    agent = rt.create_agent(
+        "Search arXiv for the Physics and Society article and write shared/gaia/paper_2016_report.md.",
+        model="test",
+        current_task_tags=["benchmark:gaia", "lane:society"],
+    )
+
+    await rt._agent_loop(agent)
+
+    memory = rt.memory.serialize(agent.id)
+    cards = memory["experience_cards"]
+    assert any(card["memory_kind"] == "evidence" for card in cards)
+    assert any("1608.03637v1" in card["summary"] for card in cards)
+    artifacts = [path for card in cards for path in card["artifacts"]]
+    assert artifacts
+    evidence_path = tmp_workspace / artifacts[0]
+    assert evidence_path.exists()
+    assert "1608.03637v1" in evidence_path.read_text()
+    queried = await meta_query({"target": agent.id, "include_memory": True}, agent, rt)
+    assert "1608.03637v1" in json.dumps(queried, ensure_ascii=False)
 
 
 @pytest.mark.asyncio
@@ -2192,7 +5488,7 @@ async def test_outputs_complete_prefers_compact_stop_action(tmp_workspace):
             usage=UsageRecord(input_tokens=10, output_tokens=5, model=model),
         )
 
-    config = RuntimeConfig(workspace_root=tmp_workspace, log_dir=None, sandbox_backend="host", max_turns=4)
+    config = RuntimeConfig(workspace_root=tmp_workspace, log_dir=None, sandbox_backend="host", max_turns=5)
     rt = Runtime(config=config, llm_call=mock_llm)
     (tmp_workspace / "shared" / "out.txt").parent.mkdir(parents=True, exist_ok=True)
     (tmp_workspace / "shared" / "out.txt").write_text("done")
@@ -2203,11 +5499,35 @@ async def test_outputs_complete_prefers_compact_stop_action(tmp_workspace):
 
     card = "\n".join(m.get("content") or "" for m in calls[0]["messages"])
     assert "All explicit output files named by your task currently exist" in card
-    assert "Next action candidate: action=compact reason=outputs_complete_publish_memory" in card
+    assert "Current action is fixed by runtime: compact" in card
+    assert "Fixed action: action=compact reason=outputs_complete_publish_memory" in card
     assert "tool=" not in card
     assert agent.status == "done"
     runtime_memory = rt.memory.serialize(agent.id)
     assert "shared/out.txt" in runtime_memory["artifact_index"]
+
+
+def test_loop_action_card_does_not_prefer_compact_for_uncertain_outputs(tmp_workspace):
+    config = RuntimeConfig(workspace_root=tmp_workspace, log_dir=None, sandbox_backend="host")
+    rt = Runtime(config=config)
+    out = tmp_workspace / "shared" / "out.txt"
+    out.parent.mkdir(parents=True, exist_ok=True)
+    out.write_text("Status: partial / unverified\nConfidence: low\n")
+    agent = rt.create_agent("Create `shared/out.txt`.", model="test")
+    agent.artifacts.append(Artifact(path="shared/out.txt", absolute_path=out, agent_id=agent.id))
+    agent._loop_action_plan = {
+        "action": "work",
+        "reason": "completion_evidence_required_before_compact",
+        "turn_added": 3,
+    }
+
+    card = rt._build_loop_action_context(agent, [], [])
+    assert card is not None
+    text = card["content"]
+
+    assert "All explicit output files named by your task currently exist, but completion blockers remain" in text
+    assert "Do not prefer compact/stop merely because files exist" in text
+    assert "Prefer action=compact or action=stop" not in text
 
 
 @pytest.mark.asyncio
@@ -2230,7 +5550,7 @@ async def test_compact_action_allows_read_confirmation_tools(tmp_workspace):
             usage=UsageRecord(input_tokens=10, output_tokens=5, model=model),
         )
 
-    config = RuntimeConfig(workspace_root=tmp_workspace, log_dir=None, sandbox_backend="host", max_turns=4)
+    config = RuntimeConfig(workspace_root=tmp_workspace, log_dir=None, sandbox_backend="host", max_turns=6)
     rt = Runtime(config=config, llm_call=mock_llm)
     (tmp_workspace / "shared" / "out.txt").parent.mkdir(parents=True, exist_ok=True)
     (tmp_workspace / "shared" / "out.txt").write_text("done")
@@ -2241,6 +5561,45 @@ async def test_compact_action_allows_read_confirmation_tools(tmp_workspace):
 
     assert [e for e in rt._events if e["event"] == "tool_call" and e["data"]["tool"] == "file_list"]
     assert not [e for e in rt._events if e["event"] == "tool_call_skipped"]
+    assert agent.status == "done"
+
+
+@pytest.mark.asyncio
+async def test_compact_action_retries_with_compact_tools_after_read_only_miss(tmp_workspace):
+    calls = []
+
+    async def mock_llm(messages, model, tools=None, **kwargs):
+        calls.append({
+            "tool_choice": kwargs.get("tool_choice"),
+            "tools": [t["function"]["name"] for t in (tools or [])],
+        })
+        if len(calls) == 1:
+            return LLMResponse(
+                tool_calls=[ToolCall(id="tc1", name="file_list", arguments={"path": "shared"})],
+                usage=UsageRecord(input_tokens=10, output_tokens=5, model=model),
+            )
+        return LLMResponse(
+            tool_calls=[
+                ToolCall(
+                    id="tc2",
+                    name="compact",
+                    arguments={"summary": "complete", "files": ["shared/out.txt"], "stop_after": True, "result": "done"},
+                )
+            ],
+            usage=UsageRecord(input_tokens=10, output_tokens=5, model=model),
+        )
+
+    config = RuntimeConfig(workspace_root=tmp_workspace, log_dir=None, sandbox_backend="host", max_turns=6)
+    rt = Runtime(config=config, llm_call=mock_llm)
+    (tmp_workspace / "shared" / "out.txt").write_text("done")
+    agent = rt.create_agent("Create `shared/out.txt`.")
+    agent._turns = 3
+
+    await rt._agent_loop(agent)
+
+    assert [e for e in rt._events if e["event"] == "loop_action_auxiliary_only_miss" and e["data"].get("action") == "compact"]
+    assert set(calls[1]["tools"]) == {"compact", "set_status"}
+    assert calls[1]["tool_choice"] == {"type": "function", "function": {"name": "compact"}}
     assert agent.status == "done"
 
 
@@ -2315,6 +5674,39 @@ async def test_work_text_miss_omits_long_content_from_history(tmp_workspace):
 
 
 @pytest.mark.asyncio
+async def test_empty_write_only_response_counts_as_write_miss(tmp_workspace):
+    calls = []
+
+    async def mock_llm(messages, model, tools=None, **kwargs):
+        calls.append({
+            "messages": messages,
+            "tools": [t["function"]["name"] for t in (tools or [])],
+        })
+        if len(calls) == 1:
+            return LLMResponse(usage=UsageRecord(input_tokens=10, output_tokens=0, model=model))
+        return LLMResponse(
+            tool_calls=[ToolCall(id="tc2", name="file_write", arguments={"path": "shared/out.txt", "content": "done"})],
+            usage=UsageRecord(input_tokens=10, output_tokens=5, model=model),
+        )
+
+    config = RuntimeConfig(workspace_root=tmp_workspace, log_dir=None, sandbox_backend="host", max_turns=5)
+    rt = Runtime(config=config, llm_call=mock_llm)
+    agent = rt.create_agent("Create `shared/out.txt`.")
+    agent._turns = 3
+    agent._artifact_nudge_count = 3
+
+    await rt._agent_loop(agent)
+
+    write_misses = [e for e in rt._events if e["event"] == "write_only_miss"]
+    assert write_misses
+    assert write_misses[0]["data"]["empty_response"] is True
+    assert calls[1]["tools"] == ["file_write"]
+    retry_card = "\n".join(m.get("content") or "" for m in calls[1]["messages"])
+    assert "Previous write-only artifact turns produced assistant text" in retry_card
+    assert (tmp_workspace / "shared" / "out.txt").read_text() == "done"
+
+
+@pytest.mark.asyncio
 async def test_write_miss_retry_filters_non_file_write_tools(tmp_workspace):
     calls = []
 
@@ -2340,6 +5732,196 @@ async def test_write_miss_retry_filters_non_file_write_tools(tmp_workspace):
     assert calls[0] == ["file_write"]
     assert [e for e in rt._events if e["event"] == "tool_call_skipped" and e["data"]["tool"] == "file_list"]
     assert (tmp_workspace / "shared" / "out.txt").read_text() == "done"
+
+
+@pytest.mark.asyncio
+async def test_work_no_tool_miss_retries_with_file_write_when_evidence_exists(tmp_workspace):
+    calls = []
+
+    async def mock_llm(messages, model, tools=None, **kwargs):
+        calls.append({
+            "messages": messages,
+            "tools": [t["function"]["name"] for t in (tools or [])],
+            "tool_choice": kwargs.get("tool_choice"),
+        })
+        return LLMResponse(
+            tool_calls=[ToolCall(id="tc1", name="file_write", arguments={"path": "shared/report.md", "content": "done"})],
+            usage=UsageRecord(input_tokens=10, output_tokens=5, model=model),
+        )
+
+    config = RuntimeConfig(workspace_root=tmp_workspace, log_dir=None, sandbox_backend="host", max_turns=5)
+    rt = Runtime(config=config, llm_call=mock_llm)
+    agent = rt.create_agent("Research the topic and write evidence report `shared/report.md`.")
+    agent._turns = 3
+    agent._action_miss_action = "work"
+    agent._action_miss_count = 2
+    agent._shell_commands.append("python3 collect_evidence.py")
+
+    await rt._agent_loop(agent)
+
+    assert calls[0]["tools"] == ["file_write"]
+    assert calls[0]["tool_choice"] == {"type": "function", "function": {"name": "file_write"}}
+    retry_card = "\n".join(m.get("content") or "" for m in calls[0]["messages"])
+    assert "Previous work turns did not execute a usable work tool" in retry_card
+    llm_event = [e for e in rt._events if e["event"] == "llm_done"][0]
+    assert llm_event["data"]["tool_scope"] == "retry_file_write_after_no_tool_miss"
+    assert llm_event["data"]["recommended_tool_choice"] == "file_write"
+    assert (tmp_workspace / "shared" / "report.md").read_text() == "done"
+
+
+@pytest.mark.asyncio
+async def test_work_no_tool_miss_retries_with_evidence_tools_when_evidence_missing(tmp_workspace):
+    calls = []
+
+    async def mock_llm(messages, model, tools=None, **kwargs):
+        calls.append({
+            "messages": messages,
+            "tools": [t["function"]["name"] for t in (tools or [])],
+            "tool_choice": kwargs.get("tool_choice"),
+        })
+        return LLMResponse(
+            tool_calls=[ToolCall(id="tc1", name="query", arguments={"q": "peer evidence for report", "limit": 5})],
+            usage=UsageRecord(input_tokens=10, output_tokens=5, model=model),
+        )
+
+    config = RuntimeConfig(workspace_root=tmp_workspace, log_dir=None, sandbox_backend="host", max_turns=6)
+    rt = Runtime(config=config, llm_call=mock_llm)
+    agent = rt.create_agent("Research the topic and write evidence report `shared/report.md`.")
+    agent._turns = 3
+    agent._action_miss_action = "work"
+    agent._action_miss_count = 2
+
+    await rt._agent_loop(agent)
+
+    assert set(calls[0]["tools"]) == {"file_read", "file_list", "grep", "query", "shell"}
+    assert calls[0]["tool_choice"] is None
+    retry_card = "\n".join(m.get("content") or "" for m in calls[0]["messages"])
+    assert "Runtime will narrow this retry turn to evidence tools" in retry_card
+    llm_event = [e for e in rt._events if e["event"] == "llm_done"][0]
+    assert llm_event["data"]["tool_scope"] == "retry_evidence_after_no_tool_miss"
+
+
+@pytest.mark.asyncio
+async def test_status_query_no_tool_miss_keeps_evidence_tools_for_discovery_report(tmp_workspace):
+    calls = []
+
+    async def mock_llm(messages, model, tools=None, **kwargs):
+        calls.append({
+            "tools": [t["function"]["name"] for t in (tools or [])],
+            "tool_choice": kwargs.get("tool_choice"),
+        })
+        return LLMResponse(
+            usage=UsageRecord(input_tokens=10, output_tokens=0, model=model),
+        )
+
+    config = RuntimeConfig(workspace_root=tmp_workspace, log_dir=None, sandbox_backend="host", max_turns=6)
+    rt = Runtime(config=config, llm_call=mock_llm)
+    agent = rt.create_agent("Search arXiv and write evidence report `shared/report.md`.")
+    agent._turns = 3
+    agent._last_query_turn = 3
+    agent._action_miss_action = "work"
+    agent._action_miss_count = 2
+
+    await rt._agent_loop(agent)
+
+    assert calls[0]["tool_choice"] is None
+    assert set(calls[0]["tools"]) == {"file_read", "file_list", "grep", "query", "shell"}
+    assert rt._artifact_write_needs_more_evidence(agent, ["shared/report.md"])
+
+
+@pytest.mark.asyncio
+async def test_auxiliary_miss_write_only_retry_recommends_file_write(tmp_workspace):
+    calls = []
+
+    async def mock_llm(messages, model, tools=None, **kwargs):
+        calls.append({
+            "tools": [t["function"]["name"] for t in (tools or [])],
+            "tool_choice": kwargs.get("tool_choice"),
+        })
+        return LLMResponse(
+            tool_calls=[ToolCall(id="tc1", name="file_write", arguments={"path": "shared/out.txt", "content": "done"})],
+            usage=UsageRecord(input_tokens=10, output_tokens=5, model=model),
+        )
+
+    config = RuntimeConfig(workspace_root=tmp_workspace, log_dir=None, sandbox_backend="host", max_turns=5)
+    rt = Runtime(config=config, llm_call=mock_llm)
+    agent = rt.create_agent("Create `shared/out.txt`.")
+    agent._turns = 3
+    agent._artifact_nudge_count = 3
+    agent._auxiliary_only_miss_count = 1
+
+    await rt._agent_loop(agent)
+
+    assert calls[0]["tools"] == ["file_write"]
+    assert calls[0]["tool_choice"] == {"type": "function", "function": {"name": "file_write"}}
+    llm_event = [e for e in rt._events if e["event"] == "llm_done"][0]
+    assert llm_event["data"]["tool_scope"] == "retry_primary_after_auxiliary_only_miss"
+    assert llm_event["data"]["recommended_tool_choice"] == "file_write"
+    assert (tmp_workspace / "shared" / "out.txt").read_text() == "done"
+
+
+@pytest.mark.asyncio
+async def test_stop_auxiliary_miss_retries_with_terminal_tools(tmp_workspace):
+    (tmp_workspace / "shared" / "out.txt").write_text("done")
+    calls = []
+
+    async def mock_llm(messages, model, tools=None, **kwargs):
+        calls.append({
+            "tools": [t["function"]["name"] for t in (tools or [])],
+            "tool_choice": kwargs.get("tool_choice"),
+        })
+        return LLMResponse(
+            tool_calls=[ToolCall(id="tc1", name="set_status", arguments={"action": "stop", "result": "done"})],
+            usage=UsageRecord(input_tokens=10, output_tokens=5, model=model),
+        )
+
+    config = RuntimeConfig(workspace_root=tmp_workspace, log_dir=None, sandbox_backend="host", max_turns=5)
+    rt = Runtime(config=config, llm_call=mock_llm)
+    agent = rt.create_agent("Create `shared/out.txt`.")
+    agent._turns = 3
+    agent._loop_action_plan = {"action": "stop", "reason": "current_terminal_action", "turn_added": 3}
+    agent._auxiliary_only_miss_count = 1
+
+    await rt._agent_loop(agent)
+
+    assert set(calls[0]["tools"]) == {"set_status", "compact"}
+    assert calls[0]["tool_choice"] == {"type": "function", "function": {"name": "set_status"}}
+    llm_event = [e for e in rt._events if e["event"] == "llm_done"][0]
+    assert llm_event["data"]["tool_scope"] == "retry_primary_after_auxiliary_only_miss"
+    assert llm_event["data"]["recommended_tool_choice"] == "set_status"
+    assert agent.status == "done"
+
+
+@pytest.mark.asyncio
+async def test_answer_stop_retry_uses_submit_answer_only(tmp_workspace):
+    calls = []
+
+    async def mock_llm(messages, model, tools=None, **kwargs):
+        calls.append({
+            "tools": [t["function"]["name"] for t in (tools or [])],
+            "tool_choice": kwargs.get("tool_choice"),
+        })
+        return LLMResponse(
+            tool_calls=[ToolCall(id="tc1", name="submit_answer", arguments={"answer": "candidate"})],
+            usage=UsageRecord(input_tokens=10, output_tokens=5, model=model),
+        )
+
+    config = RuntimeConfig(workspace_root=tmp_workspace, log_dir=None, sandbox_backend="host", max_turns=5)
+    rt = Runtime(config=config, llm_call=mock_llm)
+    agent = rt.create_agent('Solve and submit `shared/answer.json` with {"answer": "<answer-only string>"}.')
+    agent._turns = 3
+    agent._loop_action_plan = {"action": "stop", "reason": "answer_submission_pending", "turn_added": 3}
+    agent._auxiliary_only_miss_count = 1
+
+    await rt._agent_loop(agent)
+
+    assert calls[0]["tools"] == ["submit_answer"]
+    assert calls[0]["tool_choice"] == {"type": "function", "function": {"name": "submit_answer"}}
+    llm_event = [e for e in rt._events if e["event"] == "llm_done"][0]
+    assert llm_event["data"]["tool_scope"] == "answer_submit_only"
+    assert llm_event["data"]["recommended_tool_choice"] == "submit_answer"
+    assert agent.status == "done"
+    assert json.loads((tmp_workspace / "shared" / "answer.json").read_text()) == {"answer": "candidate"}
 
 
 @pytest.mark.asyncio
@@ -2461,6 +6043,168 @@ async def test_expected_file_write_registers_artifact_memory(tmp_workspace):
     agent = rt.agents["alpha"]
     assert "shared/out.txt" in [artifact.path for artifact in agent.artifacts]
     assert "shared/out.txt" in rt.memory.serialize(agent.id)["artifact_index"]
+
+
+@pytest.mark.asyncio
+async def test_answer_only_task_does_not_stop_before_evidence_or_spawn(tmp_workspace):
+    async def mock_llm(messages, model, tools=None, **kwargs):
+        return LLMResponse(
+            content="scope checked",
+            usage=UsageRecord(input_tokens=10, output_tokens=5, model=model),
+        )
+
+    config = RuntimeConfig(
+        workspace_root=tmp_workspace,
+        log_dir=None,
+        sandbox_backend="host",
+        max_turns=1,
+        loop_action_policy="constraint",
+        orchestration_preference="aggressive",
+        spawn_before_turn=1,
+        min_spawnable_workstreams=2,
+    )
+    rt = Runtime(config=config, llm_call=mock_llm)
+    agent = rt.create_agent(
+        "Research three separable evidence lanes and when ready submit `shared/answer.json` "
+        "with the final answer."
+    )
+    agent._turns = 1
+    agent._orchestration_nudge_sent = True
+
+    rt._refresh_loop_action_plan(agent, rt.missing_expected_outputs(agent))
+
+    assert agent._loop_action_plan is not None
+    assert agent._loop_action_plan["action"] == "create"
+    assert agent._loop_action_plan["reason"] in {
+        "spawnable_workstreams_before_solo_execution",
+        "answer_needs_research_before_submission",
+    }
+
+
+def test_final_answer_path_uses_submit_answer_guidance_not_artifact_guidance(tmp_workspace):
+    config = RuntimeConfig(workspace_root=tmp_workspace, log_dir=None, sandbox_backend="host")
+    rt = Runtime(config=config)
+    agent = rt.create_agent('Solve and submit `shared/answer.json` with {"answer": "<answer-only string>"}.')
+
+    system_prompt = agent.history[0]["content"]
+
+    assert "Answer submission guidance" in system_prompt
+    assert "Do not write it with file_write" in system_prompt
+    assert "Required output files:" not in system_prompt
+
+
+def test_answer_submission_not_ready_after_only_orientation_read(tmp_workspace):
+    config = RuntimeConfig(
+        workspace_root=tmp_workspace,
+        log_dir=None,
+        sandbox_backend="host",
+        loop_action_policy="constraint",
+        orchestration_preference="aggressive",
+        spawn_before_turn=1,
+        min_spawnable_workstreams=2,
+    )
+    rt = Runtime(config=config)
+    agent = rt.create_agent(
+        "Research three separable evidence lanes, inspect shared references, and submit `shared/answer.json`."
+    )
+    agent._turns = 2
+    agent._tool_calls = 2
+    agent._last_read_evidence_turn = 1
+    agent._create_resume_after_read = True
+    agent._orchestration_nudge_sent = True
+
+    assert not rt._answer_submission_ready(agent)
+
+    rt._refresh_loop_action_plan(agent, [])
+
+    assert agent._loop_action_plan["action"] == "create"
+    assert agent._loop_action_plan["reason"] in {
+        "resume_create_after_read_orientation",
+        "spawnable_workstreams_before_solo_execution",
+    }
+
+
+@pytest.mark.asyncio
+async def test_final_answer_file_write_does_not_submit_answer(tmp_workspace):
+    async def mock_llm(messages, model, tools=None, **kwargs):
+        return LLMResponse(
+            tool_calls=[
+                ToolCall(
+                    id="tc1",
+                    name="file_write",
+                    arguments={"path": "shared/answer.json", "content": '{"answer": "placeholder"}'},
+                )
+            ],
+            usage=UsageRecord(input_tokens=10, output_tokens=5, model=model),
+        )
+
+    config = RuntimeConfig(workspace_root=tmp_workspace, log_dir=None, sandbox_backend="host", max_turns=1)
+    rt = Runtime(config=config, llm_call=mock_llm)
+
+    await rt.run('Write `shared/answer.json` with {"answer": "<answer-only string>"}.')
+
+    agent = rt.agents["alpha"]
+    assert (tmp_workspace / "shared" / "answer.json").exists()
+    assert rt.missing_expected_outputs(agent) == []
+    assert agent.submitted_answer_path is None
+    assert agent.status == "failed"
+    assert "shared/answer.json" not in [artifact.path for artifact in agent.artifacts]
+    writes = [e for e in rt._events if e["event"] == "tool_call" and e["data"]["tool"] == "file_write"]
+    assert writes
+    write_result = json.loads(writes[-1]["data"]["result"])
+    assert write_result["artifact_warning"] == "terminal_answer_requires_submit_answer"
+
+
+@pytest.mark.asyncio
+async def test_final_answer_compact_stop_requires_submit_answer(tmp_workspace):
+    config = RuntimeConfig(workspace_root=tmp_workspace, log_dir=None, sandbox_backend="host", max_turns=2)
+    rt = Runtime(config=config)
+    agent = rt.create_agent('Write `shared/answer.json` with {"answer": "<answer-only string>"}.')
+    answer_path = tmp_workspace / "shared" / "answer.json"
+    answer_path.write_text('{"answer": "placeholder"}')
+
+    assert rt.missing_expected_outputs(agent) == []
+    result = await meta_compact(
+        {
+            "summary": "final answer appears to be placeholder",
+            "files": ["shared/answer.json"],
+            "stop_after": True,
+            "result": "placeholder",
+        },
+        agent,
+        rt,
+    )
+
+    assert result["blocked"] == "completion_evidence"
+    assert any(b["kind"] == "answer_submission" for b in result["blockers"])
+    assert agent.status == "running"
+
+
+@pytest.mark.asyncio
+async def test_submit_answer_writes_protocol_file_and_finishes_even_if_wrong(tmp_workspace):
+    config = RuntimeConfig(workspace_root=tmp_workspace, log_dir=None, sandbox_backend="host", max_turns=3)
+    rt = Runtime(config=config)
+    agent = rt.create_agent('Solve and submit `shared/answer.json` with {"answer": "<answer-only string>"}.')
+
+    result = await meta_submit_answer(
+        {
+            "answer": "placeholder",
+            "confidence": "low",
+            "evidence_refs": ["shared/evidence.md"],
+            "tags": ["benchmark:gaia", "task:demo"],
+        },
+        agent,
+        rt,
+    )
+
+    assert result["submitted_answer"] == "shared/answer.json"
+    assert agent.status == "done"
+    assert agent.result == "placeholder"
+    assert agent.submitted_answer_path == "shared/answer.json"
+    assert rt.missing_expected_outputs(agent) == []
+    assert rt.completion_blockers(agent) == []
+    assert json.loads((tmp_workspace / "shared" / "answer.json").read_text()) == {"answer": "placeholder"}
+    assert "shared/answer.json" in [artifact.path for artifact in agent.artifacts]
 
 
 @pytest.mark.asyncio
@@ -2735,10 +6479,170 @@ async def test_meta_query_all_and_single(runtime):
     assert result["action_state"] == "work"
     assert result["state_board"]["work_outline"] == "implement API"
     assert result["public_memory"]["public_summary"] == "building API"
+    assert result["task_ledger"]["agent_id"] == target.id
     all_result = await meta_query({}, q, runtime)
     assert all_result["count"] == len(runtime.agents)
     assert "state_board" in all_result
+    assert "task_ledger" in all_result
     assert target.id in all_result["public_memory"]
+
+
+def test_task_ledger_visible_in_every_loop_card(tmp_workspace):
+    config = RuntimeConfig(workspace_root=tmp_workspace, log_dir=None, sandbox_backend="host")
+    rt = Runtime(config=config)
+    agent = rt.create_agent("Research and write `shared/report.md`.", model="test")
+
+    card = rt._build_loop_action_context(agent, ["shared/report.md"], [])
+
+    assert card is not None
+    assert "[Task Ledger]" in card["content"]
+    assert f"you={agent.id}" in card["content"]
+    assert "shared/report.md=missing" in card["content"]
+    assert (tmp_workspace / "shared" / ".nanoma" / "task_ledger.json").exists()
+
+
+def test_ledger_update_persists_output_state(runtime, tmp_workspace):
+    agent = runtime.create_agent("Write `shared/report.md`.", model="test")
+
+    result = runtime.task_ledger_update(agent, {
+        "status": "blocked",
+        "output_path": "shared/report.md",
+        "output_status": "unverified",
+        "blockers": [{"kind": "needs_evidence", "message": "Need primary source"}],
+        "note": "Waiting for evidence.",
+    })
+
+    assert result["updated"] is True
+    path = tmp_workspace / "shared" / ".nanoma" / "task_ledger.json"
+    data = json.loads(path.read_text())
+    item = data["items"][agent.id]
+    assert item["status"] == "blocked"
+    assert item["expected_outputs"][0]["path"] == "shared/report.md"
+    assert item["expected_outputs"][0]["status"] == "unverified"
+    assert item["blockers"][0]["kind"] == "needs_evidence"
+
+
+def test_root_steward_mode_restricts_worker_tools(tmp_workspace):
+    config = RuntimeConfig(workspace_root=tmp_workspace, log_dir=None, sandbox_backend="host")
+    rt = Runtime(config=config)
+    root = rt.create_agent("Coordinate evidence collection and final answer.", model="test")
+    child = rt.create_agent("Collect evidence.", model="test", parent=root.id)
+    root.children.add(child.id)
+
+    tools, scope = rt._tools_for_loop_turn(root, "work", [])
+
+    assert scope == "root_steward"
+    assert {"query", "ledger_read", "ledger_update"}.issubset(tools)
+    assert "shell" not in tools
+    assert "file_write" not in tools
+    assert not rt._can_create_child(root)
+
+
+def test_loop_action_card_fixes_current_action(tmp_workspace):
+    config = RuntimeConfig(workspace_root=tmp_workspace, log_dir=None, sandbox_backend="host")
+    rt = Runtime(config=config)
+    agent = rt.create_agent("Write `shared/report.md`.", model="test")
+    agent._loop_action_plan = {"action": "work", "reason": "missing_artifacts"}
+
+    card = rt._build_loop_action_context(agent, ["shared/report.md"], [])
+
+    assert card is not None
+    assert "Current action is fixed by runtime: work" in card["content"]
+    assert "Do not re-select among create, read, message, work, compact, stop" in card["content"]
+    assert "Choose exactly one next action" not in card["content"]
+
+
+def test_parse_selected_loop_action_accepts_json_and_text(tmp_workspace):
+    config = RuntimeConfig(workspace_root=tmp_workspace, log_dir=None, sandbox_backend="host")
+    rt = Runtime(config=config)
+
+    assert rt._parse_selected_loop_action('{"action":"message","reason":"coordinate"}') == ("message", "coordinate")
+    assert rt._parse_selected_loop_action("I would compact now.") == ("compact", "I would compact now.")
+    assert rt._parse_selected_loop_action('{"action":"invent","reason":"bad"}') == ("", "")
+
+
+@pytest.mark.asyncio
+async def test_selector_skips_reselection_after_same_action_miss(tmp_workspace, monkeypatch):
+    calls = {"n": 0}
+
+    async def mock_llm(messages, model, tools=None, **kwargs):
+        calls["n"] += 1
+        return LLMResponse(
+            content='{"action":"read","reason":"would reselect"}',
+            usage=UsageRecord(input_tokens=10, output_tokens=5, model=model),
+        )
+
+    config = RuntimeConfig(
+        workspace_root=tmp_workspace,
+        log_dir=None,
+        sandbox_backend="host",
+        loop_action_policy="constraint",
+        two_stage_action_selection=True,
+    )
+    monkeypatch.setattr("nanoma.core.openai_compatible_call", mock_llm)
+    rt = Runtime(config=config, llm_call=mock_llm)
+    agent = rt.create_agent("Write `shared/report.md`.", model="test")
+    agent._loop_action_plan = {"action": "work", "reason": "missing_artifacts"}
+    agent._action_miss_action = "work"
+    agent._action_miss_count = 1
+
+    await rt._maybe_select_loop_action(agent, ["shared/report.md"])
+
+    assert calls["n"] == 0
+    assert agent._loop_action_plan["action"] == "work"
+    assert agent._loop_action_plan["selected_by"] == "runtime_retry_after_action_miss"
+    assert [e for e in rt._events if e["event"] == "loop_action_selector_skipped"]
+
+
+def test_root_steward_delegates_final_delivery_to_create_scope(tmp_workspace):
+    config = RuntimeConfig(
+        workspace_root=tmp_workspace,
+        log_dir=None,
+        sandbox_backend="host",
+        loop_action_policy="constraint",
+        max_agents=10,
+        max_depth=4,
+    )
+    rt = Runtime(config=config)
+    root = rt.create_agent(
+        "Coordinate evidence, then provide final answer using submit_answer(answer=...).",
+        model="test",
+        orchestration_preference="parallel",
+    )
+    worker = rt.create_agent(
+        "Find reliable answer evidence.",
+        model="test",
+        parent=root.id,
+        role="evidence",
+        group_id="gaia",
+        current_task_tags=["role:evidence", "status:verified", "confidence:high"],
+    )
+    root.children.add(worker.id)
+    evidence_path = tmp_workspace / "shared" / "evidence.md"
+    evidence_path.write_text("Status: verified\nAnswer: Egalitarian\n")
+    worker.status = "done"
+    worker.result = "Verified answer: Egalitarian"
+    worker.artifacts.append(Artifact("shared/evidence.md", evidence_path, agent_id=worker.id))
+    rt.memory.update(
+        worker.id,
+        public_summary="Verified answer evidence: Egalitarian.",
+        add_artifacts=["shared/evidence.md"],
+        tags=worker.current_task_tags,
+    )
+
+    rt._refresh_loop_action_plan(root, [])
+    tools, scope = rt._tools_for_loop_turn(root, root._loop_action_plan["action"], [])
+    card = rt._build_loop_action_context(root, [], [])
+
+    assert root._loop_action_plan["action"] == "create"
+    assert root._loop_action_plan["reason"] == "delegate_final_delivery"
+    assert root._loop_action_plan["root_steward"] is True
+    assert root._loop_action_plan["candidate_scores"][0]["reason"] == "delegate_final_delivery"
+    assert scope == "final_delivery_handoff"
+    assert {"spawn", "create_agent", "spawn_many"} == tools
+    assert card is not None
+    assert "Final delivery handoff" in card["content"]
+    assert "Prefer one focused finalizer/delivery agent" in card["content"]
 
 
 @pytest.mark.asyncio
@@ -2794,6 +6698,50 @@ async def test_meta_query_exposes_progress_and_sorts_more_complete_peers(runtime
     assert result["agents"][0]["progress"]["outputs_complete"] is True
     assert result["agents"][0]["progress"]["missing_outputs"] == []
     assert result["agents"][1]["progress"]["missing_outputs"] == ["shared/slow.txt"]
+
+
+@pytest.mark.asyncio
+async def test_meta_query_ignores_unknown_agent_id_when_filter_is_present(runtime):
+    target = runtime.create_agent("target", role="worker", group_id="diag")
+    q = runtime.create_agent("querier")
+
+    result = await meta_query({"agent_id": "made-up-id", "filter": {"group_id": "diag"}, "limit": 5}, q, runtime)
+
+    assert result["count"] == 1
+    assert result["agents"][0]["id"] == target.id
+    query_events = [e for e in runtime._events if e["event"] == "query"]
+    assert query_events[-1]["data"]["scope"] == "agents"
+    assert query_events[-1]["data"]["filter"] == {"group_id": "diag"}
+
+
+@pytest.mark.asyncio
+async def test_meta_query_filter_agent_id_matches_direct_agent(runtime):
+    target = runtime.create_agent("target", role="worker")
+    q = runtime.create_agent("querier")
+
+    result = await meta_query({"filter": {"agent_id": target.id}, "limit": 5}, q, runtime)
+
+    assert result["count"] == 1
+    assert result["agents"][0]["id"] == target.id
+
+
+@pytest.mark.asyncio
+async def test_meta_query_finds_agents_by_stable_identity_tags(runtime):
+    target = runtime.create_agent(
+        "target",
+        role="Evidence collector - Lane 2",
+        group_id="gaia-l2-c61d",
+        current_task_tags=["Benchmark: GAIA", "Task:C61D"],
+    )
+    q = runtime.create_agent("querier")
+
+    by_id_tag = await meta_query({"tags": [f"Agent:{target.id}"]}, q, runtime)
+    by_role_tag = await meta_query({"tags": ["Role: Evidence"]}, q, runtime)
+    by_lane_tag = await meta_query({"filter": {"tags": ["Lane: 2"]}}, q, runtime)
+
+    assert target.id in {a["id"] for a in by_id_tag["agents"]}
+    assert target.id in {a["id"] for a in by_role_tag["agents"]}
+    assert target.id in {a["id"] for a in by_lane_tag["agents"]}
 
 
 @pytest.mark.asyncio
@@ -2913,7 +6861,140 @@ async def test_meta_compact_and_query_public_memory(runtime):
     queried = await meta_query({"agent_id": a.id}, a, runtime)
     assert queried["public_memory"]["public_summary"] == "condensed"
     assert queried["public_memory"]["experience_cards"][0]["summary"] == "did work"
-    assert queried["state_board"]["action_state"] == "compact"
+    assert queried["public_memory"]["experience_cards"][0]["memory_kind"] == "experience"
+    assert "memory_kind:experience" in queried["public_memory"]["experience_cards"][0]["tags"]
+    assert "memory_source:compact" in queried["public_memory"]["experience_cards"][0]["tags"]
+    assert queried["state_board"]["action_state"] == "work"
+
+
+@pytest.mark.asyncio
+async def test_compact_memory_layers_preserve_kb_tags_for_query(runtime):
+    a = runtime.create_agent(
+        "GAIA worker",
+        role="Evidence collector - Lane 3",
+        group_id="gaia-l2-c61d",
+        current_task_tags=["Benchmark: GAIA", "Task:C61D", "Source:PDF"],
+    )
+
+    result = await meta_compact(
+        {
+            "summary": "Found supporting PDF evidence for the answer.",
+            "tags": ["Status:Complete", "Citation:Paper"],
+            "files": ["shared/evidence.md"],
+            "memory_kind": "evidence",
+            "memory_source": "artifact",
+            "evidence": ["PDF", "Cross Check"],
+        },
+        a,
+        runtime,
+    )
+    assert result["scheduled"] is True
+
+    runtime._execute_compact(a)
+
+    memory = runtime.memory.serialize(a.id)
+    tags = set(memory["tags"])
+    card = memory["experience_cards"][0]
+    card_tags = set(card["tags"])
+    assert card["memory_kind"] == "evidence"
+    assert card["memory_source"] == "artifact"
+    assert "memory_kind:evidence" in card_tags
+    assert "memory_source:artifact" in card_tags
+    assert "evidence:pdf" in card_tags
+    assert "agent:" + a.id in tags
+    assert {"role:evidence", "lane:3", "benchmark:gaia", "task:c61d", "source:pdf"} <= tags
+
+    read = runtime.memory.read(intent="find GAIA evidence", seed_terms=["memory_kind:evidence", "benchmark:gaia"])
+    assert read["matches"]
+    assert read["matches"][0]["matched_cards"]
+
+
+@pytest.mark.asyncio
+async def test_meta_compact_splits_summary_into_tagged_experience_cards(runtime):
+    a = runtime.create_agent("worker", current_task_tags=["Benchmark:GAIA", "Task:C61D"])
+    summary = (
+        "# Evidence\nFound arXiv 2207.01510 and extracted Standardization vs Localization.\n\n"
+        "# Physics\nFound arXiv 1608.03637 and extracted egalitarian societies.\n\n"
+        "# Answer\nThe overlap should be egalitarian."
+    )
+
+    result = await meta_compact({"summary": summary, "tags": ["Role:Synthesizer"]}, a, runtime)
+    assert result["scheduled"] is True
+    runtime._execute_compact(a)
+
+    memory = runtime.memory.serialize(a.id)
+    cards = memory["experience_cards"]
+    assert len(cards) >= 3
+    assert any("2207.01510" in card["summary"] for card in cards)
+    assert any("1608.03637" in card["summary"] for card in cards)
+    assert all("role:synthesizer" in card["tags"] for card in cards)
+    assert all("memory_source:compact" in card["tags"] for card in cards)
+    assert any("memory_part:1" in card["tags"] for card in cards)
+
+    read = runtime.memory.read(intent="physics evidence", seed_terms=["role:synthesizer"])
+    assert read["matches"][0]["matched_cards"]
+
+
+@pytest.mark.asyncio
+async def test_meta_compact_truth_guard_downgrades_unverified_completion(runtime):
+    a = runtime.create_agent("worker")
+    result = await meta_compact(
+        {
+            "summary": "Status: UNVERIFIED. Low confidence; requires verification before final use.",
+            "tags": ["status:complete", "role:evidence"],
+            "stop_after": True,
+            "result": "confirmed answer",
+        },
+        a,
+        runtime,
+    )
+    assert result["scheduled"] is True
+
+    runtime._execute_compact(a)
+
+    memory = runtime.memory.serialize(a.id)
+    assert "status:complete" not in memory["tags"]
+    assert "status:unverified" in memory["tags"]
+    assert "needs:verification" in memory["tags"]
+    assert "confidence:low" in memory["tags"]
+    assert memory["public_summary"].startswith("[UNVERIFIED / NEEDS VERIFICATION]")
+    assert a.status == "running"
+    assert a.action_state == "work"
+    assert a.result is None
+    assert memory["active_task"] is not None
+    assert [e for e in runtime._events if e["event"] == "compact_truth_guard"]
+
+
+@pytest.mark.asyncio
+async def test_meta_compact_truth_guard_uses_artifact_uncertainty(runtime, tmp_workspace):
+    a = runtime.create_agent("worker")
+    artifact_path = tmp_workspace / "shared" / "report.md"
+    artifact_path.write_text("Status: BEST EFFORT / UNVERIFIED\nConfidence: Low\n")
+    a.artifacts.append(Artifact("shared/report.md", artifact_path))
+
+    result = await meta_compact(
+        {
+            "summary": "Evidence complete and ready for final synthesis.",
+            "files": ["shared/report.md"],
+            "tags": ["status:complete", "role:evidence"],
+            "stop_after": True,
+            "result": "ready",
+        },
+        a,
+        runtime,
+    )
+    assert result["scheduled"] is True
+
+    runtime._execute_compact(a)
+
+    memory = runtime.memory.serialize(a.id)
+    assert "status:complete" not in memory["tags"]
+    assert "status:unverified" in memory["tags"]
+    assert memory["public_summary"].startswith("[UNVERIFIED / NEEDS VERIFICATION]")
+    assert a.status == "running"
+    assert a.action_state == "work"
+    assert a.result is None
+    assert memory["active_task"] is not None
 
 
 @pytest.mark.asyncio
@@ -2929,6 +7010,8 @@ async def test_meta_compact_stop_after_marks_done(runtime):
     assert memory["public_summary"] == "final compact"
     assert memory["active_task"] is None
     assert "done" in memory["tags"]
+    assert any(card["memory_kind"] == "terminal" for card in memory["experience_cards"])
+    assert "memory_kind:terminal" in memory["tags"]
 
 
 @pytest.mark.asyncio
@@ -3216,6 +7299,21 @@ async def test_tool_file_list(tmp_workspace):
     names = [e["name"] for e in result["entries"]]
     assert "a.txt" in names
     assert "b.txt" in names
+
+
+@pytest.mark.asyncio
+async def test_tool_file_list_expands_shared_alias(tmp_workspace):
+    from nanoma.tools import tool_file_list
+
+    ctx = ToolContext(shared_dir=tmp_workspace / "shared", workspace_root=tmp_workspace)
+    ws = tmp_workspace / "agent"
+    ws.mkdir()
+    (tmp_workspace / "shared" / "evidence.txt").write_text("ok")
+
+    result = await tool_file_list({"path": "$SHARED"}, ws, ctx)
+
+    assert "error" not in result
+    assert [entry["name"] for entry in result["entries"]] == ["evidence.txt"]
 
 
 @pytest.mark.asyncio
@@ -3563,6 +7661,850 @@ def test_count_message_tokens():
     assert tokens > 0
 
 
+def test_mcp_schemas_keep_optional_arguments_model_compat_is_scoped():
+    from nanoma.tools import WORK_TOOLS
+
+    schemas = [
+        WORK_TOOLS["file_list"]["schema"],
+        META_TOOLS["spawn_many"]["schema"],
+        META_TOOLS["query"]["schema"],
+        META_TOOLS["wait"]["schema"],
+        META_TOOLS["set_status"]["schema"],
+        META_TOOLS["get_cost"]["schema"],
+        WORK_TOOLS["bt_aggregate"]["schema"],
+    ]
+
+    assert [
+        schema["function"]["parameters"].get("required")
+        for schema in schemas
+    ] == [None, None, None, None, None, None, None]
+    assert "enum" not in META_TOOLS["set_status"]["schema"]["function"]["parameters"]["properties"]["action"]
+
+    untouched = _adapt_tool_schemas_for_model(schemas, "deepseek-v4-flash")
+    assert untouched is schemas
+    assert [schema["function"]["parameters"].get("required") for schema in untouched] == [None, None, None, None, None, None, None]
+
+    adapted = _adapt_tool_schemas_for_model(schemas, "deepseek-v4-pro")
+    assert adapted is not schemas
+    assert [schema["function"]["parameters"].get("required") for schema in adapted] == [
+        ["path"],
+        ["agents"],
+        ["filter"],
+        ["agent_ids"],
+        ["action"],
+        [],
+        ["directory"],
+    ]
+    assert "enum" in adapted[4]["function"]["parameters"]["properties"]["action"]
+    assert [schema["function"]["parameters"].get("required") for schema in schemas] == [None, None, None, None, None, None, None]
+
+
+def test_v4_pro_meta_status_tools_are_adapted_without_removal():
+    schemas = [
+        META_TOOLS["get_cost"]["schema"],
+        META_TOOLS["set_status"]["schema"],
+        META_TOOLS["compact"]["schema"],
+    ]
+
+    adapted = _adapt_tool_schemas_for_model(schemas, "deepseek-v4-pro")
+
+    assert [schema["function"]["name"] for schema in adapted] == ["get_cost", "set_status", "compact"]
+    assert adapted[0]["function"]["parameters"].get("required") == []
+    assert adapted[1]["function"]["parameters"].get("required") == ["action"]
+    assert adapted[2]["function"]["parameters"].get("required") == ["summary"]
+    assert "enum" in adapted[1]["function"]["parameters"]["properties"]["action"]
+
+
+def test_v4_pro_schema_compat_matches_short_and_provider_versioned_names():
+    assert _model_needs_required_arg_tool_schema("deepseek-v4-pro")
+    assert _model_needs_required_arg_tool_schema("deepseek/deepseek-v4-pro")
+    assert _model_needs_required_arg_tool_schema("deepseek/deepseek-v4-pro-20260423")
+    assert not _model_needs_required_arg_tool_schema("deepseek-v4-flash")
+
+
+def test_v4_pro_named_tool_choice_downgrades_to_schema_only_auto():
+    named_choice = {"type": "function", "function": {"name": "file_write"}}
+
+    assert _adapt_tool_choice_for_model(named_choice, "deepseek-v4-pro") == "auto"
+    assert _adapt_tool_choice_for_model(named_choice, "deepseek/deepseek-v4-pro") == "auto"
+    assert _adapt_tool_choice_for_model("auto", "deepseek-v4-pro") == "auto"
+    assert _adapt_tool_choice_for_model(None, "deepseek-v4-pro") is None
+    assert _adapt_tool_choice_for_model(named_choice, "deepseek-v4-flash") is named_choice
+
+
+def test_empty_zero_usage_llm_response_is_transient():
+    data = {
+        "choices": [{"message": {"role": "assistant", "content": ""}, "finish_reason": "stop"}],
+        "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
+    }
+
+    with pytest.raises(TransientEmptyLLMResponse):
+        _raise_for_transient_empty_response(data)
+
+
+def test_empty_content_with_real_usage_is_not_transient():
+    data = {
+        "choices": [{"message": {"role": "assistant", "content": ""}, "finish_reason": "stop"}],
+        "usage": {"prompt_tokens": 123, "completion_tokens": 0, "total_tokens": 123},
+    }
+
+    _raise_for_transient_empty_response(data)
+
+
+def test_pro_tool_turn_text_zero_usage_is_transient_transport_miss():
+    data = {
+        "choices": [{"message": {"role": "assistant", "content": "I will call spawn_many now."}, "finish_reason": "stop"}],
+        "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
+    }
+
+    with pytest.raises(TransientToolCallTransportMiss):
+        _raise_for_transient_tool_call_transport_miss(
+            data,
+            model="deepseek-v4-pro",
+            tools=[META_TOOLS["spawn_many"]["schema"]],
+        )
+
+
+def test_non_pro_tool_turn_text_zero_usage_is_not_transport_miss():
+    data = {
+        "choices": [{"message": {"role": "assistant", "content": "I will call spawn_many now."}, "finish_reason": "stop"}],
+        "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
+    }
+
+    _raise_for_transient_tool_call_transport_miss(
+        data,
+        model="deepseek-v4-flash",
+        tools=[META_TOOLS["spawn_many"]["schema"]],
+    )
+
+
+def test_tool_retry_repair_is_scoped_to_v4_pro_tool_transients():
+    tools = [META_TOOLS["spawn_many"]["schema"]]
+
+    assert _should_repair_tool_retry(TransientEmptyLLMResponse("empty"), model="deepseek-v4-pro", tools=tools)
+    assert not _should_repair_tool_retry(TransientEmptyLLMResponse("empty"), model="deepseek-v4-flash", tools=tools)
+    assert not _should_repair_tool_retry(RuntimeError("other"), model="deepseek-v4-pro", tools=tools)
+    assert not _should_repair_tool_retry(TransientEmptyLLMResponse("empty"), model="deepseek-v4-pro", tools=[])
+
+
+def test_body_with_tool_retry_repair_appends_transient_message_without_mutating_original():
+    body = {"model": "deepseek-v4-pro", "messages": [{"role": "user", "content": "spawn"}]}
+
+    repaired = _body_with_tool_retry_repair(body)
+
+    assert repaired is not body
+    assert len(body["messages"]) == 1
+    assert len(repaired["messages"]) == 2
+    assert repaired["messages"][-1]["role"] == "user"
+    assert "valid tool_call" in repaired["messages"][-1]["content"]
+
+
+@pytest.mark.asyncio
+async def test_openai_compatible_call_retries_empty_zero_usage_response(monkeypatch):
+    import nanoma.llm as llm_mod
+
+    responses = [
+        {
+            "choices": [{"message": {"role": "assistant", "content": ""}, "finish_reason": "stop"}],
+            "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
+        },
+        {
+            "choices": [{"message": {"role": "assistant", "content": "ok"}, "finish_reason": "stop"}],
+            "usage": {"prompt_tokens": 7, "completion_tokens": 3, "total_tokens": 10},
+        },
+    ]
+
+    class FakeClient:
+        is_closed = False
+
+        def __init__(self):
+            self.calls = 0
+
+        async def post(self, *args, **kwargs):
+            data = responses[self.calls]
+            self.calls += 1
+            request = httpx.Request("POST", "https://example.test/v1/chat/completions")
+            return httpx.Response(200, json=data, request=request)
+
+    fake = FakeClient()
+    monkeypatch.setattr(llm_mod, "_shared_client", fake)
+
+    response = await openai_compatible_call(
+        [{"role": "user", "content": "hello"}],
+        "model-x",
+        base_url="https://example.test/v1",
+        api_key="test-key",
+        retry_config=RetryConfig(max_retries=1, base_delay=0, max_delay=0),
+    )
+
+    assert fake.calls == 2
+    assert response.content == "ok"
+    assert response.usage.input_tokens == 7
+    assert response.usage.output_tokens == 3
+
+
+@pytest.mark.asyncio
+async def test_openai_compatible_call_logs_http_status_error_details(monkeypatch, tmp_path):
+    import nanoma.llm as llm_mod
+
+    class FakeClient:
+        is_closed = False
+
+        async def post(self, *args, **kwargs):
+            request = httpx.Request("POST", "https://example.test/v1/chat/completions")
+            return httpx.Response(
+                418,
+                json={"error": {"message": "bad tool schema", "type": "invalid_request_error"}},
+                headers={"x-request-id": "req-test", "retry-after": "5"},
+                request=request,
+            )
+
+    monkeypatch.setattr(llm_mod, "_shared_client", FakeClient())
+    monkeypatch.setattr(llm_mod, "_log_dir", tmp_path)
+    monkeypatch.setattr(llm_mod, "_log_counter", 0)
+
+    with pytest.raises(httpx.HTTPStatusError):
+        await openai_compatible_call(
+            [{"role": "user", "content": "hello"}],
+            "deepseek-v4-pro",
+            tools=[META_TOOLS["spawn_many"]["schema"]],
+            base_url="https://example.test/v1",
+            api_key="test-key",
+            retry_config=RetryConfig(max_retries=0, base_delay=0, max_delay=0),
+        )
+
+    logs = list(tmp_path.glob("*_deepseek-v4-pro.jsonl"))
+    assert len(logs) == 1
+    payload = json.loads(logs[0].read_text())
+    assert payload["error"] == "HTTPStatusError"
+    assert payload["response_status"] == 418
+    assert payload["response_json"]["error"]["message"] == "bad tool schema"
+    assert payload["response_text"]
+    assert payload["response_headers"]["x-request-id"] == "req-test"
+    assert payload["retry"] is False
+    assert payload["request_url"] == "https://example.test/v1/chat/completions"
+
+
+@pytest.mark.asyncio
+async def test_openai_compatible_call_does_not_retry_non_retryable_http_status(monkeypatch, tmp_path):
+    import nanoma.llm as llm_mod
+
+    class FakeClient:
+        is_closed = False
+
+        def __init__(self):
+            self.calls = 0
+
+        async def post(self, *args, **kwargs):
+            self.calls += 1
+            request = httpx.Request("POST", "https://example.test/v1/chat/completions")
+            return httpx.Response(
+                402,
+                json={"error": {"message": "Insufficient Balance", "type": "invalid_request_error"}},
+                request=request,
+            )
+
+    fake = FakeClient()
+    monkeypatch.setattr(llm_mod, "_shared_client", fake)
+    monkeypatch.setattr(llm_mod, "_log_dir", tmp_path)
+    monkeypatch.setattr(llm_mod, "_log_counter", 0)
+
+    with pytest.raises(httpx.HTTPStatusError):
+        await openai_compatible_call(
+            [{"role": "user", "content": "hello"}],
+            "deepseek-v4-pro",
+            base_url="https://example.test/v1",
+            api_key="test-key",
+            retry_config=RetryConfig(max_retries=3, base_delay=0, max_delay=0),
+        )
+
+    logs = list(tmp_path.glob("*_deepseek-v4-pro.jsonl"))
+    assert fake.calls == 1
+    assert len(logs) == 1
+    payload = json.loads(logs[0].read_text())
+    assert payload["response_status"] == 402
+    assert payload["response_json"]["error"]["message"] == "Insufficient Balance"
+    assert payload["retry"] is False
+
+
+@pytest.mark.asyncio
+async def test_openai_compatible_call_applies_required_arg_schema_only_for_v4_pro(monkeypatch):
+    import nanoma.llm as llm_mod
+
+    class FakeClient:
+        is_closed = False
+
+        def __init__(self):
+            self.bodies = []
+
+        async def post(self, *args, **kwargs):
+            self.bodies.append(kwargs["json"])
+            request = httpx.Request("POST", "https://example.test/v1/chat/completions")
+            return httpx.Response(
+                200,
+                json={
+                    "choices": [{"message": {"role": "assistant", "content": "ok"}, "finish_reason": "stop"}],
+                    "usage": {"prompt_tokens": 7, "completion_tokens": 3, "total_tokens": 10},
+                },
+                request=request,
+            )
+
+    tool = META_TOOLS["spawn_many"]["schema"]
+    fake = FakeClient()
+    monkeypatch.setattr(llm_mod, "_shared_client", fake)
+
+    await openai_compatible_call(
+        [{"role": "user", "content": "hello"}],
+        "deepseek-v4-flash",
+        tools=[tool],
+        base_url="https://example.test/v1",
+        api_key="test-key",
+        retry_config=RetryConfig(max_retries=0, base_delay=0, max_delay=0),
+    )
+    await openai_compatible_call(
+        [{"role": "user", "content": "hello"}],
+        "deepseek-v4-pro",
+        tools=[tool],
+        base_url="https://example.test/v1",
+        api_key="test-key",
+        retry_config=RetryConfig(max_retries=0, base_delay=0, max_delay=0),
+    )
+
+    assert fake.bodies[0]["tools"][0]["function"]["parameters"].get("required") is None
+    assert fake.bodies[1]["tools"][0]["function"]["parameters"].get("required") == ["agents"]
+    assert tool["function"]["parameters"].get("required") is None
+
+
+@pytest.mark.asyncio
+async def test_openai_compatible_call_uses_schema_only_for_v4_pro_named_tool_choice(monkeypatch):
+    import nanoma.llm as llm_mod
+    from nanoma.tools import WORK_TOOLS
+
+    class FakeClient:
+        is_closed = False
+
+        def __init__(self):
+            self.bodies = []
+
+        async def post(self, *args, **kwargs):
+            self.bodies.append(kwargs["json"])
+            request = httpx.Request("POST", "https://example.test/v1/chat/completions")
+            return httpx.Response(
+                200,
+                json={
+                    "choices": [
+                        {
+                            "message": {
+                                "role": "assistant",
+                                "tool_calls": [
+                                    {
+                                        "id": "call_1",
+                                        "type": "function",
+                                        "function": {
+                                            "name": "file_write",
+                                            "arguments": json.dumps({"path": "shared/out.txt", "content": "ok"}),
+                                        },
+                                    }
+                                ],
+                            },
+                            "finish_reason": "tool_calls",
+                        }
+                    ],
+                    "usage": {"prompt_tokens": 7, "completion_tokens": 3, "total_tokens": 10},
+                },
+                request=request,
+            )
+
+    fake = FakeClient()
+    monkeypatch.setattr(llm_mod, "_shared_client", fake)
+
+    await openai_compatible_call(
+        [{"role": "user", "content": "write"}],
+        "deepseek-v4-pro",
+        tools=[WORK_TOOLS["file_write"]["schema"]],
+        tool_choice={"type": "function", "function": {"name": "file_write"}},
+        base_url="https://example.test/v1",
+        api_key="test-key",
+        retry_config=RetryConfig(max_retries=0, base_delay=0, max_delay=0),
+    )
+
+    assert fake.bodies[0]["tool_choice"] == "auto"
+    assert [tool["function"]["name"] for tool in fake.bodies[0]["tools"]] == ["file_write"]
+
+
+@pytest.mark.asyncio
+async def test_openai_compatible_call_sanitizes_old_tool_names_for_v4_pro_schema_only(monkeypatch):
+    import nanoma.llm as llm_mod
+    from nanoma.tools import WORK_TOOLS
+
+    class FakeClient:
+        is_closed = False
+
+        def __init__(self):
+            self.bodies = []
+
+        async def post(self, *args, **kwargs):
+            self.bodies.append(kwargs["json"])
+            request = httpx.Request("POST", "https://example.test/v1/chat/completions")
+            return httpx.Response(
+                200,
+                json={
+                    "choices": [
+                        {
+                            "message": {
+                                "role": "assistant",
+                                "tool_calls": [
+                                    {
+                                        "id": "call_1",
+                                        "type": "function",
+                                        "function": {
+                                            "name": "file_write",
+                                            "arguments": json.dumps({"path": "shared/out.txt", "content": "ok"}),
+                                        },
+                                    }
+                                ],
+                            },
+                            "finish_reason": "tool_calls",
+                        }
+                    ],
+                    "usage": {"prompt_tokens": 7, "completion_tokens": 3, "total_tokens": 10},
+                },
+                request=request,
+            )
+
+    fake = FakeClient()
+    monkeypatch.setattr(llm_mod, "_shared_client", fake)
+    messages = [
+        {"role": "system", "content": "Use shell and file_list earlier, but now write."},
+        {
+            "role": "assistant",
+            "content": "I will call shell.",
+            "tool_calls": [
+                {
+                    "id": "old",
+                    "type": "function",
+                    "function": {"name": "shell", "arguments": json.dumps({"command": "ls"})},
+                }
+            ],
+        },
+        {"role": "tool", "tool_call_id": "old", "content": '{"stdout": ""}'},
+        {"role": "user", "content": "Ignore file_list, query_help, and call file_write."},
+    ]
+
+    await openai_compatible_call(
+        messages,
+        "deepseek-v4-pro",
+        tools=[WORK_TOOLS["file_write"]["schema"]],
+        tool_choice={"type": "function", "function": {"name": "file_write"}},
+        base_url="https://example.test/v1",
+        api_key="test-key",
+        retry_config=RetryConfig(max_retries=0, base_delay=0, max_delay=0),
+    )
+
+    body_messages = fake.bodies[0]["messages"]
+    encoded = json.dumps(body_messages)
+    assert '"tool_calls"' not in encoded
+    assert '"role": "tool"' not in encoded
+    assert "shell" not in encoded
+    assert "file_list" not in encoded
+    assert "query_help" not in encoded
+    assert "file_write" in encoded
+
+
+@pytest.mark.asyncio
+async def test_openai_compatible_call_sanitizes_target_tool_calls_for_v4_pro_schema_only(monkeypatch):
+    import nanoma.llm as llm_mod
+
+    class FakeClient:
+        is_closed = False
+
+        def __init__(self):
+            self.bodies = []
+
+        async def post(self, *args, **kwargs):
+            self.bodies.append(kwargs["json"])
+            request = httpx.Request("POST", "https://example.test/v1/chat/completions")
+            return httpx.Response(
+                200,
+                json={
+                    "choices": [
+                        {
+                            "message": {
+                                "role": "assistant",
+                                "tool_calls": [
+                                    {
+                                        "id": "call_1",
+                                        "type": "function",
+                                        "function": {
+                                            "name": "spawn_many",
+                                            "arguments": json.dumps({"agents": [{"task": "child"}]}),
+                                        },
+                                    }
+                                ],
+                            },
+                            "finish_reason": "tool_calls",
+                        }
+                    ],
+                    "usage": {"prompt_tokens": 7, "completion_tokens": 3, "total_tokens": 10},
+                },
+                request=request,
+            )
+
+    fake = FakeClient()
+    monkeypatch.setattr(llm_mod, "_shared_client", fake)
+    messages = [
+        {"role": "system", "content": "spawn"},
+        {
+            "role": "assistant",
+            "content": "I will spawn.",
+            "tool_calls": [
+                {
+                    "id": "old_spawn",
+                    "type": "function",
+                    "function": {
+                        "name": "spawn_many",
+                        "arguments": json.dumps({"agents": [{"task": "old child"}]}),
+                    },
+                }
+            ],
+        },
+        {"role": "tool", "tool_call_id": "old_spawn", "content": '{"created": 0}'},
+    ]
+
+    await openai_compatible_call(
+        messages,
+        "deepseek-v4-pro",
+        tools=[META_TOOLS["spawn_many"]["schema"]],
+        tool_choice={"type": "function", "function": {"name": "spawn_many"}},
+        base_url="https://example.test/v1",
+        api_key="test-key",
+        retry_config=RetryConfig(max_retries=0, base_delay=0, max_delay=0),
+    )
+
+    encoded = json.dumps(fake.bodies[0]["messages"])
+    assert '"tool_calls"' not in encoded
+    assert '"role": "tool"' not in encoded
+    assert "Prior tool calls omitted" in encoded
+
+
+@pytest.mark.asyncio
+async def test_openai_compatible_call_parses_tool_arguments_with_raw_newlines(monkeypatch):
+    import nanoma.llm as llm_mod
+
+    class FakeClient:
+        is_closed = False
+
+        async def post(self, *args, **kwargs):
+            request = httpx.Request("POST", "https://example.test/v1/chat/completions")
+            return httpx.Response(
+                200,
+                json={
+                    "choices": [
+                        {
+                            "message": {
+                                "role": "assistant",
+                                "tool_calls": [
+                                    {
+                                        "id": "call_1",
+                                        "type": "function",
+                                        "function": {
+                                            "name": "spawn_many",
+                                            "arguments": '{"agents":[{"task":"line 1\nline 2","role":"worker"}]}',
+                                        },
+                                    }
+                                ],
+                            },
+                            "finish_reason": "tool_calls",
+                        }
+                    ],
+                    "usage": {"prompt_tokens": 7, "completion_tokens": 3, "total_tokens": 10},
+                },
+                request=request,
+            )
+
+    monkeypatch.setattr(llm_mod, "_shared_client", FakeClient())
+
+    response = await openai_compatible_call(
+        [{"role": "user", "content": "spawn"}],
+        "deepseek-v4-pro",
+        tools=[META_TOOLS["spawn_many"]["schema"]],
+        base_url="https://example.test/v1",
+        api_key="test-key",
+        retry_config=RetryConfig(max_retries=0, base_delay=0, max_delay=0),
+    )
+
+    assert response.tool_calls[0].arguments == {"agents": [{"task": "line 1\nline 2", "role": "worker"}]}
+
+
+@pytest.mark.asyncio
+async def test_openai_compatible_call_repairs_v4_pro_schema_only_named_tool_miss(monkeypatch):
+    import nanoma.llm as llm_mod
+    from nanoma.tools import WORK_TOOLS
+
+    responses = [
+        {
+            "choices": [
+                {
+                    "message": {
+                        "role": "assistant",
+                        "content": "",
+                        "tool_calls": [
+                            {
+                                "id": "call_bad_1",
+                                "type": "function",
+                                "function": {"name": "shell", "arguments": json.dumps({"command": "ls"})},
+                            }
+                        ],
+                    },
+                    "finish_reason": "tool_calls",
+                }
+            ],
+            "usage": {"prompt_tokens": 7, "completion_tokens": 0, "total_tokens": 7},
+        },
+        {
+            "choices": [
+                {
+                    "message": {
+                        "role": "assistant",
+                        "content": "",
+                        "tool_calls": [
+                            {
+                                "id": "call_bad_2",
+                                "type": "function",
+                                "function": {"name": "file_list", "arguments": json.dumps({"path": "shared"})},
+                            }
+                        ],
+                    },
+                    "finish_reason": "tool_calls",
+                }
+            ],
+            "usage": {"prompt_tokens": 8, "completion_tokens": 1, "total_tokens": 9},
+        },
+        {
+            "choices": [
+                {
+                    "message": {
+                        "role": "assistant",
+                        "tool_calls": [
+                            {
+                                "id": "call_1",
+                                "type": "function",
+                                "function": {
+                                    "name": "file_write",
+                                    "arguments": json.dumps({"path": "shared/out.txt", "content": "ok"}),
+                                },
+                            }
+                        ],
+                    },
+                    "finish_reason": "tool_calls",
+                }
+            ],
+            "usage": {"prompt_tokens": 9, "completion_tokens": 3, "total_tokens": 12},
+        },
+    ]
+
+    class FakeClient:
+        is_closed = False
+
+        def __init__(self):
+            self.calls = 0
+            self.bodies = []
+
+        async def post(self, *args, **kwargs):
+            self.bodies.append(kwargs["json"])
+            data = responses[self.calls]
+            self.calls += 1
+            request = httpx.Request("POST", "https://example.test/v1/chat/completions")
+            return httpx.Response(200, json=data, request=request)
+
+    fake = FakeClient()
+    monkeypatch.setattr(llm_mod, "_shared_client", fake)
+
+    response = await openai_compatible_call(
+        [{"role": "user", "content": "write"}],
+        "deepseek-v4-pro",
+        tools=[WORK_TOOLS["file_write"]["schema"]],
+        tool_choice={"type": "function", "function": {"name": "file_write"}},
+        base_url="https://example.test/v1",
+        api_key="test-key",
+        retry_config=RetryConfig(max_retries=2, base_delay=0, max_delay=0),
+    )
+
+    assert fake.calls == 3
+    assert fake.bodies[0]["tool_choice"] == "auto"
+    assert fake.bodies[1]["tool_choice"] == "auto"
+    assert fake.bodies[2]["tool_choice"] == "auto"
+    assert "Schema-only tool retry" in fake.bodies[1]["messages"][-1]["content"]
+    assert "Retry #2" in fake.bodies[2]["messages"][-1]["content"]
+    assert response.tool_calls[0].name == "file_write"
+
+
+@pytest.mark.asyncio
+async def test_openai_compatible_call_keeps_named_tool_choice_for_non_pro(monkeypatch):
+    import nanoma.llm as llm_mod
+    from nanoma.tools import WORK_TOOLS
+
+    class FakeClient:
+        is_closed = False
+
+        def __init__(self):
+            self.bodies = []
+
+        async def post(self, *args, **kwargs):
+            self.bodies.append(kwargs["json"])
+            request = httpx.Request("POST", "https://example.test/v1/chat/completions")
+            return httpx.Response(
+                200,
+                json={
+                    "choices": [{"message": {"role": "assistant", "content": "ok"}, "finish_reason": "stop"}],
+                    "usage": {"prompt_tokens": 7, "completion_tokens": 3, "total_tokens": 10},
+                },
+                request=request,
+            )
+
+    fake = FakeClient()
+    monkeypatch.setattr(llm_mod, "_shared_client", fake)
+    named_choice = {"type": "function", "function": {"name": "file_write"}}
+
+    await openai_compatible_call(
+        [{"role": "user", "content": "write"}],
+        "deepseek-v4-flash",
+        tools=[WORK_TOOLS["file_write"]["schema"]],
+        tool_choice=named_choice,
+        base_url="https://example.test/v1",
+        api_key="test-key",
+        retry_config=RetryConfig(max_retries=0, base_delay=0, max_delay=0),
+    )
+
+    assert fake.bodies[0]["tool_choice"] == named_choice
+
+
+@pytest.mark.asyncio
+async def test_openai_compatible_call_retries_pro_tool_transport_miss(monkeypatch):
+    import nanoma.llm as llm_mod
+
+    responses = [
+        {
+            "choices": [{"message": {"role": "assistant", "content": "I will spawn the agents now."}, "finish_reason": "stop"}],
+            "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
+        },
+        {
+            "choices": [
+                {
+                    "message": {
+                        "role": "assistant",
+                        "tool_calls": [
+                            {
+                                "id": "call_1",
+                                "type": "function",
+                                "function": {
+                                    "name": "spawn_many",
+                                    "arguments": json.dumps({"agents": [{"task": "candidate 00"}]}),
+                                },
+                            }
+                        ],
+                    },
+                    "finish_reason": "tool_calls",
+                }
+            ],
+            "usage": {"prompt_tokens": 7, "completion_tokens": 3, "total_tokens": 10},
+        },
+    ]
+
+    class FakeClient:
+        is_closed = False
+
+        def __init__(self):
+            self.calls = 0
+
+        async def post(self, *args, **kwargs):
+            data = responses[self.calls]
+            self.calls += 1
+            request = httpx.Request("POST", "https://example.test/v1/chat/completions")
+            return httpx.Response(200, json=data, request=request)
+
+    fake = FakeClient()
+    monkeypatch.setattr(llm_mod, "_shared_client", fake)
+
+    response = await openai_compatible_call(
+        [{"role": "user", "content": "spawn"}],
+        "deepseek-v4-pro",
+        tools=[META_TOOLS["spawn_many"]["schema"]],
+        base_url="https://example.test/v1",
+        api_key="test-key",
+        retry_config=RetryConfig(max_retries=1, base_delay=0, max_delay=0),
+    )
+
+    assert fake.calls == 2
+    assert response.tool_calls[0].name == "spawn_many"
+    assert response.tool_calls[0].arguments == {"agents": [{"task": "candidate 00"}]}
+
+
+@pytest.mark.asyncio
+async def test_openai_compatible_call_repairs_pro_empty_tool_retry(monkeypatch):
+    import nanoma.llm as llm_mod
+
+    responses = [
+        {
+            "choices": [{"message": {"role": "assistant", "content": ""}, "finish_reason": "stop"}],
+            "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
+        },
+        {
+            "choices": [
+                {
+                    "message": {
+                        "role": "assistant",
+                        "tool_calls": [
+                            {
+                                "id": "call_1",
+                                "type": "function",
+                                "function": {
+                                    "name": "spawn_many",
+                                    "arguments": json.dumps({"agents": [{"task": "candidate 00"}]}),
+                                },
+                            }
+                        ],
+                    },
+                    "finish_reason": "tool_calls",
+                }
+            ],
+            "usage": {"prompt_tokens": 7, "completion_tokens": 3, "total_tokens": 10},
+        },
+    ]
+
+    class FakeClient:
+        is_closed = False
+
+        def __init__(self):
+            self.calls = 0
+            self.bodies = []
+
+        async def post(self, *args, **kwargs):
+            self.bodies.append(kwargs["json"])
+            data = responses[self.calls]
+            self.calls += 1
+            request = httpx.Request("POST", "https://example.test/v1/chat/completions")
+            return httpx.Response(200, json=data, request=request)
+
+    fake = FakeClient()
+    monkeypatch.setattr(llm_mod, "_shared_client", fake)
+
+    response = await openai_compatible_call(
+        [{"role": "user", "content": "spawn"}],
+        "deepseek-v4-pro",
+        tools=[META_TOOLS["spawn_many"]["schema"]],
+        base_url="https://example.test/v1",
+        api_key="test-key",
+        retry_config=RetryConfig(max_retries=1, base_delay=0, max_delay=0),
+    )
+
+    assert fake.calls == 2
+    assert len(fake.bodies[0]["messages"]) == 1
+    assert len(fake.bodies[1]["messages"]) == 2
+    assert "valid tool_call" in fake.bodies[1]["messages"][-1]["content"]
+    assert response.tool_calls[0].name == "spawn_many"
+
+
 def test_stage_source_snapshot_initializes_git_baseline(tmp_path):
     from examples.high_concurrency_runner import stage_source_snapshot
 
@@ -3666,7 +8608,7 @@ async def test_spawn_and_wait(tmp_workspace):
 
     config = RuntimeConfig(workspace_root=tmp_workspace, budget=10.0, log_dir=None, sandbox_backend="host")
     rt = Runtime(config=config, llm_call=mock_llm)
-    result = await rt.run("parent task")
+    result = await rt.run("Spawn peer agents for parent coordination.")
     assert result == "parent done"
     assert len(rt.agents) == 2
 
@@ -3770,11 +8712,56 @@ async def test_runtime_waits_for_running_children_after_root_finishes(tmp_worksp
     config = RuntimeConfig(workspace_root=tmp_workspace, budget=10.0, log_dir=None, sandbox_backend="host", max_turns=6)
     rt = Runtime(config=config, llm_call=mock_llm)
 
-    result = await rt.run("parent")
+    result = await rt.run("Spawn peer agents for delegated output coordination.")
 
     assert result.startswith("[Delegated to ")
     assert (tmp_workspace / "shared" / "child.txt").read_text() == "child done"
     assert [e for e in rt._events if e["event"] == "join_remaining_agents"]
+
+
+@pytest.mark.asyncio
+async def test_terminal_answer_submission_prunes_leftover_children_after_grace(tmp_workspace):
+    calls = {"child": 0}
+
+    async def mock_llm(messages, model, tools=None, **kwargs):
+        calls["child"] += 1
+        await asyncio.sleep(0.2)
+        return LLMResponse(
+            content="Still trying to spawn another verifier.",
+            usage=UsageRecord(input_tokens=10, output_tokens=5, model=model),
+        )
+
+    config = RuntimeConfig(
+        workspace_root=tmp_workspace,
+        budget=10.0,
+        log_dir=None,
+        sandbox_backend="host",
+        orchestration_preference="aggressive",
+        spawn_before_turn=1,
+        min_spawnable_workstreams=2,
+        loop_action_policy="constraint",
+        max_turns=10,
+        terminal_submission_join_grace=0.05,
+    )
+    rt = Runtime(config=config, llm_call=mock_llm)
+    root = rt.create_agent(
+        'Solve and submit `shared/answer.json` with {"answer": "<answer-only string>"}.',
+        model="test",
+    )
+    child = rt.create_agent("leftover child with no required output.", model="test", parent=root.id, role="worker")
+    root.children.add(child.id)
+    rt.start_agent(child)
+
+    await meta_submit_answer({"answer": "Egalitarian"}, root, rt)
+    await rt._wait_for_remaining_agents(root)
+
+    assert root.result == "Egalitarian"
+    assert child.status == "done"
+    assert "Pruned after root terminal submission" in (child.result or "")
+    assert (tmp_workspace / "shared" / "answer.json").exists()
+    assert [e for e in rt._events if e["event"] == "terminal_prune_request"]
+    assert [e for e in rt._events if e["event"] == "terminal_join_grace_finished"]
+    assert [e for e in rt._events if e["event"] == "terminal_leftover_agent_pruned"]
 
 
 @pytest.mark.asyncio
