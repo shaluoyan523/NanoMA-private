@@ -256,6 +256,20 @@ def test_bare_shared_artifact_paths_are_expected_outputs(tmp_workspace):
     ]
 
 
+def test_overwrite_verification_task_keeps_target_as_expected_output(tmp_workspace):
+    config = RuntimeConfig(workspace_root=tmp_workspace, log_dir=None, sandbox_backend="host")
+    rt = Runtime(config=config)
+    agent = rt.create_agent(
+        "Verify the previous society article report, read current context if useful, "
+        "and write the verified report to `shared/gaia_l2/c61d/society_articles.md` "
+        "(overwrite existing file if needed).",
+        model="test",
+    )
+
+    assert rt.expected_outputs(agent) == ["shared/gaia_l2/c61d/society_articles.md"]
+    assert rt.missing_expected_outputs(agent) == ["shared/gaia_l2/c61d/society_articles.md"]
+
+
 def test_ledger():
     ledger = CostLedger(total_budget=5.0)
     usage = UsageRecord(input_tokens=1000, output_tokens=500, model="test")
@@ -456,6 +470,118 @@ async def test_spawn_many_solo_default_does_not_freeze_research_workers(tmp_work
 
     assert result["results"][0]["result"]["requested_orchestration_preference"] is None
     assert child.orchestration_preference != "solo"
+
+
+@pytest.mark.asyncio
+async def test_spawn_many_injects_local_output_for_gaia_helper_without_path(tmp_workspace):
+    config = RuntimeConfig(workspace_root=tmp_workspace, log_dir=None, sandbox_backend="host")
+    rt = Runtime(config=config)
+    parent = rt.create_agent(
+        "Coordinate GAIA research lanes. If you spawn helpers, require each helper to write "
+        "a short evidence report under `shared/gaia_l2/c61d/` before stopping."
+    )
+
+    result = await meta_spawn_many(
+        {
+            "defaults": {
+                "create_type": "peer_agent",
+                "relationship": "peer",
+                "group_id": "gaia_l2_c61d",
+            },
+            "agents": [
+                {
+                    "task": "Find the AI regulation paper from June 2022 and identify all six axis-end words.",
+                    "role": "paper_finder_2022",
+                    "current_task_tags": ["benchmark:gaia", "lane:2022_paper"],
+                },
+                {
+                    "task": "Find the Physics and Society article from August 11, 2016 and identify society descriptors.",
+                    "role": "paper_finder_2016",
+                    "current_task_tags": ["benchmark:gaia", "lane:2016_paper"],
+                },
+            ],
+        },
+        parent,
+        rt,
+    )
+
+    assert result["created"] == 2
+    first = rt.agents[result["results"][0]["result"]["agent_id"]]
+    second = rt.agents[result["results"][1]["result"]["agent_id"]]
+
+    assert result["results"][0]["result"]["auto_local_output"] == "shared/gaia_l2/c61d/paper_finder_2022_evidence.md"
+    assert result["results"][1]["result"]["auto_local_output"] == "shared/gaia_l2/c61d/paper_finder_2016_evidence.md"
+    assert rt.expected_outputs(first) == ["shared/gaia_l2/c61d/paper_finder_2022_evidence.md"]
+    assert rt.expected_outputs(second) == ["shared/gaia_l2/c61d/paper_finder_2016_evidence.md"]
+    assert "Required local output" in first.task
+    assert [e for e in rt._events if e["event"] == "spawn_local_output_injected"]
+
+
+@pytest.mark.asyncio
+async def test_spawn_does_not_inject_local_output_when_child_has_explicit_output(tmp_workspace):
+    config = RuntimeConfig(workspace_root=tmp_workspace, log_dir=None, sandbox_backend="host")
+    rt = Runtime(config=config)
+    parent = rt.create_agent(
+        "Coordinate helper agents and require reports under `shared/gaia_l2/c61d/`."
+    )
+
+    result = await meta_spawn(
+        {
+            "task": "Find evidence and write `shared/custom/report.md`.",
+            "role": "researcher",
+            "group_id": "wave",
+        },
+        parent,
+        rt,
+    )
+
+    child = rt.agents[result["agent_id"]]
+    assert result["auto_local_output"] is None
+    assert rt.expected_outputs(child) == ["shared/custom/report.md"]
+    assert child.task.count("Required local output") == 0
+
+
+@pytest.mark.asyncio
+async def test_spawn_expected_outputs_contract_injects_recovery_slot(tmp_workspace):
+    config = RuntimeConfig(workspace_root=tmp_workspace, log_dir=None, sandbox_backend="host")
+    rt = Runtime(config=config)
+    parent = rt.create_agent(
+        "Coordinate helper agents and require reports under `shared/gaia_l2/c61d/`."
+    )
+
+    result = await meta_spawn(
+        {
+            "task": "Recover the society lane by replacing the previous low-confidence report.",
+            "role": "recovery",
+            "target_output_path": "shared/gaia_l2/c61d/society_articles.md",
+            "readiness": 1.0,
+        },
+        parent,
+        rt,
+    )
+
+    child = rt.agents[result["agent_id"]]
+    assert result["expected_outputs"] == ["shared/gaia_l2/c61d/society_articles.md"]
+    assert result["auto_local_output"] is None
+    assert rt.expected_outputs(child) == ["shared/gaia_l2/c61d/society_articles.md"]
+    assert "Required output slot(s)" in child.task
+
+
+@pytest.mark.asyncio
+async def test_spawn_does_not_inject_local_output_for_plain_parent(tmp_workspace):
+    config = RuntimeConfig(workspace_root=tmp_workspace, log_dir=None, sandbox_backend="host")
+    rt = Runtime(config=config)
+    parent = rt.create_agent("parent task")
+
+    result = await meta_spawn(
+        {"task": "check requirements", "role": "requirements", "group_id": "wave"},
+        parent,
+        rt,
+    )
+
+    child = rt.agents[result["agent_id"]]
+    assert result["auto_local_output"] is None
+    assert rt.expected_outputs(child) == []
 
 
 @pytest.mark.asyncio
@@ -1690,7 +1816,7 @@ def test_constraint_loop_action_queries_overlap_before_discovery_work(tmp_worksp
         orchestration_preference="parallel",
     )
     rt.create_agent(
-        "Search arXiv for AI regulation evidence and sources; write shared/lane_bravo.md.",
+        "Search arXiv for AI regulation evidence and sources; write shared/lane_alpha.md.",
         model="test",
         parent=parent.id,
         group_id="gaia-c61",
@@ -2211,6 +2337,46 @@ def test_constraint_loop_action_avoids_duplicate_covered_lanes(tmp_workspace):
     assert parent._loop_action_plan["action"] == "create"
     assert parent._loop_action_plan["reason"] == "delegate_final_delivery"
     assert parent._loop_action_plan["constraints"]["lane_coverage_pressure"] >= 0.95
+
+
+def test_covered_spawn_request_requires_same_output_slot_when_explicit(tmp_workspace):
+    config = RuntimeConfig(workspace_root=tmp_workspace, log_dir=None, sandbox_backend="host")
+    rt = Runtime(config=config)
+    parent = rt.create_agent("Coordinate GAIA lanes.", model="test")
+    paper = rt.create_agent(
+        "Find paper evidence and write `shared/gaia_l2/c61d/paper_figure_words.md`.",
+        model="test",
+        parent=parent.id,
+        role="evidence",
+        group_id="gaia-c61",
+        current_task_tags=["benchmark:gaia", "lane:paper"],
+    )
+    parent.children.add(paper.id)
+    artifact_path = tmp_workspace / "shared" / "gaia_l2" / "c61d" / "paper_figure_words.md"
+    artifact_path.parent.mkdir(parents=True, exist_ok=True)
+    artifact_path.write_text("Source: https://arxiv.org/abs/2206.00000\nVerified paper evidence.\n")
+    paper.status = "done"
+    paper.result = "paper evidence verified"
+    paper.artifacts.append(Artifact("shared/gaia_l2/c61d/paper_figure_words.md", artifact_path, agent_id=paper.id))
+    rt.memory.update(
+        paper.id,
+        public_summary="paper evidence verified",
+        add_artifacts=["shared/gaia_l2/c61d/paper_figure_words.md"],
+        tags=paper.current_task_tags + ["status:done", "confidence:high"],
+    )
+
+    covered = rt.covered_spawn_request(
+        parent,
+        task=(
+            "Recover society evidence and write "
+            "`shared/gaia_l2/c61d/society_articles.md`."
+        ),
+        role="recovery",
+        group_id="gaia-c61",
+        current_task_tags=["benchmark:gaia", "lane:society"],
+    )
+
+    assert covered is None
 
 
 def test_constraint_loop_action_worker_handoffs_after_mature_evidence(tmp_workspace):
@@ -2853,7 +3019,7 @@ def test_evidence_report_placeholder_content_blocks_completion(tmp_workspace):
     )
     agent.artifacts.append(Artifact(path="shared/gaia/paper_2022_findings.md", absolute_path=artifact_path, agent_id=agent.id))
 
-    assert rt.missing_expected_outputs(agent) == []
+    assert rt.missing_expected_outputs(agent) == ["shared/gaia/paper_2022_findings.md"]
     assert not rt.outputs_complete(agent)
     blockers = rt.completion_blockers(agent, include_missing_outputs=False)
     assert any(blocker["kind"] == "uncertain_evidence" for blocker in blockers)
@@ -4042,13 +4208,13 @@ async def test_peer_progress_after_query_limits_more_peer_reading(tmp_workspace)
         current_task_tags=["phase:gen0", "problem:X", "role:generator"],
     )
     peer = rt.create_agent(
-        "Create `shared/peer.cpp` and `shared/peer.md`.",
+        "Create `shared/out.cpp` and `shared/out.md`.",
         group_id="wave",
         created_by="root",
         current_task_tags=["phase:gen0", "problem:X", "role:generator"],
     )
     peer.status = "done"
-    peer.artifacts.append(Artifact("shared/peer.cpp", tmp_workspace / "shared" / "peer.cpp"))
+    peer.artifacts.append(Artifact("shared/out.cpp", tmp_workspace / "shared" / "out.cpp"))
     agent._turns = 4
     agent._artifact_nudge_count = 1
     agent._peer_progress_nudge_sent = True
@@ -4120,7 +4286,7 @@ async def test_overlap_query_before_work_then_prunes_duplicate_discovery_lane(tm
         orchestration_preference="parallel",
     )
     peer = rt.create_agent(
-        "Search arXiv for AI regulation evidence and sources; write shared/lane_bravo.md.",
+        "Search arXiv for AI regulation evidence and sources; write shared/lane_alpha.md.",
         model="test",
         parent=parent.id,
         group_id="gaia-c61",
@@ -4130,7 +4296,7 @@ async def test_overlap_query_before_work_then_prunes_duplicate_discovery_lane(tm
     )
     peer.status = "done"
     peer.result = "Completed AI regulation evidence lane."
-    peer.artifacts.append(Artifact("shared/lane_bravo.md", tmp_workspace / "shared" / "lane_bravo.md"))
+    peer.artifacts.append(Artifact("shared/lane_alpha.md", tmp_workspace / "shared" / "lane_alpha.md"))
 
     await rt._agent_loop(agent)
 
@@ -4216,7 +4382,7 @@ async def test_parent_query_can_request_duplicate_agents_self_prune(tmp_workspac
         orchestration_preference="parallel",
     )
     duplicate = rt.create_agent(
-        "Search arXiv for the same AI regulation evidence; write shared/lane_delta.md.",
+        "Search arXiv for the same AI regulation evidence; write shared/lane_bravo.md.",
         model="test",
         parent=parent.id,
         group_id="gaia-c61",
@@ -5893,7 +6059,7 @@ async def test_stop_auxiliary_miss_retries_with_terminal_tools(tmp_workspace):
 
 
 @pytest.mark.asyncio
-async def test_answer_stop_retry_uses_submit_answer_only(tmp_workspace):
+async def test_answer_stop_retry_uses_submit_review_scope(tmp_workspace):
     calls = []
 
     async def mock_llm(messages, model, tools=None, **kwargs):
@@ -5915,11 +6081,13 @@ async def test_answer_stop_retry_uses_submit_answer_only(tmp_workspace):
 
     await rt._agent_loop(agent)
 
-    assert calls[0]["tools"] == ["submit_answer"]
-    assert calls[0]["tool_choice"] == {"type": "function", "function": {"name": "submit_answer"}}
+    assert "submit_answer" in calls[0]["tools"]
+    assert "query" in calls[0]["tools"]
+    assert "ledger_read" in calls[0]["tools"]
+    assert calls[0]["tool_choice"] is None
     llm_event = [e for e in rt._events if e["event"] == "llm_done"][0]
-    assert llm_event["data"]["tool_scope"] == "answer_submit_only"
-    assert llm_event["data"]["recommended_tool_choice"] == "submit_answer"
+    assert llm_event["data"]["tool_scope"] == "answer_submit_review"
+    assert llm_event["data"]["recommended_tool_choice"] is None
     assert agent.status == "done"
     assert json.loads((tmp_workspace / "shared" / "answer.json").read_text()) == {"answer": "candidate"}
 
@@ -6144,7 +6312,7 @@ async def test_final_answer_file_write_does_not_submit_answer(tmp_workspace):
     await rt.run('Write `shared/answer.json` with {"answer": "<answer-only string>"}.')
 
     agent = rt.agents["alpha"]
-    assert (tmp_workspace / "shared" / "answer.json").exists()
+    assert not (tmp_workspace / "shared" / "answer.json").exists()
     assert rt.missing_expected_outputs(agent) == []
     assert agent.submitted_answer_path is None
     assert agent.status == "failed"
@@ -6152,7 +6320,8 @@ async def test_final_answer_file_write_does_not_submit_answer(tmp_workspace):
     writes = [e for e in rt._events if e["event"] == "tool_call" and e["data"]["tool"] == "file_write"]
     assert writes
     write_result = json.loads(writes[-1]["data"]["result"])
-    assert write_result["artifact_warning"] == "terminal_answer_requires_submit_answer"
+    assert write_result["error"] == "final_answer_write_denied"
+    assert write_result["reason"] == "terminal_answer_requires_submit_answer"
 
 
 @pytest.mark.asyncio
@@ -6205,6 +6374,111 @@ async def test_submit_answer_writes_protocol_file_and_finishes_even_if_wrong(tmp
     assert rt.completion_blockers(agent) == []
     assert json.loads((tmp_workspace / "shared" / "answer.json").read_text()) == {"answer": "placeholder"}
     assert "shared/answer.json" in [artifact.path for artifact in agent.artifacts]
+
+
+@pytest.mark.asyncio
+async def test_child_verifier_cannot_submit_global_answer_without_grant(tmp_workspace):
+    config = RuntimeConfig(workspace_root=tmp_workspace, log_dir=None, sandbox_backend="host", max_turns=3)
+    rt = Runtime(config=config)
+    root = rt.create_agent('Solve GAIA and submit `shared/answer.json` with {"answer": "<answer-only string>"}.')
+    child = rt.create_agent(
+        'Verify one paper lane. When ready call submit_answer(answer="<answer-only string>").',
+        parent=root.id,
+        role="verifier",
+        group_id="lane1_paper",
+        current_task_tags=["role:verification", "lane:paper"],
+    )
+    root.children.add(child.id)
+
+    result = await meta_submit_answer({"answer": "partial paper answer"}, child, rt)
+
+    assert result["error"] == "submit_answer_denied"
+    assert result["reason"] == "submit_answer_not_granted"
+    assert child.status == "running"
+    assert child.submitted_answer_path is None
+    assert not (tmp_workspace / "shared" / "answer.json").exists()
+    assert [e for e in rt._events if e["event"] == "submit_answer_denied" and e["agent"] == child.id]
+
+
+@pytest.mark.asyncio
+async def test_child_verifier_does_not_see_submit_answer_tool_without_grant(tmp_workspace):
+    calls = []
+
+    async def mock_llm(messages, model, tools=None, **kwargs):
+        calls.append({
+            "tools": [t["function"]["name"] for t in (tools or [])],
+            "tool_choice": kwargs.get("tool_choice"),
+        })
+        return LLMResponse(
+            tool_calls=[ToolCall(id="tc1", name="set_status", arguments={"status": "done", "result": "local done"})],
+            usage=UsageRecord(input_tokens=10, output_tokens=5, model=model),
+        )
+
+    config = RuntimeConfig(workspace_root=tmp_workspace, log_dir=None, sandbox_backend="host", max_turns=2)
+    rt = Runtime(config=config, llm_call=mock_llm)
+    root = rt.create_agent('Solve GAIA and submit `shared/answer.json` with {"answer": "<answer-only string>"}.')
+    child = rt.create_agent(
+        'Verify one paper lane. When ready call submit_answer(answer="<answer-only string>").',
+        parent=root.id,
+        role="verifier",
+        group_id="lane1_paper",
+    )
+    root.children.add(child.id)
+    child._loop_action_plan = {"action": "stop", "reason": "answer_submission_pending", "turn_added": 1}
+
+    await rt._agent_loop(child)
+
+    assert calls
+    assert "submit_answer" not in calls[0]["tools"]
+    assert calls[0]["tool_choice"] != {"type": "function", "function": {"name": "submit_answer"}}
+
+
+@pytest.mark.asyncio
+async def test_spawn_strips_submit_answer_from_non_delivery_child(tmp_workspace):
+    config = RuntimeConfig(workspace_root=tmp_workspace, log_dir=None, sandbox_backend="host")
+    rt = Runtime(config=config)
+    root = rt.create_agent('Solve GAIA and submit `shared/answer.json` with {"answer": "<answer-only string>"}.')
+
+    result = await meta_spawn(
+        {
+            "task": 'Verify one paper lane. When ready call submit_answer(answer="<answer-only string>").',
+            "role": "verifier",
+            "group_id": "lane1_paper",
+        },
+        root,
+        rt,
+    )
+
+    child = rt.agents[result["agent_id"]]
+    assert result["submit_answer_granted"] is False
+    assert "submit_answer(" not in child.task
+    assert "Local completion only" in child.task
+    assert [e for e in rt._events if e["event"] == "spawn_task_sanitized"]
+
+
+@pytest.mark.asyncio
+async def test_spawn_grants_submit_answer_to_delivery_child(tmp_workspace):
+    config = RuntimeConfig(workspace_root=tmp_workspace, log_dir=None, sandbox_backend="host")
+    rt = Runtime(config=config)
+    root = rt.create_agent('Solve GAIA and submit `shared/answer.json` with {"answer": "<answer-only string>"}.')
+
+    result = await meta_spawn(
+        {
+            "task": 'Final delivery: query evidence, verify the final answer, then call submit_answer(answer="<answer-only string>").',
+            "role": "finalizer",
+            "group_id": "final_delivery",
+            "current_task_tags": ["role:finalizer", "final_delivery"],
+            "readiness": 1.0,
+        },
+        root,
+        rt,
+    )
+
+    child = rt.agents[result["agent_id"]]
+    assert result["submit_answer_granted"] is True
+    assert result["auto_local_output"] is None
+    assert "submit_answer(" in child.task
+    assert rt.can_submit_answer(child)["ok"] is True
 
 
 @pytest.mark.asyncio
@@ -6522,6 +6796,28 @@ def test_ledger_update_persists_output_state(runtime, tmp_workspace):
     assert item["blockers"][0]["kind"] == "needs_evidence"
 
 
+def test_placeholder_artifact_remains_missing_for_scheduling(tmp_workspace):
+    config = RuntimeConfig(workspace_root=tmp_workspace, log_dir=None, sandbox_backend="host")
+    rt = Runtime(config=config)
+    agent = rt.create_agent("Find primary evidence and write `shared/report.md`.", model="test")
+    path = tmp_workspace / "shared" / "report.md"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        "Status: PENDING VERIFICATION placeholder\n"
+        "Primary source not yet available. Results to be confirmed.\n"
+    )
+    agent.artifacts.append(Artifact("shared/report.md", path, agent_id=agent.id))
+
+    assert rt.expected_outputs(agent) == ["shared/report.md"]
+    assert rt.missing_expected_outputs(agent) == ["shared/report.md"]
+
+    item = rt.task_ledger_item_snapshot(agent)
+
+    assert item["expected_outputs"][0]["status"] == "placeholder"
+    assert item["status"] == "partial"
+    assert any(blocker["kind"] == "uncertain_evidence" for blocker in rt.completion_blockers(agent))
+
+
 def test_root_steward_mode_restricts_worker_tools(tmp_workspace):
     config = RuntimeConfig(workspace_root=tmp_workspace, log_dir=None, sandbox_backend="host")
     rt = Runtime(config=config)
@@ -6643,6 +6939,433 @@ def test_root_steward_delegates_final_delivery_to_create_scope(tmp_workspace):
     assert card is not None
     assert "Final delivery handoff" in card["content"]
     assert "Prefer one focused finalizer/delivery agent" in card["content"]
+
+
+def test_root_final_delivery_uses_mature_output_slots_and_prunes_old_blockers(tmp_workspace):
+    config = RuntimeConfig(
+        workspace_root=tmp_workspace,
+        log_dir=None,
+        sandbox_backend="host",
+        loop_action_policy="constraint",
+        max_agents=10,
+        max_depth=4,
+    )
+    rt = Runtime(config=config)
+    root = rt.create_agent(
+        'Coordinate evidence and submit `shared/answer.json` with {"answer": "<answer-only string>"} using submit_answer.',
+        model="test",
+        orchestration_preference="parallel",
+    )
+    paper = rt.create_agent(
+        "Find paper words and write `shared/paper.md`.",
+        model="test",
+        parent=root.id,
+        role="evidence",
+        group_id="gaia",
+    )
+    society = rt.create_agent(
+        "Find society words and write `shared/society.md`.",
+        model="test",
+        parent=root.id,
+        role="evidence",
+        group_id="gaia",
+    )
+    root.children.update({paper.id, society.id})
+    for agent, path, content in [
+        (paper, "shared/paper.md", "Source: https://arxiv.org/abs/2207.01510\nWords: Egalitarianism, Utilitarianism\n"),
+        (society, "shared/society.md", "Source: https://arxiv.org/abs/1608.03637\nWords: egalitarian, hierarchical\n"),
+    ]:
+        abs_path = tmp_workspace / path
+        abs_path.parent.mkdir(parents=True, exist_ok=True)
+        abs_path.write_text(content)
+        agent.status = "done"
+        agent.artifacts.append(Artifact(path, abs_path, agent_id=agent.id))
+        rt.task_ledger_update(agent, {
+            "status": "partial",
+            "output_path": path,
+            "output_status": "placeholder",
+            "blockers": [{"kind": "uncertain_evidence", "artifacts": [path], "message": "old blocker"}],
+        })
+
+    paper_item = rt.task_ledger_item_snapshot(paper)
+    society_item = rt.task_ledger_item_snapshot(society)
+
+    assert paper_item["expected_outputs"][0]["status"] == "evidence_attached"
+    assert society_item["expected_outputs"][0]["status"] == "evidence_attached"
+    assert not paper_item.get("blockers")
+    assert not society_item.get("blockers")
+
+    rt._refresh_loop_action_plan(root, rt.missing_expected_outputs(root))
+    tools, scope = rt._tools_for_loop_turn(root, root._loop_action_plan["action"], [])
+
+    assert root._loop_action_plan["action"] == "create"
+    assert root._loop_action_plan["reason"] == "delegate_final_delivery"
+    assert scope == "final_delivery_handoff"
+    assert tools == {"spawn", "create_agent", "spawn_many"}
+
+
+def test_root_direct_answer_submission_after_recent_evidence_query(tmp_workspace):
+    config = RuntimeConfig(
+        workspace_root=tmp_workspace,
+        log_dir=None,
+        sandbox_backend="host",
+        loop_action_policy="constraint",
+        max_agents=10,
+        max_depth=4,
+    )
+    rt = Runtime(config=config)
+    root = rt.create_agent(
+        'Coordinate evidence and submit `shared/answer.json` with {"answer": "<answer-only string>"} using submit_answer.',
+        model="test",
+        orchestration_preference="parallel",
+    )
+    worker = rt.create_agent(
+        "Find reliable answer evidence and write `shared/evidence.md`.",
+        model="test",
+        parent=root.id,
+        role="evidence",
+        group_id="gaia",
+        current_task_tags=["role:evidence", "status:verified", "confidence:high"],
+    )
+    root.children.add(worker.id)
+    evidence_path = tmp_workspace / "shared" / "evidence.md"
+    evidence_path.write_text("Source: https://example.test\nAnswer: egalitarian\n")
+    worker.status = "done"
+    worker.result = "Verified answer: egalitarian"
+    worker.artifacts.append(Artifact("shared/evidence.md", evidence_path, agent_id=worker.id))
+    rt.memory.update(
+        worker.id,
+        public_summary="Verified answer evidence: egalitarian.",
+        add_artifacts=["shared/evidence.md"],
+        tags=worker.current_task_tags,
+    )
+    root._turns = 5
+    root._last_query_turn = 4
+    root._last_query_evidence_turn = 4
+    root._last_query_agent_ids = [worker.id]
+    root._last_query_reliable_evidence_ids = [worker.id]
+
+    rt._refresh_loop_action_plan(root, [])
+    tools, scope = rt._tools_for_loop_turn(root, root._loop_action_plan["action"], [])
+    card = rt._build_loop_action_context(root, [], [])
+
+    assert root._loop_action_plan["action"] == "stop"
+    assert root._loop_action_plan["reason"] == "direct_answer_submission_ready"
+    assert root._loop_action_plan["root_steward"] is True
+    assert root._loop_action_plan["candidate_scores"][0]["reason"] == "direct_answer_submission_ready"
+    assert scope == "answer_submit_only"
+    assert tools == {"submit_answer"}
+    assert card is not None
+    assert "Direct terminal delivery is ready" in card["content"]
+
+
+def test_root_promotes_terminal_candidate_artifact_to_submit_even_with_running_descendants(tmp_workspace):
+    config = RuntimeConfig(
+        workspace_root=tmp_workspace,
+        log_dir=None,
+        sandbox_backend="host",
+        loop_action_policy="constraint",
+        max_agents=10,
+        max_depth=4,
+    )
+    rt = Runtime(config=config)
+    root = rt.create_agent(
+        'Coordinate evidence and submit `shared/answer.json` with {"answer": "<answer-only string>"} using submit_answer.',
+        model="test",
+        orchestration_preference="aggressive",
+    )
+    evidence = rt.create_agent(
+        "Find evidence and write `shared/evidence.md`.",
+        model="test",
+        parent=root.id,
+        role="evidence",
+        group_id="evidence",
+    )
+    synthesis = rt.create_agent(
+        "Synthesize evidence and write `shared/answer_verification.md` with the candidate answer.",
+        model="test",
+        parent=evidence.id,
+        role="synthesizer",
+        group_id="synthesis",
+        current_task_tags=["role:synthesis", "status:ready_for_review", "candidate_answer:egalitarian"],
+    )
+    extra = rt.create_agent("Still-running redundant verifier.", model="test", parent=root.id, role="verifier")
+    root.children.update({evidence.id, extra.id})
+    evidence.children.add(synthesis.id)
+
+    artifact_path = tmp_workspace / "shared" / "answer_verification.md"
+    artifact_path.write_text(
+        "# Answer Verification Report\n\n"
+        "## Candidate Answer\n\n"
+        "**egalitarian**\n\n"
+        "Cross-check complete. Sources: https://arxiv.org/abs/2207.01510 and https://arxiv.org/abs/1608.03637.\n",
+        encoding="utf-8",
+    )
+    synthesis.artifacts.append(Artifact("shared/answer_verification.md", artifact_path, agent_id=synthesis.id))
+    rt.memory.update(
+        synthesis.id,
+        public_summary="Cross-check complete. Candidate answer: egalitarian.",
+        add_artifacts=["shared/answer_verification.md"],
+        tags=synthesis.current_task_tags,
+    )
+    root._turns = 8
+    root._last_query_turn = 7
+    root._last_query_agent_ids = [synthesis.id]
+    evidence.status = "running"
+    extra.status = "running"
+    synthesis.status = "running"
+
+    rt._refresh_loop_action_plan(root, [])
+    tools, scope = rt._tools_for_loop_turn(root, root._loop_action_plan["action"], [])
+    card = rt._build_loop_action_context(root, [], [])
+
+    assert root._loop_action_plan["action"] == "stop"
+    assert root._loop_action_plan["reason"] == "terminal_candidate_submit_ready"
+    assert root._loop_action_plan["terminal_candidate"]["id"] == synthesis.id
+    assert root._loop_action_plan["terminal_candidate"]["answer_hint"] == "egalitarian"
+    assert scope == "answer_submit_only"
+    assert tools == {"submit_answer"}
+    assert card is not None
+    assert "answer_hint=egalitarian" in card["content"]
+
+    root_item = rt.task_ledger_item_snapshot(root)
+    assert root_item is not None
+    assert root_item["status"] == "ready_for_review"
+    assert "terminal_candidate_ready" in root_item["note"]
+
+
+def test_root_partial_evidence_stop_uses_soft_submit_review_scope(tmp_workspace):
+    config = RuntimeConfig(
+        workspace_root=tmp_workspace,
+        log_dir=None,
+        sandbox_backend="host",
+        loop_action_policy="constraint",
+        max_agents=10,
+        max_depth=4,
+    )
+    rt = Runtime(config=config)
+    root = rt.create_agent(
+        'Coordinate two evidence lanes and submit `shared/answer.json` with {"answer": "<answer-only string>"} using submit_answer.',
+        model="test",
+        orchestration_preference="aggressive",
+    )
+    complete = rt.create_agent(
+        "Find one evidence lane and write `shared/lane1.md`.",
+        model="test",
+        parent=root.id,
+        role="evidence",
+        group_id="evidence",
+    )
+    incomplete = rt.create_agent(
+        "Find the other evidence lane and write `shared/lane2.md`.",
+        model="test",
+        parent=root.id,
+        role="evidence",
+        group_id="evidence",
+    )
+    root.children.update({complete.id, incomplete.id})
+    path = tmp_workspace / "shared" / "lane1.md"
+    path.write_text("Source: https://example.test\nEvidence attached.\n", encoding="utf-8")
+    complete.status = "done"
+    complete.artifacts.append(Artifact("shared/lane1.md", path, agent_id=complete.id))
+    incomplete.status = "running"
+    root._loop_action_plan = {
+        "action": "stop",
+        "reason": "answer_submission_pending",
+        "turn_added": 3,
+        "answer_readiness": rt._root_answer_readiness_public(rt._root_answer_readiness(root)),
+    }
+
+    tools, scope = rt._tools_for_loop_turn(root, root._loop_action_plan["action"], [])
+    card = rt._build_loop_action_context(root, [], [])
+
+    assert root._loop_action_plan["action"] == "stop"
+    assert scope == "answer_submit_review"
+    assert "submit_answer" in tools
+    assert "query" in tools
+    assert "ledger_read" in tools
+    assert card is not None
+    assert "Answer submission readiness is a soft signal" in card["content"]
+
+
+@pytest.mark.asyncio
+async def test_selector_cannot_downgrade_final_delivery_to_message(tmp_workspace, monkeypatch):
+    import nanoma.core as core
+
+    calls = {"n": 0}
+
+    async def mock_llm(messages, model, tools=None, **kwargs):
+        calls["n"] += 1
+        return LLMResponse(
+            content='{"action":"message","reason":"query one more time"}',
+            usage=UsageRecord(input_tokens=10, output_tokens=5, model=model),
+        )
+
+    config = RuntimeConfig(
+        workspace_root=tmp_workspace,
+        log_dir=None,
+        sandbox_backend="host",
+        loop_action_policy="constraint",
+        two_stage_action_selection=True,
+    )
+    monkeypatch.setattr(core, "openai_compatible_call", mock_llm)
+    rt = Runtime(config=config, llm_call=mock_llm)
+    root = rt.create_agent(
+        'Coordinate evidence and submit `shared/answer.json` with {"answer": "<answer-only string>"} using submit_answer.',
+        model="test",
+        orchestration_preference="parallel",
+    )
+    worker = rt.create_agent(
+        "Find evidence and write `shared/evidence.md`.",
+        model="test",
+        parent=root.id,
+        role="evidence",
+        group_id="gaia",
+    )
+    root.children.add(worker.id)
+    evidence_path = tmp_workspace / "shared" / "evidence.md"
+    evidence_path.parent.mkdir(parents=True, exist_ok=True)
+    evidence_path.write_text("Source: https://example.test\nAnswer: egalitarian\n")
+    worker.status = "done"
+    worker.artifacts.append(Artifact("shared/evidence.md", evidence_path, agent_id=worker.id))
+
+    rt._refresh_loop_action_plan(root, [])
+    await rt._maybe_select_loop_action(root, [])
+
+    assert calls["n"] == 1
+    assert root._loop_action_plan["action"] == "create"
+    assert root._loop_action_plan["reason"] == "delegate_final_delivery"
+    assert root._loop_action_selected_by == "runtime_final_delivery_guard"
+
+
+@pytest.mark.asyncio
+async def test_selector_can_soft_downgrade_direct_answer_submission(tmp_workspace, monkeypatch):
+    import nanoma.core as core
+
+    calls = {"n": 0}
+
+    async def mock_llm(messages, model, tools=None, **kwargs):
+        calls["n"] += 1
+        return LLMResponse(
+            content='{"action":"message","reason":"ask one more child"}',
+            usage=UsageRecord(input_tokens=10, output_tokens=5, model=model),
+        )
+
+    config = RuntimeConfig(
+        workspace_root=tmp_workspace,
+        log_dir=None,
+        sandbox_backend="host",
+        loop_action_policy="constraint",
+        two_stage_action_selection=True,
+    )
+    monkeypatch.setattr(core, "openai_compatible_call", mock_llm)
+    rt = Runtime(config=config, llm_call=mock_llm)
+    root = rt.create_agent(
+        'Coordinate evidence and submit `shared/answer.json` with {"answer": "<answer-only string>"} using submit_answer.',
+        model="test",
+        orchestration_preference="parallel",
+    )
+    worker = rt.create_agent(
+        "Find evidence and write `shared/evidence.md`.",
+        model="test",
+        parent=root.id,
+        role="evidence",
+        group_id="gaia",
+        current_task_tags=["role:evidence", "status:verified", "confidence:high"],
+    )
+    root.children.add(worker.id)
+    evidence_path = tmp_workspace / "shared" / "evidence.md"
+    evidence_path.parent.mkdir(parents=True, exist_ok=True)
+    evidence_path.write_text("Source: https://example.test\nAnswer: egalitarian\n")
+    worker.status = "done"
+    worker.result = "Verified answer: egalitarian"
+    worker.artifacts.append(Artifact("shared/evidence.md", evidence_path, agent_id=worker.id))
+    rt.memory.update(
+        worker.id,
+        public_summary="Verified answer evidence: egalitarian.",
+        add_artifacts=["shared/evidence.md"],
+        tags=worker.current_task_tags,
+    )
+    root._turns = 5
+    root._last_query_turn = 4
+    root._last_query_evidence_turn = 4
+    root._last_query_agent_ids = [worker.id]
+    root._last_query_reliable_evidence_ids = [worker.id]
+
+    rt._refresh_loop_action_plan(root, [])
+    await rt._maybe_select_loop_action(root, [])
+
+    assert calls["n"] == 1
+    assert root._loop_action_plan["action"] == "message"
+    assert root._loop_action_plan["reason"] == "ask one more child"
+    assert root._loop_action_selected_by == "llm_selector"
+    assert root._loop_action_plan["selector_previous_action"] == "stop"
+
+
+@pytest.mark.asyncio
+async def test_root_submits_terminal_candidate_and_broadcasts_prune(tmp_workspace):
+    calls = []
+
+    async def mock_llm(messages, model, tools=None, **kwargs):
+        calls.append({
+            "content": "\n".join(str(message.get("content") or "") for message in messages[-2:]),
+            "tools": [tool["function"]["name"] for tool in (tools or [])],
+            "tool_choice": kwargs.get("tool_choice"),
+        })
+        return LLMResponse(
+            tool_calls=[ToolCall(id="tc1", name="submit_answer", arguments={"answer": "egalitarian"})],
+            usage=UsageRecord(input_tokens=20, output_tokens=5, model=model),
+        )
+
+    config = RuntimeConfig(
+        workspace_root=tmp_workspace,
+        log_dir=None,
+        sandbox_backend="host",
+        loop_action_policy="constraint",
+        max_turns=5,
+    )
+    rt = Runtime(config=config, llm_call=mock_llm)
+    root = rt.create_agent(
+        'Coordinate evidence and submit `shared/answer.json` with {"answer": "<answer-only string>"} using submit_answer.',
+        model="test",
+        orchestration_preference="aggressive",
+    )
+    worker = rt.create_agent("Evidence lane.", model="test", parent=root.id, role="evidence")
+    synthesis = rt.create_agent(
+        "Synthesize evidence and write `shared/answer_verification.md`.",
+        model="test",
+        parent=worker.id,
+        role="synthesizer",
+        group_id="synthesis",
+        current_task_tags=["role:synthesis", "candidate_answer:egalitarian"],
+    )
+    root.children.add(worker.id)
+    worker.children.add(synthesis.id)
+    artifact_path = tmp_workspace / "shared" / "answer_verification.md"
+    artifact_path.write_text(
+        "# Answer Verification Report\n\n## Candidate Answer\n\n**egalitarian**\n\nSources: https://example.test\n",
+        encoding="utf-8",
+    )
+    synthesis.artifacts.append(Artifact("shared/answer_verification.md", artifact_path, agent_id=synthesis.id))
+    rt.memory.update(
+        synthesis.id,
+        public_summary="Candidate answer: egalitarian.",
+        add_artifacts=["shared/answer_verification.md"],
+        tags=synthesis.current_task_tags,
+    )
+    root._turns = 3
+    root._last_query_turn = 3
+    root._last_query_agent_ids = [synthesis.id]
+
+    await rt._agent_loop(root)
+
+    assert calls[0]["tools"] == ["submit_answer"]
+    assert calls[0]["tool_choice"] == {"type": "function", "function": {"name": "submit_answer"}}
+    assert "answer_hint=egalitarian" in calls[0]["content"]
+    assert json.loads((tmp_workspace / "shared" / "answer.json").read_text()) == {"answer": "egalitarian"}
+    assert worker.id in root._prune_requests_sent_targets
+    assert synthesis.id in root._prune_requests_sent_targets
+    assert [e for e in rt._events if e["event"] == "terminal_prune_request"]
 
 
 @pytest.mark.asyncio
@@ -8762,6 +9485,38 @@ async def test_terminal_answer_submission_prunes_leftover_children_after_grace(t
     assert [e for e in rt._events if e["event"] == "terminal_prune_request"]
     assert [e for e in rt._events if e["event"] == "terminal_join_grace_finished"]
     assert [e for e in rt._events if e["event"] == "terminal_leftover_agent_pruned"]
+
+
+@pytest.mark.asyncio
+async def test_root_submit_answer_immediately_notifies_descendants_to_prune(tmp_workspace):
+    config = RuntimeConfig(
+        workspace_root=tmp_workspace,
+        log_dir=None,
+        sandbox_backend="host",
+        terminal_submission_join_grace=0.05,
+    )
+    rt = Runtime(config=config)
+    root = rt.create_agent(
+        'Solve and submit `shared/answer.json` with {"answer": "<answer-only string>"}.',
+        model="test",
+    )
+    child = rt.create_agent("continue searching lane A", model="test", parent=root.id, role="worker")
+    grandchild = rt.create_agent("continue subsearch lane A1", model="test", parent=child.id, role="worker")
+    root.children.add(child.id)
+    child.children.add(grandchild.id)
+    child.status = "running"
+    grandchild.status = "idle"
+
+    result = await meta_submit_answer({"answer": "egalitarian"}, root, rt)
+
+    assert result["submitted_answer"] == "shared/answer.json"
+    assert root._prune_requests_sent_targets == {child.id, grandchild.id}
+    assert child._steer_inbox.qsize() == 1
+    assert grandchild._steer_inbox.qsize() == 1
+    assert [
+        e for e in rt._events
+        if e["event"] == "terminal_prune_request" and e["data"].get("to") in {child.id, grandchild.id}
+    ]
 
 
 @pytest.mark.asyncio

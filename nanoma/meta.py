@@ -348,6 +348,13 @@ def _spawn_dependency_score(args: dict[str, Any], agent: "Agent", runtime: "Runt
                 missing = runtime.missing_expected_outputs(peer)
                 if peer.status == "done":
                     score = 1.0
+                elif (
+                    downstream_focus
+                    and expected
+                    and peer.artifacts
+                    and any(path in {artifact.path for artifact in peer.artifacts} for path in expected)
+                ):
+                    score = 0.75
                 elif expected:
                     score = (len(expected) - len(missing)) / max(1, len(expected))
                 elif peer.artifacts or peer.result:
@@ -484,7 +491,12 @@ def _query_help(snapshots: list[dict[str, Any]]) -> dict[str, Any]:
 
 
 async def meta_spawn(args: dict[str, Any], agent: "Agent", runtime: "Runtime") -> dict[str, Any]:
-    from nanoma.core import ResourceQuota
+    from nanoma.core import (
+        ResourceQuota,
+        _inject_expected_outputs_if_needed,
+        _inject_local_deliverable_if_needed,
+        _strip_submit_answer_protocol_from_child_task,
+    )
 
     task = args.get("task", "")
     model = args.get("model")
@@ -495,6 +507,7 @@ async def meta_spawn(args: dict[str, Any], agent: "Agent", runtime: "Runtime") -
     group_id = args.get("group_id", "")
     workflow_prior = _normalize_workflow_prior(args.get("workflow_prior"))
     current_task_tags = list(args.get("current_task_tags", []))
+    expected_outputs_arg = args.get("expected_outputs") or args.get("target_outputs") or args.get("target_output_path")
     orchestration_preference = args.get("orchestration_preference")
     readiness = _spawn_dependency_score(args, agent, runtime)
 
@@ -502,6 +515,46 @@ async def meta_spawn(args: dict[str, Any], agent: "Agent", runtime: "Runtime") -
         return {"error": "task is required"}
     if _looks_like_placeholder_task(task):
         return {"error": "task appears to be a placeholder/refusal, not a concrete child task"}
+    original_task = str(task)
+    child_submit_granted = runtime.should_grant_submit_answer_to_child(
+        agent,
+        task=original_task,
+        role=str(role or ""),
+        group_id=str(group_id or ""),
+        workflow_prior=str(workflow_prior or ""),
+        current_task_tags=current_task_tags,
+    )
+    if not child_submit_granted:
+        task = _strip_submit_answer_protocol_from_child_task(original_task)
+    if task != original_task:
+        runtime._emit(agent.id, "spawn_task_sanitized", {
+            "reason": "removed_global_submit_protocol",
+            "original_preview": original_task[:200],
+            "sanitized_preview": str(task)[:200],
+        })
+    task, explicit_expected_outputs = _inject_expected_outputs_if_needed(str(task), expected_outputs_arg)
+    if explicit_expected_outputs:
+        runtime._emit(agent.id, "spawn_expected_outputs_injected", {
+            "paths": explicit_expected_outputs[:20],
+            "role": role,
+            "group_id": group_id,
+            "task_preview": str(task)[:200],
+        })
+    task, auto_local_output = _inject_local_deliverable_if_needed(
+        str(task),
+        parent_task=agent.task,
+        role=str(role or ""),
+        group_id=str(group_id or ""),
+        current_task_tags=current_task_tags,
+        child_submit_granted=child_submit_granted,
+    )
+    if auto_local_output:
+        runtime._emit(agent.id, "spawn_local_output_injected", {
+            "path": auto_local_output,
+            "role": role,
+            "group_id": group_id,
+            "task_preview": str(task)[:200],
+        })
     if agent.depth + 1 > runtime.config.max_depth:
         return {"error": f"Max depth ({runtime.config.max_depth}) exceeded"}
     if len(runtime.agents) >= runtime.config.max_agents:
@@ -598,6 +651,8 @@ async def meta_spawn(args: dict[str, Any], agent: "Agent", runtime: "Runtime") -
         current_task_tags=current_task_tags,
         orchestration_preference=orchestration_preference,
     )
+    if child_submit_granted:
+        runtime.grant_submit_answer(child)
     runtime.start_agent(child)
     runtime.state_board_update(child.id, action_state="create", current_task_tags=child.current_task_tags)
 
@@ -615,6 +670,9 @@ async def meta_spawn(args: dict[str, Any], agent: "Agent", runtime: "Runtime") -
         "group_id": group_id,
         "workflow_prior": workflow_prior,
         "current_task_tags": list(child.current_task_tags),
+        "submit_answer_granted": child_submit_granted,
+        "auto_local_output": auto_local_output,
+        "expected_outputs": explicit_expected_outputs,
         "requested_orchestration_preference": orchestration_preference,
         "orchestration_preference": child.orchestration_preference,
         "readiness": readiness["readiness"],
@@ -641,6 +699,9 @@ async def meta_spawn(args: dict[str, Any], agent: "Agent", runtime: "Runtime") -
         "group_id": group_id,
         "workflow_prior": workflow_prior,
         "current_task_tags": list(child.current_task_tags),
+        "submit_answer_granted": child_submit_granted,
+        "auto_local_output": auto_local_output,
+        "expected_outputs": explicit_expected_outputs,
         "requested_orchestration_preference": orchestration_preference,
         "orchestration_preference": child.orchestration_preference,
         "readiness": readiness["readiness"],
@@ -679,6 +740,8 @@ async def meta_spawn_many(args: dict[str, Any], agent: "Agent", runtime: "Runtim
         "depends_on",
         "readiness",
         "readiness_threshold",
+        "expected_outputs",
+        "target_output_path",
     ):
         if key in args and key not in defaults:
             defaults[key] = args[key]
@@ -1249,6 +1312,10 @@ async def meta_submit_answer(args: dict[str, Any], agent: "Agent", runtime: "Run
         return {"error": "answer required"}
     answer_text = str(answer)
     path_str = str(args.get("path") or runtime.final_answer_path_for(agent))
+    permission = runtime.can_submit_answer(agent, path_str)
+    if not permission.get("ok"):
+        runtime._emit(agent.id, "submit_answer_denied", permission)
+        return {"error": "submit_answer_denied", **permission}
     if not runtime.answer_submission_required(agent) and not path_str:
         path_str = f"{runtime.config.shared_dir}/answer.json"
 
@@ -1298,6 +1365,13 @@ async def meta_submit_answer(args: dict[str, Any], agent: "Agent", runtime: "Run
     agent.memory = {"public_memory": runtime.memory.serialize(agent.id)}
     runtime.state_board_sync(agent.id)
     runtime._refresh_task_ledger_agent_item(agent)
+    if agent.parent is None and runtime.answer_submission_required(agent):
+        running = [
+            peer
+            for peer in runtime.agents.values()
+            if peer.id != agent.id and peer.status in {"running", "idle"}
+        ]
+        await runtime._request_remaining_agents_prune_after_terminal_submission(agent, running)
     return {
         "submitted_answer": rel_path,
         "answer": answer_text,
@@ -1451,6 +1525,8 @@ META_TOOLS: dict[str, dict[str, Any]] = {
             "depends_on": {"type": "array", "items": {"type": "string"}, "description": "Agent ids, roles, group ids, or tags whose partial outputs this downstream agent depends on."},
             "readiness": {"type": "number", "description": "0-1 estimate that dependencies already have enough output for this agent to start useful work."},
             "readiness_threshold": {"type": "number", "description": "Optional 0-1 threshold for immediate start; defaults to runtime spawn_readiness_threshold."},
+            "expected_outputs": {"type": "array", "items": {"type": "string"}, "description": "Optional canonical shared output paths this child must produce or repair. Use for recovery/verifier handoffs so the ledger tracks the same output slot."},
+            "target_output_path": {"type": "string", "description": "Shortcut for one expected output path."},
         }, "required": ["task"]},
     }}} ,
     "create_agent": {"handler": meta_create_agent, "is_meta": True, "schema": {"type": "function", "function": {
@@ -1470,14 +1546,16 @@ META_TOOLS: dict[str, dict[str, Any]] = {
             "depends_on": {"type": "array", "items": {"type": "string"}},
             "readiness": {"type": "number"},
             "readiness_threshold": {"type": "number"},
+            "expected_outputs": {"type": "array", "items": {"type": "string"}},
+            "target_output_path": {"type": "string"},
         }, "required": ["task"]},
     }}} ,
     "spawn_many": {"handler": meta_spawn_many, "is_meta": True, "schema": {"type": "function", "function": {
         "name": "spawn_many",
         "description": "Create a peer wave of multiple agents in one tool call. Use early for independent worker lanes. For downstream verification/review/synthesis lanes, provide depends_on and readiness; runtime defers low-readiness entries so workers can publish partial outputs before verifier agents start. Put shared metadata in defaults and per-agent task/role/tags in agents.",
         "parameters": {"type": "object", "properties": {
-            "defaults": {"type": "object", "description": "Optional fields applied to every spawn, such as create_type='peer_agent', relationship='peer', group_id, workflow_prior, orchestration_preference, model, depends_on, readiness, or readiness_threshold."},
-            "agents": {"type": "array", "items": {"type": "object"}, "description": "Agent definitions. Each object may include task, role, create_type, relationship, group_id, workflow_prior, orchestration_preference, current_task_tags, model, delegate, depends_on, readiness, or readiness_threshold."},
+            "defaults": {"type": "object", "description": "Optional fields applied to every spawn, such as create_type='peer_agent', relationship='peer', group_id, workflow_prior, orchestration_preference, model, depends_on, readiness, readiness_threshold, or expected_outputs."},
+            "agents": {"type": "array", "items": {"type": "object"}, "description": "Agent definitions. Each object may include task, role, create_type, relationship, group_id, workflow_prior, orchestration_preference, current_task_tags, model, delegate, depends_on, readiness, readiness_threshold, expected_outputs, or target_output_path."},
             "tasks": {"type": "array", "items": {"type": "string"}, "description": "Shortcut list of task strings; defaults are applied to each."},
         }},
     }}} ,
@@ -1532,7 +1610,7 @@ META_TOOLS: dict[str, dict[str, Any]] = {
             "item_id": {"type": "string", "description": "Ledger item id to update; defaults to this agent id."},
             "status": {"type": "string", "enum": ["open", "claimed", "in_progress", "partial", "blocked", "ready_for_review", "verified", "covered", "pruned", "failed"]},
             "output_path": {"type": "string"},
-            "output_status": {"type": "string", "enum": ["missing", "draft", "partial", "unverified", "verified", "covered", "submitted", "rejected"]},
+            "output_status": {"type": "string", "enum": ["missing", "draft", "partial", "unverified", "placeholder", "evidence_gap", "evidence_attached", "verified", "covered", "submitted", "rejected"]},
             "covered_by": {"type": "array", "items": {"type": "string"}},
             "blockers": {"type": "array", "items": {"type": "object"}},
             "note": {"type": "string"},

@@ -308,12 +308,20 @@ def _referenced_input_like_shared_paths(task: str) -> list[str]:
             "public file", "public files", "input file", "read", "inspect",
             "metadata", "statement", "reference", "依据", "参考", "读取", "查看",
         )
-        output_terms = ("write", "create", "produce", "deliver", "output", "save", "append", "update", "生成", "写入", "产出", "更新", "追加")
+        output_terms = (
+            "write", "write to", "write the", "create", "produce", "deliver", "output",
+            "save", "append", "update", "overwrite", "replace", "correct",
+            "verified report", "final report", "生成", "写入", "产出", "更新", "追加", "覆盖",
+        )
         downstream_input_terms = (
             "read", "inspect", "verify", "validate", "cross-check",
             "check", "confirm", "compare", "核验", "验证", "检查", "读取",
         )
-        output_near_path = any(term in local_prefix for term in output_terms)
+        local_suffix = task_text[end: min(len(task_text), end + 64)].lower()
+        post_path_output_terms = ("overwrite", "replace", "update", "append", "if needed", "as needed", "覆盖", "更新", "追加")
+        output_near_path = any(term in local_prefix for term in output_terms) or any(
+            term in local_suffix for term in post_path_output_terms
+        )
         input_near_path = any(term in local_prefix for term in input_terms)
         downstream_input_near_path = any(term in local_prefix for term in downstream_input_terms)
         if output_near_path:
@@ -722,6 +730,213 @@ def _task_mentions_submit_answer_protocol(task: str) -> bool:
     return bool(re.search(r"\bsubmit_answer\s*\(", text)) or "submit_answer(answer" in text
 
 
+def _strip_submit_answer_protocol_from_child_task(task: str) -> str:
+    text = str(task or "")
+    if not _task_mentions_submit_answer_protocol(text) and "answer.json" not in text and "final_answer.json" not in text:
+        return text
+    replacements = [
+        (
+            r"(?im)^\s*[-*]?\s*when ready[^.\n]*submit_answer\s*\([^.\n]*(?:\.\s*)?$",
+            "",
+        ),
+        (
+            r"(?im)^\s*[-*]?\s*do not write [`'\"]?shared/(?:final_)?answer\.json[`'\"]?[^.\n]*(?:\.\s*)?$",
+            "",
+        ),
+        (
+            r"(?im)^\s*[-*]?\s*use submit_answer\s*\([^.\n]*(?:\.\s*)?$",
+            "",
+        ),
+        (
+            r"(?im)^\s*[-*]?\s*call submit_answer\s*\([^.\n]*(?:\.\s*)?$",
+            "",
+        ),
+    ]
+    for pattern, repl in replacements:
+        text = re.sub(pattern, repl, text)
+    text = re.sub(r"\bsubmit_answer\s*\([^)]*\)", "publish a local evidence summary", text)
+    text = re.sub(
+        r"(?i)\bwrite\s+[`'\"]?shared/(?:final_)?answer\.json[`'\"]?",
+        "write the requested local evidence artifact",
+        text,
+    )
+    text = re.sub(
+        r"(?i)\bsubmit\s+[`'\"]?shared/(?:final_)?answer\.json[`'\"]?",
+        "publish the requested local evidence artifact",
+        text,
+    )
+    text = re.sub(r"\n{3,}", "\n\n", text).strip()
+    if text != str(task or ""):
+        text += (
+            "\n\nLocal completion only: do not submit the global benchmark answer. "
+            "Write or compact your assigned evidence/verification result; a runtime-authorized delivery agent will submit the final answer."
+        )
+    return text
+
+
+def _slug_for_path(value: str, *, fallback: str = "agent") -> str:
+    text = str(value or "").strip().lower()
+    text = re.sub(r"[^a-z0-9]+", "_", text).strip("_")
+    text = re.sub(r"_+", "_", text)
+    return (text or fallback)[:64].strip("_") or fallback
+
+
+def _task_requests_helper_reports(task: str) -> bool:
+    text = (task or "").lower()
+    if not text.strip():
+        return False
+    helper_terms = (
+        "helper",
+        "helpers",
+        "sub-agent",
+        "sub agent",
+        "agent",
+        "agents",
+        "worker",
+        "workers",
+        "peer",
+        "peers",
+        "lane",
+        "lanes",
+    )
+    output_terms = (
+        "evidence report",
+        "short evidence report",
+        "report",
+        "reports",
+        "artifact",
+        "artifacts",
+        "write",
+        "produce",
+        "deliver",
+        "save",
+        "产物",
+        "报告",
+        "写",
+    )
+    return any(term in text for term in helper_terms) and any(term in text for term in output_terms)
+
+
+def _preferred_child_output_dir_from_parent_task(parent_task: str) -> str | None:
+    task = parent_task or ""
+    candidates: list[str] = []
+    for match in re.finditer(r"`(shared/[^`]+/)`", task):
+        candidates.append(match.group(1).strip())
+    for match in re.finditer(r"(?<![\w/])(shared/[^\s`'\"<>)\]}]+/)", task):
+        candidates.append(match.group(1).strip())
+    for raw in candidates:
+        path = raw.rstrip(".,;:)]}") + "/"
+        path = re.sub(r"/+", "/", path)
+        if not path.startswith("shared/"):
+            continue
+        if _looks_like_final_answer_path(path.rstrip("/")):
+            continue
+        lowered = path.lower()
+        if any(term in lowered for term in ("gaia", "evidence", "report", "agent_outputs", "lane", "research")):
+            return path
+    return None
+
+
+def _lane_slug_for_child_output(
+    *,
+    role: str = "",
+    group_id: str = "",
+    current_task_tags: list[str] | tuple[str, ...] | set[str] | None = None,
+) -> str:
+    tags = [str(tag).strip() for tag in (current_task_tags or []) if str(tag).strip()]
+    lane_tags = []
+    for tag in tags:
+        lowered = tag.lower()
+        if lowered.startswith(("lane:", "role:", "deliverable:", "feature:")):
+            lane_tags.append(tag.split(":", 1)[1])
+    for candidate in [role, *lane_tags, group_id]:
+        slug = _slug_for_path(candidate, fallback="")
+        if slug and slug not in {"agent", "worker", "evidence", "verifier", "researcher", "peer_agent"}:
+            return slug
+    return "local_report"
+
+
+def _default_child_output_path(
+    *,
+    parent_task: str,
+    role: str = "",
+    group_id: str = "",
+    current_task_tags: list[str] | tuple[str, ...] | set[str] | None = None,
+) -> str:
+    output_dir = _preferred_child_output_dir_from_parent_task(parent_task)
+    if not output_dir:
+        group_slug = _slug_for_path(group_id, fallback="default")
+        output_dir = f"shared/.nanoma/agent_outputs/{group_slug}/"
+    lane_slug = _lane_slug_for_child_output(role=role, group_id=group_id, current_task_tags=current_task_tags)
+    return f"{output_dir.rstrip('/')}/{lane_slug}_evidence.md"
+
+
+def _inject_local_deliverable_if_needed(
+    task: str,
+    *,
+    parent_task: str,
+    role: str = "",
+    group_id: str = "",
+    current_task_tags: list[str] | tuple[str, ...] | set[str] | None = None,
+    child_submit_granted: bool = False,
+) -> tuple[str, str | None]:
+    if child_submit_granted:
+        return task, None
+    if _expected_output_paths(task):
+        return task, None
+    if not _task_requests_helper_reports(parent_task):
+        return task, None
+    path = _default_child_output_path(
+        parent_task=parent_task,
+        role=role,
+        group_id=group_id,
+        current_task_tags=current_task_tags,
+    )
+    if _looks_like_final_answer_path(path):
+        return task, None
+    instruction = (
+        "\n\nRequired local output:\n"
+        f"- Write your evidence or verification report to `{path}` before you stop.\n"
+        "- Include concise sources/IDs, findings, confidence, blockers, and task/lane tags.\n"
+        "- This is a local deliverable for ledger/query; do not submit the global answer."
+    )
+    return str(task or "").rstrip() + instruction, path
+
+
+def _inject_expected_outputs_if_needed(task: str, expected_outputs: list[str] | tuple[str, ...] | set[str] | None) -> tuple[str, list[str]]:
+    outputs: list[str] = []
+    seen: set[str] = set()
+    raw_outputs: Any = expected_outputs
+    if isinstance(raw_outputs, str):
+        raw_outputs = [raw_outputs]
+    for raw in raw_outputs or []:
+        path = str(raw or "").strip().strip("`'\"")
+        if not path:
+            continue
+        path = path.rstrip(".,;:)]}")
+        if not _looks_like_output_path(path):
+            continue
+        if _looks_like_final_answer_path(path):
+            continue
+        if path not in seen:
+            seen.add(path)
+            outputs.append(path)
+    if not outputs:
+        return task, []
+    existing = set(_non_terminal_expected_output_paths(task))
+    missing = [path for path in outputs if path not in existing]
+    if not missing:
+        return task, outputs
+    lines = "\n".join(f"- `{path}`" for path in missing)
+    instruction = (
+        "\n\nRequired output slot(s):\n"
+        f"{lines}\n"
+        "- Treat these as the canonical deliverables for this task. If an existing file is low-confidence, replace it with evidence-backed content.\n"
+        "- Include concise evidence references, confidence, blockers, and tags in the artifact where applicable."
+    )
+    return str(task or "").rstrip() + instruction, outputs
+
+
 def _non_terminal_expected_output_paths(task: str) -> list[str]:
     return [path for path in _expected_output_paths(task) if not _looks_like_final_answer_path(path)]
 
@@ -747,12 +962,14 @@ _TEXT_TOOL_ALIASES: dict[str, str] = {
 }
 
 _LOOP_ACTIONS = {"create", "read", "message", "work", "compact", "stop"}
+_ROOT_SUBMIT_ONLY_REASONS = {"direct_answer_submission_ready", "terminal_candidate_submit_ready"}
 _CREATE_EXECUTION_TOOLS = {"spawn", "create_agent", "spawn_many"}
 _CREATE_STATE_TOOLS = {"compact", "set_status", "get_cost"}
 _LEDGER_READ_TOOLS = {"ledger_read"}
 _LEDGER_WRITE_TOOLS = {"ledger_update"}
 _LEDGER_TOOLS = _LEDGER_READ_TOOLS | _LEDGER_WRITE_TOOLS
 _TASK_LEDGER_OUTPUT_DONE_STATUSES = {"verified", "covered", "submitted"}
+_TASK_LEDGER_OUTPUT_INCOMPLETE_STATUSES = {"missing", "unverified", "placeholder", "evidence_gap"}
 _TASK_LEDGER_TERMINAL_STATUSES = {"verified", "covered", "pruned", "failed"}
 _STRONG_UNVERIFIED_EVIDENCE_TERMS = (
     "unverified",
@@ -818,12 +1035,36 @@ _PLACEHOLDER_EVIDENCE_TERMS = (
     "todo:",
 )
 _UNVERIFIED_EVIDENCE_TERMS = _STRONG_UNVERIFIED_EVIDENCE_TERMS + _PLACEHOLDER_EVIDENCE_TERMS
+_EVIDENCE_ATTACHED_TERMS = (
+    "source:",
+    "sources:",
+    "citation:",
+    "citations:",
+    "url:",
+    "doi:",
+    "arxiv:",
+    "arxiv id",
+    "http://",
+    "https://",
+    "retrieved",
+    "primary source",
+    "evidence ref",
+    "evidence_refs",
+)
 _COMPLETION_CLAIM_TAGS = {
     "status:complete",
     "status:done",
     "confidence:high",
     "verified:true",
 }
+_TERMINAL_ANSWER_ARTIFACT_TERMS = (
+    "candidate answer",
+    "final answer",
+    "answer verification",
+    "cross-check complete",
+    "overlap analysis",
+    "candidate_answer:",
+)
 _TRUTH_GUARD_UNVERIFIED_TAGS = {"status:unverified", "needs:verification", "confidence:low"}
 _CREATE_ALLOWED_TOOLS = _CREATE_EXECUTION_TOOLS | _CREATE_STATE_TOOLS
 _UNCERTAIN_EVIDENCE_CREATE_REASONS = {
@@ -1136,6 +1377,62 @@ def _focus_class_from_parts(
     ):
         return "verification"
     return "evidence"
+
+
+def _extract_terminal_answer_hint(text: str) -> str:
+    if not text:
+        return ""
+    lines = text.splitlines()
+    for index, line in enumerate(lines):
+        stripped_heading = line.strip()
+        if not stripped_heading.startswith("#"):
+            continue
+        heading_text = re.sub(r"^#+\s*", "", stripped_heading).strip().lower()
+        heading_text = heading_text.strip(" .,:;`*_\"'")
+        if heading_text not in {"candidate answer", "final answer", "answer"}:
+            continue
+        for next_line in lines[index + 1:index + 8]:
+            candidate = next_line.strip()
+            if not candidate or candidate.startswith("#") or candidate.startswith("|"):
+                continue
+            candidate = candidate.strip(" .,:;`*_\"'")
+            if 0 < len(candidate) <= 120 and not _looks_like_process_chatter(candidate):
+                return candidate
+    patterns = (
+        r"(?im)^\s*(?:candidate\s+answer|final\s+answer|answer)\s*[:\-]\s*\**`?\"?([^`\"\n*|]{1,120})",
+        r"(?im)\bcandidate_answer\s*:\s*([^\s,;|\n]{1,120})",
+        r"(?im)\boverlap\s*:\s*\**`?\"?([^`\"\n*|]{1,120})",
+    )
+    for pattern in patterns:
+        match = re.search(pattern, text)
+        if not match:
+            continue
+        answer = match.group(1).strip()
+        answer = re.sub(r"\s+\|.*$", "", answer).strip()
+        answer = re.sub(r"\s+-\s+.*$", "", answer).strip()
+        answer = answer.strip(" .,:;`*_\"'")
+        if 0 < len(answer) <= 120 and not _looks_like_process_chatter(answer):
+            return answer
+    return ""
+
+
+def _explicit_final_delivery_identity(
+    *,
+    role: str = "",
+    group_id: str = "",
+    workflow_prior: str = "",
+    current_task_tags: list[str] | tuple[str, ...] | set[str] | None = None,
+) -> bool:
+    tags = [str(tag).strip().lower() for tag in (current_task_tags or []) if str(tag).strip()]
+    identity = "\n".join([role or "", group_id or "", workflow_prior or "", " ".join(tags)]).lower()
+    return bool(
+        "final_delivery" in identity
+        or "final-delivery" in identity
+        or "role:delivery" in identity
+        or "role:finalizer" in identity
+        or re.search(r"\bfinali[sz]er\b", identity)
+        or re.search(r"\bdelivery\b", identity)
+    )
 
 
 @dataclass
@@ -1565,6 +1862,7 @@ class Runtime:
         self._messages_sent: list[tuple[str, str, int]] = []  # (from, to, tokens) for comm graph
         self._last_llm_messages: dict[str, list[Message]] = {}
         self.task_ledger: dict[str, Any] = {}
+        self._submit_answer_grants: set[str] = set()
         self._emit_lock = threading.Lock()  # protects events.jsonl writes
 
         self.config.workspace_root.mkdir(parents=True, exist_ok=True)
@@ -1676,6 +1974,8 @@ class Runtime:
 
         self.agents[agent_id] = agent
         agent._created_at = time.time()
+        if parent is None and self.answer_submission_required(agent):
+            self._submit_answer_grants.add(agent.id)
         if parent and parent in self.agents:
             self.agents[parent].children.add(agent_id)
         self.memory.init_agent(agent_id, task=task, tags=agent.current_task_tags)
@@ -1694,6 +1994,7 @@ class Runtime:
             "group_id": group_id,
             "workflow_prior": workflow_prior,
             "current_task_tags": list(agent.current_task_tags),
+            "submit_answer_granted": agent.id in self._submit_answer_grants,
             "orchestration_preference": agent_orchestration_preference,
             "orchestration_resolution": orchestration_resolution,
         })
@@ -1881,8 +2182,34 @@ class Runtime:
                 return str(output.get("status") or "")
         return ""
 
+    def _prune_resolved_output_blockers(
+        self,
+        blockers: Any,
+        resolved_outputs: set[str],
+    ) -> list[Any]:
+        if not isinstance(blockers, list) or not resolved_outputs:
+            return list(blockers or []) if isinstance(blockers, list) else []
+        kept: list[Any] = []
+        for blocker in blockers:
+            if not isinstance(blocker, dict):
+                kept.append(blocker)
+                continue
+            kind = str(blocker.get("kind") or "")
+            if kind not in {"uncertain_evidence", "unverified_evidence"}:
+                kept.append(blocker)
+                continue
+            artifacts = {
+                str(path)
+                for path in _normalize_string_list(blocker.get("artifacts"))
+            }
+            if artifacts and artifacts.issubset(resolved_outputs):
+                continue
+            kept.append(blocker)
+        return kept
+
     def _task_ledger_output_entries(self, agent: Agent, existing: dict[str, Any]) -> list[dict[str, Any]]:
         outputs: list[dict[str, Any]] = []
+        resolved_outputs: set[str] = set()
         for path in _expected_output_paths(agent.task):
             existing_status = self._task_ledger_existing_output_status(existing, path)
             abs_path = self._tool_context.workspace_root / path
@@ -1895,22 +2222,8 @@ class Runtime:
                     break
             if existing_status == "covered" and covered_by:
                 status = "covered"
-            elif not exists:
-                status = "missing"
-            elif is_final_answer and agent.submitted_answer_path == path:
-                status = "submitted"
-            elif is_final_answer:
-                status = "draft"
-            elif self._artifact_has_unverified_signal(path):
-                status = "unverified"
-            elif existing_status in _TASK_LEDGER_OUTPUT_DONE_STATUSES:
-                status = existing_status
-            elif agent.status == "done" and not self._agent_has_uncertain_evidence(agent):
-                status = "verified"
-            elif path in {artifact.path for artifact in agent.artifacts}:
-                status = "draft"
             else:
-                status = "draft"
+                status = self._artifact_output_status(agent, path, existing_status)
             entry = {
                 "path": path,
                 "status": status,
@@ -1922,7 +2235,11 @@ class Runtime:
                 entry["final_answer"] = True
                 if agent.submitted_answer_path:
                     entry["submitted_answer_path"] = agent.submitted_answer_path
+            if status in {"evidence_attached", "verified", "covered", "submitted"}:
+                resolved_outputs.add(path)
             outputs.append(entry)
+        if resolved_outputs and existing.get("blockers"):
+            existing["blockers"] = self._prune_resolved_output_blockers(existing.get("blockers"), resolved_outputs)
         return outputs
 
     def _task_ledger_agent_status(
@@ -1945,7 +2262,9 @@ class Runtime:
             statuses = {str(output.get("status") or "") for output in outputs}
             if statuses and statuses.issubset(_TASK_LEDGER_OUTPUT_DONE_STATUSES):
                 return "verified" if agent.status == "done" else "ready_for_review"
-            if statuses.intersection({"draft", "unverified"}):
+            if statuses == {"evidence_attached"}:
+                return "verified" if agent.status == "done" else "ready_for_review"
+            if statuses.intersection({"draft", "unverified", "placeholder", "evidence_gap"}):
                 return "partial"
             if "missing" in statuses:
                 if existing_status in {"blocked", "partial", "ready_for_review", "claimed"}:
@@ -2181,7 +2500,10 @@ class Runtime:
             output_status = str(args.get("output_status") or args.get("status") or "").strip()
             if not output_status:
                 output_status = "draft"
-            allowed_output_statuses = {"missing", "draft", "partial", "unverified", "verified", "covered", "submitted", "rejected"}
+            allowed_output_statuses = {
+                "missing", "draft", "partial", "unverified", "placeholder", "evidence_gap",
+                "evidence_attached", "verified", "covered", "submitted", "rejected",
+            }
             if output_status not in allowed_output_statuses:
                 return {"error": f"Unknown output status '{output_status}'"}
             outputs = [dict(output) for output in (item.get("expected_outputs") or []) if isinstance(output, dict)]
@@ -2569,6 +2891,12 @@ class Runtime:
                     and any((tool.get("function") or {}).get("name") == "set_status" for tool in turn_tool_schemas)
                 ):
                     recommended_tool_choice = "set_status"
+                elif (
+                    loop_action == "stop"
+                    and turn_tool_scope == "answer_submit_only"
+                    and any((tool.get("function") or {}).get("name") == "submit_answer" for tool in turn_tool_schemas)
+                ):
+                    recommended_tool_choice = "submit_answer"
                 elif loop_action and turn_tool_scope != "action_default":
                     scoped_tool_names = [
                         str((tool.get("function") or {}).get("name") or "")
@@ -3345,6 +3673,8 @@ class Runtime:
             tag for tag in agent.current_task_tags if str(tag).startswith(disambiguating_prefixes)
         }
         for peer in self._peer_progress_candidates(agent):
+            if not self._agents_have_compatible_output_slot(agent, peer):
+                continue
             if not (agent.group_id and peer.group_id and agent.group_id == peer.group_id):
                 shared_tags = self._shared_coordination_tags(agent, peer)
                 if not shared_tags:
@@ -3647,11 +3977,83 @@ class Runtime:
         if not expected:
             return []
         missing: list[str] = []
+        ledger = self._ensure_task_ledger_loaded()
+        item = (ledger.get("items") or {}).get(agent.id) or {}
         for path in expected:
             abs_path = self._tool_context.workspace_root / path
             if not abs_path.exists():
                 missing.append(path)
+                continue
+            existing_status = self._task_ledger_existing_output_status(item, path)
+            status = self._artifact_output_status(agent, path, existing_status)
+            if status in {"placeholder", "evidence_gap", "unverified"}:
+                missing.append(path)
         return missing
+
+    def submit_answer_granted(self, agent: Agent) -> bool:
+        return agent.id in self._submit_answer_grants
+
+    def grant_submit_answer(self, agent: Agent) -> None:
+        self._submit_answer_grants.add(agent.id)
+        self._emit(agent.id, "submit_answer_grant", {
+            "path": self.final_answer_path_for(agent),
+        })
+
+    def can_submit_answer(self, agent: Agent, path: str | None = None) -> dict[str, Any]:
+        if not self.answer_submission_required(agent):
+            return {
+                "ok": False,
+                "reason": "answer_submission_not_required_for_this_agent",
+                "advice": "Finish local work with file artifacts, compact, or set_status instead.",
+            }
+        if agent.id not in self._submit_answer_grants:
+            return {
+                "ok": False,
+                "reason": "submit_answer_not_granted",
+                "advice": (
+                    "This is local or intermediate work. Publish evidence/verification locally; "
+                    "only a runtime-authorized delivery agent may submit the global answer."
+                ),
+            }
+        expected_path = self.final_answer_path_for(agent)
+        if path:
+            normalized = self._normalize_workspace_relative_path(path, agent.workspace)
+            if normalized and normalized != expected_path:
+                return {
+                    "ok": False,
+                    "reason": "submit_answer_path_mismatch",
+                    "expected_path": expected_path,
+                    "requested_path": normalized,
+                }
+        return {"ok": True, "path": expected_path}
+
+    def should_grant_submit_answer_to_child(
+        self,
+        parent: Agent,
+        *,
+        task: str,
+        role: str = "",
+        group_id: str = "",
+        workflow_prior: str = "",
+        current_task_tags: list[str] | None = None,
+    ) -> bool:
+        if not self.can_submit_answer(parent).get("ok"):
+            return False
+        if not _explicit_final_delivery_identity(
+            role=role,
+            group_id=group_id,
+            workflow_prior=workflow_prior,
+            current_task_tags=current_task_tags,
+        ):
+            return False
+        focus = _focus_class_from_parts(
+            task=task,
+            role=role,
+            group_id=group_id,
+            workflow_prior=workflow_prior,
+            current_task_tags=current_task_tags,
+        )
+        return focus == "final_delivery"
 
     def answer_submission_required(self, agent: Agent) -> bool:
         return bool(_final_answer_paths(agent.task)) or _task_mentions_submit_answer_protocol(agent.task)
@@ -4415,18 +4817,59 @@ class Runtime:
         return any(term in "\n".join(parts).lower() for term in _UNVERIFIED_EVIDENCE_TERMS)
 
     def _artifact_has_unverified_signal(self, rel_path: str) -> bool:
+        text = self._artifact_text(rel_path, limit=12000)
+        return bool(text) and any(term in text for term in _UNVERIFIED_EVIDENCE_TERMS)
+
+    def _artifact_text(self, rel_path: str, *, limit: int = 12000) -> str:
         abs_path = (self.config.workspace_root / rel_path).resolve()
         try:
             abs_path.relative_to(self.config.workspace_root.resolve())
         except ValueError:
-            return False
+            return ""
         if not abs_path.is_file():
-            return False
+            return ""
         try:
-            text = abs_path.read_text(errors="replace")[:12000].lower()
+            return abs_path.read_text(errors="replace")[:limit].lower()
         except OSError:
-            return False
-        return any(term in text for term in _UNVERIFIED_EVIDENCE_TERMS)
+            return ""
+
+    def _artifact_output_status(self, agent: Agent, path: str, existing_status: str = "") -> str:
+        abs_path = self._tool_context.workspace_root / path
+        exists = abs_path.exists()
+        is_final_answer = _looks_like_final_answer_path(path)
+        if existing_status == "covered":
+            return "covered"
+        if not exists:
+            return "missing"
+        if is_final_answer and agent.submitted_answer_path == path:
+            return "submitted"
+        if is_final_answer:
+            return "draft"
+        text = self._artifact_text(path, limit=16000)
+        if text:
+            if any(term in text for term in _PLACEHOLDER_EVIDENCE_TERMS):
+                return "placeholder"
+            if any(term in text for term in _STRONG_UNVERIFIED_EVIDENCE_TERMS):
+                return "evidence_gap"
+        if existing_status in _TASK_LEDGER_OUTPUT_DONE_STATUSES:
+            return existing_status
+        evidence_refs: list[str] = []
+        ledger = self._ensure_task_ledger_loaded()
+        item = (ledger.get("items") or {}).get(agent.id) or {}
+        for output in item.get("expected_outputs") or []:
+            if isinstance(output, dict) and output.get("path") == path:
+                evidence_refs = _normalize_string_list(output.get("evidence_refs"))
+                break
+        if evidence_refs or any(term in text for term in _EVIDENCE_ATTACHED_TERMS):
+            return "evidence_attached"
+        if agent.status == "done" and not self._agent_has_uncertain_evidence(agent) and self._agent_has_reliable_evidence(agent):
+            return "verified"
+        if path in {artifact.path for artifact in agent.artifacts}:
+            return "draft"
+        return "draft"
+
+    def _output_status_is_incomplete_for_scheduling(self, status: str) -> bool:
+        return status in _TASK_LEDGER_OUTPUT_INCOMPLETE_STATUSES
 
     def _uncertain_artifact_paths(self, agent: Agent, *, expected_only: bool = False) -> list[str]:
         paths: list[str] = []
@@ -4536,6 +4979,20 @@ class Runtime:
                 paths.update(path for path in card.artifacts if path)
         return paths
 
+    def _agents_have_compatible_output_slot(self, left: Agent, right: Agent) -> bool:
+        left_outputs = set(_non_terminal_expected_output_paths(left.task))
+        right_outputs = set(_non_terminal_expected_output_paths(right.task))
+        if left_outputs and right_outputs:
+            return bool(left_outputs.intersection(right_outputs))
+        return True
+
+    def _spawn_request_has_compatible_output_slot(self, agent: Agent, task: str) -> bool:
+        request_outputs = set(_non_terminal_expected_output_paths(task))
+        agent_outputs = set(_non_terminal_expected_output_paths(agent.task))
+        if request_outputs and agent_outputs:
+            return bool(request_outputs.intersection(agent_outputs))
+        return True
+
     def _spawn_request_overlaps_agent_lane(
         self,
         agent: Agent,
@@ -4550,6 +5007,8 @@ class Runtime:
         request_inputs = set(_referenced_input_like_shared_paths(task))
         request_paths = request_outputs.union(request_inputs)
         agent_paths = self._agent_known_artifact_paths(agent).union(_non_terminal_expected_output_paths(agent.task))
+        if not self._spawn_request_has_compatible_output_slot(agent, task):
+            return False
         if request_paths and agent_paths and request_paths.intersection(agent_paths):
             return True
 
@@ -4798,6 +5257,8 @@ class Runtime:
         right_outputs = set(_non_terminal_expected_output_paths(right.task))
         if left_outputs and right_outputs and left_outputs.intersection(right_outputs):
             return True
+        if left_outputs and right_outputs:
+            return False
         left_lanes = _agent_lane_fingerprints(left)
         right_lanes = _agent_lane_fingerprints(right)
         if left_lanes and right_lanes and left_lanes.intersection(right_lanes):
@@ -5093,7 +5554,15 @@ class Runtime:
             "terminal artifact, compact your current state with status:pruned and stop. If you have a critical "
             "contradiction that should block the answer, publish it immediately with compact/set_status."
         )
-        for agent in running:
+        notify_targets: list[Agent] = []
+        seen: set[str] = set()
+        for agent in list(running) + self._descendant_agents(root):
+            if agent.id in seen:
+                continue
+            seen.add(agent.id)
+            notify_targets.append(agent)
+
+        for agent in notify_targets:
             if agent.id == root.id:
                 continue
             if agent.status not in {"running", "idle"}:
@@ -5278,6 +5747,10 @@ class Runtime:
             _task_is_discovery_work(agent.task) and _non_terminal_expected_output_paths(agent.task)
         ):
             return False
+        for path in missing_outputs:
+            status = self._artifact_output_status(agent, path)
+            if status in {"placeholder", "evidence_gap", "unverified"}:
+                return True
         if (agent._turns - agent._last_read_evidence_turn) <= 4 and agent._last_read_evidence_turn > 0:
             return False
         if (agent._turns - agent._last_query_evidence_turn) <= 4 and agent._last_query_evidence_turn > 0:
@@ -5392,6 +5865,19 @@ class Runtime:
         if normalized not in {artifact.path for artifact in agent.artifacts}:
             agent.artifacts.append(Artifact(path=normalized, absolute_path=abs_path, description="expected output", agent_id=agent.id))
         self.memory.update(agent.id, add_artifacts=[normalized], tags=agent.current_task_tags)
+        output_status = self._artifact_output_status(agent, normalized)
+        update_args: dict[str, Any] = {
+            "output_path": normalized,
+            "output_status": output_status,
+        }
+        if output_status in {"placeholder", "evidence_gap", "unverified"}:
+            update_args["status"] = "partial"
+            update_args["blockers"] = [{
+                "kind": "uncertain_evidence",
+                "message": "Expected output exists but its content says evidence is pending, placeholder, or low confidence.",
+                "artifacts": [normalized],
+            }]
+        self.task_ledger_update(agent, update_args)
 
     def _publish_shell_evidence(self, agent: Agent, command: str, result: dict[str, Any]) -> None:
         stdout = str(result.get("stdout") or "").strip()
@@ -5727,6 +6213,8 @@ class Runtime:
                 continue
             if not peer.parent:
                 continue
+            if not self._agents_have_compatible_output_slot(agent, peer):
+                continue
             peer_outputs = set(_non_terminal_expected_output_paths(peer.task))
             same_output = bool(agent_outputs and peer_outputs and agent_outputs.intersection(peer_outputs))
             lane_overlap = bool(agent_lanes and _agent_lane_fingerprints(peer).intersection(agent_lanes))
@@ -5988,7 +6476,7 @@ class Runtime:
             ],
         }
 
-    def _answer_submission_ready(self, agent: Agent) -> bool:
+    def _non_root_answer_submission_ready(self, agent: Agent) -> bool:
         if not self.answer_submission_required(agent) or agent.submitted_answer_path:
             return False
         if self._agent_has_uncertain_evidence(agent):
@@ -6015,8 +6503,242 @@ class Runtime:
             return True
         return False
 
+    def _answer_submission_ready(self, agent: Agent) -> bool:
+        if agent.parent is None:
+            return bool(self._root_answer_readiness(agent).get("can_attempt_submit"))
+        return self._non_root_answer_submission_ready(agent)
+
     def _answer_submission_pending(self, agent: Agent) -> bool:
         return self.answer_submission_required(agent) and not agent.submitted_answer_path
+
+    def _agent_has_mature_output_slot(self, agent: Agent) -> bool:
+        for output in self._task_ledger_output_entries(agent, {}):
+            if str(output.get("status") or "") in {"evidence_attached", "verified", "covered", "submitted"}:
+                return True
+        return False
+
+    def _agent_ready_for_final_delivery_evidence(self, agent: Agent) -> bool:
+        if self._agent_has_uncertain_evidence(agent):
+            return False
+        return self._agent_has_reliable_evidence(agent) or self._agent_has_mature_output_slot(agent)
+
+    def _terminal_answer_candidate_from_agent(self, agent: Agent) -> dict[str, Any] | None:
+        if self._agent_has_uncertain_evidence(agent):
+            return None
+        focus = self._agent_focus_class(agent)
+        identity_text = " ".join([
+            agent.role,
+            agent.group_id,
+            agent.workflow_prior,
+            " ".join(agent.current_task_tags),
+            agent.task[:600],
+        ]).lower()
+        terminal_identity = (
+            focus in {"synthesis", "verification", "final_delivery"}
+            or any(term in identity_text for term in ("synthesis", "answer", "final", "overlap", "cross-check"))
+        )
+        if not terminal_identity:
+            return None
+        candidate_paths = [artifact.path for artifact in agent.artifacts]
+        candidate_paths.extend(_non_terminal_expected_output_paths(agent.task))
+        seen_paths: set[str] = set()
+        for path in candidate_paths[:12]:
+            path = str(path or "")
+            if not path or path in seen_paths or _looks_like_final_answer_path(path):
+                continue
+            seen_paths.add(path)
+            text = self._artifact_text(path, limit=24000)
+            if not text:
+                continue
+            lowered = text.lower()
+            if not any(term in lowered for term in _TERMINAL_ANSWER_ARTIFACT_TERMS):
+                continue
+            answer_hint = _extract_terminal_answer_hint(text)
+            if not answer_hint:
+                continue
+            return {
+                "id": agent.id,
+                "role": agent.role,
+                "status": agent.status,
+                "focus": focus,
+                "artifact": path,
+                "answer_hint": answer_hint,
+                "result": (agent.result or "")[:240],
+                "tags": agent.current_task_tags[:12],
+            }
+        result_hint = _extract_terminal_answer_hint(agent.result or "")
+        if result_hint:
+            return {
+                "id": agent.id,
+                "role": agent.role,
+                "status": agent.status,
+                "focus": focus,
+                "artifact": "",
+                "answer_hint": result_hint,
+                "result": (agent.result or "")[:240],
+                "tags": agent.current_task_tags[:12],
+            }
+        return None
+
+    def _root_terminal_answer_candidate(self, agent: Agent) -> dict[str, Any] | None:
+        if agent.parent is not None or not self.answer_submission_required(agent):
+            return None
+        related = self._related_agents_for_completion_evidence(agent)
+        related.extend(peer for peer in self.agents.values() if peer.id not in {item.id for item in related})
+        seen: set[str] = set()
+        candidates: list[dict[str, Any]] = []
+        queried_ids = set(agent._last_query_agent_ids)
+        for peer in related:
+            if peer.id == agent.id or peer.id in seen:
+                continue
+            seen.add(peer.id)
+            candidate = self._terminal_answer_candidate_from_agent(peer)
+            if not candidate:
+                continue
+            if queried_ids and peer.id not in queried_ids and peer.parent not in queried_ids:
+                candidate["not_recently_queried"] = True
+            candidates.append(candidate)
+        if not candidates:
+            return None
+        candidates.sort(key=lambda item: (
+            1 if item.get("not_recently_queried") else 0,
+            0 if item.get("status") == "done" else 1,
+            0 if item.get("focus") in {"synthesis", "final_delivery"} else 1,
+            str(item.get("id") or ""),
+        ))
+        best = candidates[0]
+        if best.get("not_recently_queried") and agent._last_query_turn > 0:
+            return None
+        return best
+
+    def _record_root_terminal_answer_candidate(self, agent: Agent, candidate: dict[str, Any]) -> None:
+        self.task_ledger_update(agent, {
+            "item_id": agent.id,
+            "status": "ready_for_review",
+            "note": (
+                "terminal_candidate_ready: "
+                f"answer_hint={candidate.get('answer_hint') or ''}; "
+                f"source_agent={candidate.get('id') or ''}; "
+                f"artifact={candidate.get('artifact') or ''}"
+            ),
+            "covered_by": [str(candidate.get("id") or "")],
+        })
+
+    def _agent_ledger_output_summary(self, agent: Agent) -> dict[str, Any]:
+        item = self.task_ledger_item_snapshot(agent) or {}
+        outputs = [output for output in item.get("expected_outputs") or [] if isinstance(output, dict)]
+        incomplete = [
+            output
+            for output in outputs
+            if str(output.get("status") or "") in _TASK_LEDGER_OUTPUT_INCOMPLETE_STATUSES
+        ]
+        mature = [
+            output
+            for output in outputs
+            if str(output.get("status") or "") in {"evidence_attached", "verified", "covered", "submitted"}
+        ]
+        blockers = list(item.get("blockers") or [])
+        return {
+            "id": agent.id,
+            "status": item.get("status") or agent.status,
+            "agent_status": item.get("agent_status") or agent.status,
+            "outputs": outputs,
+            "incomplete_outputs": incomplete,
+            "mature_outputs": mature,
+            "blockers": blockers,
+        }
+
+    def _root_answer_readiness(self, agent: Agent) -> dict[str, Any]:
+        terminal_candidate = self._root_terminal_answer_candidate(agent)
+        evidence_agents = self._final_delivery_evidence_agents(agent)
+        unfinished = self.unfinished_child_agents(agent)
+        related = [
+            peer
+            for peer in self._related_agents_for_completion_evidence(agent)
+            if peer.id != agent.id
+        ]
+        child_summaries = [self._agent_ledger_output_summary(peer) for peer in related[:12]]
+        incomplete_children = [
+            summary for summary in child_summaries
+            if summary["incomplete_outputs"] or str(summary.get("status") or "") in {"in_progress", "partial"}
+        ]
+        blocker_kinds = {
+            str(blocker.get("kind") or "")
+            for blocker in self.completion_blockers(agent, include_missing_outputs=False)
+            if blocker.get("kind") != "answer_submission"
+        }
+        recently_inspected = self._root_recently_inspected_final_delivery_evidence(agent, evidence_agents)
+        score = 0.0
+        reasons: list[str] = []
+        if terminal_candidate:
+            score += 0.72
+            reasons.append("terminal_candidate")
+        if evidence_agents:
+            score += min(0.55, 0.35 + 0.10 * len(evidence_agents))
+            reasons.append("mature_evidence")
+        if recently_inspected:
+            score += 0.25
+            reasons.append("recently_inspected")
+        if not incomplete_children and evidence_agents:
+            score += 0.20
+            reasons.append("no_known_child_gaps")
+        if unfinished and not terminal_candidate:
+            score -= min(0.28, 0.10 * len(unfinished))
+            reasons.append("unfinished_children")
+        if incomplete_children and not terminal_candidate:
+            score -= min(0.35, 0.12 * len(incomplete_children))
+            reasons.append("ledger_gaps")
+        if blocker_kinds:
+            score -= min(0.20, 0.08 * len(blocker_kinds))
+            reasons.append("completion_blockers")
+        score = max(0.0, min(1.0, score))
+        return {
+            "score": round(score, 3),
+            "submit_only_ready": score >= 0.82 and (bool(terminal_candidate) or recently_inspected),
+            "can_attempt_submit": score >= 0.45 or bool(evidence_agents) or bool(terminal_candidate),
+            "terminal_candidate": terminal_candidate,
+            "evidence_agents": evidence_agents,
+            "unfinished_agents": unfinished,
+            "incomplete_children": incomplete_children,
+            "blocker_kinds": sorted(kind for kind in blocker_kinds if kind),
+            "recently_inspected": recently_inspected,
+            "reasons": reasons,
+        }
+
+    def _root_answer_readiness_public(self, readiness: dict[str, Any]) -> dict[str, Any]:
+        evidence_agents = readiness.get("evidence_agents") or []
+        unfinished_agents = readiness.get("unfinished_agents") or []
+        return {
+            "score": readiness.get("score", 0.0),
+            "submit_only_ready": bool(readiness.get("submit_only_ready")),
+            "can_attempt_submit": bool(readiness.get("can_attempt_submit")),
+            "reasons": list(readiness.get("reasons") or [])[:8],
+            "recently_inspected": bool(readiness.get("recently_inspected")),
+            "blocker_kinds": list(readiness.get("blocker_kinds") or [])[:8],
+            "terminal_candidate": readiness.get("terminal_candidate") or None,
+            "evidence_agents": [
+                {
+                    "id": peer.id,
+                    "role": peer.role,
+                    "status": peer.status,
+                    "artifacts": sorted(self._agent_known_artifact_paths(peer))[:8],
+                    "result": (peer.result or "")[:220],
+                }
+                for peer in evidence_agents[:8]
+                if isinstance(peer, Agent)
+            ],
+            "unfinished_agents": [
+                {
+                    "id": peer.id,
+                    "role": peer.role,
+                    "status": peer.status,
+                    "missing_outputs": self.missing_expected_outputs(peer)[:8],
+                }
+                for peer in unfinished_agents[:8]
+                if isinstance(peer, Agent)
+            ],
+            "incomplete_children": list(readiness.get("incomplete_children") or [])[:8],
+        }
 
     def _final_delivery_evidence_agents(self, agent: Agent) -> list[Agent]:
         candidates: list[Agent] = []
@@ -6024,7 +6746,7 @@ class Runtime:
         for related in self._related_agents_for_completion_evidence(agent):
             if related.id == agent.id or related.id in seen:
                 continue
-            if not self._agent_has_reliable_evidence(related):
+            if not self._agent_ready_for_final_delivery_evidence(related):
                 continue
             candidates.append(related)
             seen.add(related.id)
@@ -6065,6 +6787,9 @@ class Runtime:
         return False
 
     def _can_create_final_delivery_agent(self, agent: Agent) -> bool:
+        root_submit_task = agent.parent is None and self.answer_submission_required(agent)
+        if root_submit_task:
+            return len(self.agents) < self.config.max_agents and agent.depth + 1 <= self.config.max_depth
         return (
             len(self.agents) < self.config.max_agents
             and agent.depth + 1 <= self.config.max_depth
@@ -6072,6 +6797,73 @@ class Runtime:
             and not self._agent_has_solo_decision(agent)
             and not self._agent_has_pending_self_work_decision(agent)
         )
+
+    def _root_recently_inspected_final_delivery_evidence(self, agent: Agent, evidence_agents: list[Agent]) -> bool:
+        if agent.parent is not None or not evidence_agents:
+            return False
+        evidence_ids = {peer.id for peer in evidence_agents}
+        if agent._last_query_evidence_turn > 0 and (agent._turns - agent._last_query_evidence_turn) <= 6:
+            queried_ids = set(agent._last_query_reliable_evidence_ids) or set(agent._last_query_agent_ids)
+            if not queried_ids or queried_ids.intersection(evidence_ids):
+                return True
+        if agent._last_query_turn > 0 and (agent._turns - agent._last_query_turn) <= 4:
+            queried_ids = set(agent._last_query_agent_ids)
+            if queried_ids.intersection(evidence_ids):
+                return True
+        if agent._last_read_evidence_turn > 0 and (agent._turns - agent._last_read_evidence_turn) <= 4:
+            return True
+        return False
+
+    def _root_direct_answer_submission_plan(self, agent: Agent) -> dict[str, Any] | None:
+        if agent.parent is not None:
+            return None
+        if not self.answer_submission_required(agent) or agent.submitted_answer_path:
+            return None
+        if not self.can_submit_answer(agent).get("ok"):
+            return None
+        readiness = self._root_answer_readiness(agent)
+        if not readiness.get("submit_only_ready"):
+            return None
+        terminal_candidate = readiness.get("terminal_candidate")
+        evidence_agents = list(readiness.get("evidence_agents") or [])
+        if not evidence_agents and not terminal_candidate:
+            return None
+        blockers = [
+            blocker
+            for blocker in self.completion_blockers(agent, include_missing_outputs=False)
+            if blocker.get("kind") != "answer_submission"
+        ]
+        if any(blocker.get("kind") in {"source_change", "test_run", "missing_outputs"} for blocker in blockers):
+            return None
+        if all(blocker.get("kind") in {"uncertain_evidence", "unverified_evidence"} for blocker in blockers):
+            blockers = []
+        if blockers:
+            return None
+        if terminal_candidate:
+            self._record_root_terminal_answer_candidate(agent, terminal_candidate)
+        return {
+            "action": "stop",
+            "reason": "terminal_candidate_submit_ready" if terminal_candidate else "direct_answer_submission_ready",
+            "turn_added": agent._turns,
+            "answer_path": self.final_answer_path_for(agent),
+            "readiness": {
+                key: value
+                for key, value in readiness.items()
+                if key not in {"evidence_agents", "terminal_candidate", "unfinished_agents"}
+            },
+            "evidence_agents": [
+                {
+                    "id": peer.id,
+                    "role": peer.role,
+                    "status": peer.status,
+                    "artifacts": [artifact.path for artifact in peer.artifacts[:8]],
+                    "result": (peer.result or "")[:240],
+                    "tags": peer.current_task_tags[:12],
+                }
+                for peer in evidence_agents[:8]
+            ],
+            "terminal_candidate": terminal_candidate,
+        }
 
     def _final_delivery_handoff_plan(self, agent: Agent) -> dict[str, Any] | None:
         if not self.answer_submission_required(agent) or agent.submitted_answer_path:
@@ -6096,6 +6888,8 @@ class Runtime:
         ]
         if any(blocker.get("kind") in {"source_change", "test_run", "missing_outputs"} for blocker in blockers):
             return None
+        if all(blocker.get("kind") in {"uncertain_evidence", "unverified_evidence"} for blocker in blockers):
+            blockers = []
         return {
             "action": "create",
             "reason": "delegate_final_delivery",
@@ -6259,6 +7053,10 @@ class Runtime:
             "current_ledger_item": ledger.get("current_agent_item") or {},
             "related_ledger_items": (ledger.get("items") or [])[:6],
         }
+        if self.answer_submission_required(agent) and not agent.submitted_answer_path:
+            readiness = self._root_answer_readiness(agent) if agent.parent is None else {}
+            if readiness:
+                payload["answer_readiness"] = self._root_answer_readiness_public(readiness)
         return {
             "role": "user",
             "content": (
@@ -6375,6 +7173,7 @@ class Runtime:
         plan = dict(previous_plan)
         plan["selector_previous_action"] = previous
         plan["action"] = selected
+        plan["reason"] = reason[:240] or str(previous_plan.get("reason") or "")
         plan["selected_by"] = "llm_selector"
         plan["selector_reason"] = reason[:500]
         plan["selector_locked"] = True
@@ -6390,6 +7189,8 @@ class Runtime:
             plan["root_steward"] = True
             agent._loop_action_plan = plan
         if plan.get("action") == "create" and plan.get("reason") == "delegate_final_delivery":
+            return
+        if plan.get("action") == "stop":
             return
         if plan.get("action") not in {"create", "work"}:
             return
@@ -6511,6 +7312,11 @@ class Runtime:
             agent._loop_action_plan = create_miss_plan
             return
 
+        direct_answer_plan = self._root_direct_answer_submission_plan(agent)
+        if direct_answer_plan:
+            agent._loop_action_plan = direct_answer_plan
+            return
+
         final_delivery_plan = self._final_delivery_handoff_plan(agent)
         if final_delivery_plan:
             agent._loop_action_plan = final_delivery_plan
@@ -6520,6 +7326,11 @@ class Runtime:
         outputs_complete = bool(expected_outputs) and not missing_outputs
         answer_submission_pending = self.answer_submission_required(agent) and not agent.submitted_answer_path
         answer_submission_ready = self._answer_submission_ready(agent)
+        root_answer_readiness = (
+            self._root_answer_readiness(agent)
+            if answer_submission_pending and agent.parent is None
+            else {}
+        )
         if outputs_complete:
             current = agent._loop_action_plan
             if current and current.get("action") in {"compact", "stop"}:
@@ -6542,11 +7353,17 @@ class Runtime:
                     return
                 if answer_submission_pending:
                     if answer_submission_ready:
+                        readiness_public = (
+                            self._root_answer_readiness_public(root_answer_readiness)
+                            if root_answer_readiness
+                            else {}
+                        )
                         agent._loop_action_plan = {
                             "action": "stop",
                             "reason": "answer_submission_pending",
                             "turn_added": agent._turns,
                             "blockers": blockers,
+                            "answer_readiness": readiness_public,
                         }
                     elif self._initial_create_required(agent):
                         agent._loop_action_plan = {
@@ -6892,6 +7709,17 @@ class Runtime:
                 target_action=create_miss_plan.get("target_action"),
             )
 
+        direct_answer_plan = self._root_direct_answer_submission_plan(agent)
+        if direct_answer_plan:
+            add(
+                "stop",
+                str(direct_answer_plan.get("reason") or "direct_answer_submission_ready"),
+                0.99,
+                answer_path=direct_answer_plan.get("answer_path"),
+                evidence_agents=direct_answer_plan.get("evidence_agents", []),
+                terminal_candidate=direct_answer_plan.get("terminal_candidate"),
+            )
+
         final_delivery_plan = self._final_delivery_handoff_plan(agent)
         if final_delivery_plan:
             add(
@@ -6918,6 +7746,11 @@ class Runtime:
         outputs_complete = bool(expected_outputs) and not missing_outputs
         answer_submission_pending = self.answer_submission_required(agent) and not agent.submitted_answer_path
         answer_submission_ready = self._answer_submission_ready(agent)
+        root_answer_readiness = (
+            self._root_answer_readiness(agent)
+            if answer_submission_pending and agent.parent is None
+            else {}
+        )
         if outputs_complete:
             if current and current.get("action") in {"compact", "stop"}:
                 add(str(current["action"]), str(current.get("reason") or "current_terminal_action"), 0.95)
@@ -6944,10 +7777,21 @@ class Runtime:
                         blockers=completion_blockers,
                         missing_outputs=uncertain_handoff_plan.get("missing_outputs", []),
                         uncertain_artifacts=uncertain_handoff_plan.get("uncertain_artifacts", []),
-                    )
+                )
                 if answer_submission_pending:
                     if answer_submission_ready:
-                        add("stop", "answer_submission_pending", 0.90, blockers=completion_blockers)
+                        readiness_score = float(root_answer_readiness.get("score", 0.65) if root_answer_readiness else 0.65)
+                        add(
+                            "stop",
+                            "answer_submission_pending",
+                            max(0.40, min(0.90, 0.42 + 0.40 * readiness_score)),
+                            blockers=completion_blockers,
+                            answer_readiness=(
+                                self._root_answer_readiness_public(root_answer_readiness)
+                                if root_answer_readiness
+                                else {}
+                            ),
+                        )
                     elif self._initial_create_required(agent):
                         add("create", "answer_needs_research_before_submission", 0.92, blockers=completion_blockers)
                     else:
@@ -6957,7 +7801,17 @@ class Runtime:
             if _task_prefers_query_before_artifact(agent.task) and agent._last_query_turn <= 0:
                 add("read", "outputs_complete_but_peer_query_required", 0.72)
             if answer_submission_pending and answer_submission_ready:
-                add("stop", "answer_submission_pending", 0.90)
+                readiness_score = float(root_answer_readiness.get("score", 0.65) if root_answer_readiness else 0.65)
+                add(
+                    "stop",
+                    "answer_submission_pending",
+                    max(0.40, min(0.90, 0.42 + 0.40 * readiness_score)),
+                    answer_readiness=(
+                        self._root_answer_readiness_public(root_answer_readiness)
+                        if root_answer_readiness
+                        else {}
+                    ),
+                )
             elif not answer_submission_pending:
                 add("compact", "outputs_complete_publish_memory", 0.86)
                 add("stop", "outputs_complete_stop_candidate", 0.52)
@@ -7255,6 +8109,15 @@ class Runtime:
                 if missing_outputs and expected_outputs:
                     continue
                 non_submission_blockers = [blocker for blocker in blockers if blocker.get("kind") != "answer_submission"]
+                if (
+                    candidate.reason in {"direct_answer_submission_ready", "terminal_candidate_submit_ready"}
+                    and non_submission_blockers
+                    and all(
+                        blocker.get("kind") in {"uncertain_evidence", "unverified_evidence"}
+                        for blocker in non_submission_blockers
+                    )
+                ):
+                    non_submission_blockers = []
                 if non_submission_blockers:
                     continue
             if action == "compact":
@@ -7425,7 +8288,15 @@ class Runtime:
             score += 0.35 * (1.0 - metrics.artifact_gap)
             score += 0.20 * metrics.handoff_pressure
             if candidate.reason == "answer_submission_pending":
-                score += 1.00
+                readiness = candidate.data.get("answer_readiness") if isinstance(candidate.data, dict) else {}
+                readiness_score = float((readiness or {}).get("score", 0.5) or 0.0)
+                score += 0.20 + 0.95 * max(0.0, min(1.0, readiness_score))
+                if readiness and not readiness.get("submit_only_ready"):
+                    score -= 0.35
+            if candidate.reason == "direct_answer_submission_ready":
+                score += 2.15
+            if candidate.reason == "terminal_candidate_submit_ready":
+                score += 2.45
             score -= 0.75 * metrics.dependency_pressure
             score -= 0.45 * metrics.consistency_pressure
             score -= 1.00 * metrics.uncertain_evidence_pressure
@@ -7646,8 +8517,22 @@ class Runtime:
 
     def _tools_for_loop_turn(self, agent: Agent, action: str, missing_outputs: list[str]) -> tuple[set[str], str]:
         allowed = self._tools_for_loop_action(action)
-        if not self.answer_submission_required(agent):
+        if not self.can_submit_answer(agent).get("ok"):
             allowed = allowed - {"submit_answer"}
+        plan_reason = str((agent._loop_action_plan or {}).get("reason") or "")
+        if (
+            action == "stop"
+            and self._answer_submission_pending(agent)
+            and "submit_answer" in allowed
+            and self.can_submit_answer(agent).get("ok")
+        ):
+            if plan_reason in _ROOT_SUBMIT_ONLY_REASONS:
+                return {"submit_answer"}, "answer_submit_only"
+            review_allowed = {
+                "submit_answer", "query", "ledger_read", "ledger_update", "file_read",
+                "file_list", "grep", "wait", "send", "set_status", "compact", "get_cost",
+            }
+            return allowed.union(_LEDGER_TOOLS).intersection(review_allowed), "answer_submit_review"
         if self._root_steward_mode(agent):
             if action == "create" and (agent._loop_action_plan or {}).get("reason") == "delegate_final_delivery":
                 create_execution_tools = _CREATE_EXECUTION_TOOLS & allowed
@@ -7657,7 +8542,7 @@ class Runtime:
                 "query", "ledger_read", "ledger_update", "send", "wait",
                 "compact", "set_status", "get_cost",
             }
-            if self.answer_submission_required(agent):
+            if self.can_submit_answer(agent).get("ok"):
                 steward_allowed.add("submit_answer")
             return allowed.union(_LEDGER_TOOLS).intersection(steward_allowed), "root_steward"
         if (
@@ -7678,12 +8563,6 @@ class Runtime:
             create_execution_tools = _CREATE_EXECUTION_TOOLS & allowed
             if create_execution_tools:
                 return create_execution_tools, "resume_create_after_read_orientation"
-        if (
-            action == "stop"
-            and self._answer_submission_pending(agent)
-            and "submit_answer" in allowed
-        ):
-            return {"submit_answer"}, "answer_submit_only"
         if action == "compact" and (agent._auxiliary_only_miss_count >= 1 or (agent._action_miss_action == action and agent._action_miss_count >= 1)):
             primary_tools = self._primary_tools_for_loop_action(action) & allowed
             if primary_tools:
@@ -7790,8 +8669,23 @@ class Runtime:
             parts.append(
                 "Root steward boundary: the first child wave already exists. "
                 "Do not take over worker/search/implementation artifacts yourself. "
-                "Use query, ledger_read, ledger_update, send/wait, compact, or stop to inspect agents, update the task ledger, request pruning, and record remaining gaps."
+                "Use query, ledger_read, ledger_update, send/wait, compact, or stop to inspect agents, update the task ledger, request pruning, and record remaining gaps. "
+                "If the evidence has already been inspected and is sufficient for the terminal answer, stop may submit directly with submit_answer."
             )
+        if plan and plan.get("action") == "stop" and self.answer_submission_required(agent) and not agent.submitted_answer_path:
+            readiness = plan.get("answer_readiness") if isinstance(plan.get("answer_readiness"), dict) else {}
+            if not readiness and self._root_steward_mode(agent):
+                readiness = self._root_answer_readiness_public(self._root_answer_readiness(agent))
+            if readiness:
+                incomplete = readiness.get("incomplete_children") or []
+                unfinished = readiness.get("unfinished_agents") or []
+                parts.append(
+                    "Answer submission readiness is a soft signal, not a hard gate. "
+                    f"score={readiness.get('score', 0)} reasons={readiness.get('reasons') or []}. "
+                    "If the answer is sufficiently supported, submit_answer may be called and the harness may judge it wrong; "
+                    "if evidence is still unclear, use query/ledger_read/file_read in this stop turn before submitting or publish why the next loop should replan. "
+                    f"Known incomplete children={len(incomplete)} unfinished={len(unfinished)}."
+                )
         if missing_outputs:
             targets = "\n".join(f"- {path}" for path in missing_outputs[:8])
             more = "" if len(missing_outputs) <= 8 else f"\n- ... {len(missing_outputs) - 8} more"
@@ -7837,6 +8731,29 @@ class Runtime:
                             "Previous work turns did not execute a usable work tool. Runtime will narrow this retry turn "
                             "to file_write so the selected work action creates the required output files."
                         )
+        if plan and plan.get("reason") in {"direct_answer_submission_ready", "terminal_candidate_submit_ready"}:
+            evidence = list(plan.get("evidence_agents") or [])
+            evidence_lines = "\n".join(
+                f"- {item.get('id')}: status={item.get('status') or '-'} artifacts={item.get('artifacts') or []} result={(item.get('result') or '')[:180]}"
+                for item in evidence[:8]
+                if isinstance(item, dict)
+            )
+            terminal_candidate = plan.get("terminal_candidate") if isinstance(plan.get("terminal_candidate"), dict) else {}
+            candidate_line = ""
+            if terminal_candidate:
+                candidate_line = (
+                    f"\nTerminal candidate: answer_hint={terminal_candidate.get('answer_hint') or '-'} "
+                    f"source_agent={terminal_candidate.get('id') or '-'} "
+                    f"artifact={terminal_candidate.get('artifact') or '-'}"
+                )
+            parts.append(
+                "Direct terminal delivery is ready: recent query/read evidence or a terminal candidate artifact supports the answer. "
+                "If other agents are still running, the successful submission will notify them to prune. "
+                "Call submit_answer(answer=...) with the concise answer string. Do not use compact, set_status, file_write, or send in this submit-only turn.\n"
+                f"Answer path={plan.get('answer_path') or self.final_answer_path_for(agent)}\n"
+                f"Evidence signals:\n{evidence_lines or '- none'}"
+                f"{candidate_line}"
+            )
         if agent._auxiliary_only_miss_count:
             parts.append(
                 "Previous loop turns only used auxiliary tools such as get_cost/set_status/compact and did not satisfy "
@@ -8229,6 +9146,26 @@ class Runtime:
             "active_task": ActiveTaskCard(task=new_task or agent.task, tags=tags or agent.current_task_tags, work_outline=work_outline),
         }
         if truth_guard["truth_guard"]:
+            expected_paths = _non_terminal_expected_output_paths(agent.task)
+            referenced_paths = [
+                path for path in files
+                if path in expected_paths or not expected_paths
+            ]
+            target_paths = referenced_paths or expected_paths
+            for path in target_paths[:8]:
+                self.task_ledger_update(agent, {
+                    "item_id": agent.id,
+                    "status": "partial",
+                    "output_path": path,
+                    "output_status": self._artifact_output_status(agent, path) if path in expected_paths else "evidence_gap",
+                    "blockers": [{
+                        "kind": "unverified_evidence",
+                        "message": "Truth guard found placeholder, partial, or low-confidence evidence for this output.",
+                        "artifacts": [path],
+                        "event": truth_guard["truth_guard"],
+                    }],
+                    "note": "Truth guard downgraded this output; continue evidence repair before retrying terminal compact.",
+                })
             self.task_ledger_update(agent, {
                 "item_id": agent.id,
                 "status": "blocked",
@@ -8239,6 +9176,17 @@ class Runtime:
                 }],
                 "note": "Truth guard downgraded completion; continue with work or query before retrying terminal compact.",
             })
+            agent._loop_action_plan = {
+                "action": "work",
+                "reason": "truth_guard_evidence_repair",
+                "turn_added": agent._turns,
+                "missing_outputs": target_paths[:20],
+                "blockers": [{
+                    "kind": "unverified_evidence",
+                    "message": "Repair or replace low-confidence output with evidence-backed content.",
+                    "artifacts": target_paths[:8],
+                }],
+            }
             update_kwargs["remove_tags"] = list(_COMPLETION_CLAIM_TAGS)
             if params.get("stop_after"):
                 params["stop_after"] = False
@@ -8367,6 +9315,26 @@ class Runtime:
         tool_info = tools.get(tc.name)
         if not tool_info:
             return {"error": f"Unknown tool: {tc.name}"}
+        if tc.name == "submit_answer":
+            permission = self.can_submit_answer(agent, str(tc.arguments.get("path") or ""))
+            if not permission.get("ok"):
+                self._emit(agent.id, "submit_answer_denied", permission)
+                return {"error": "submit_answer_denied", **permission}
+        if tc.name == "file_write":
+            path_arg = str(tc.arguments.get("path", tc.arguments.get("file_path", tc.arguments.get("filepath", ""))))
+            normalized = self._normalize_workspace_relative_path(path_arg, agent.workspace)
+            if normalized and _looks_like_final_answer_path(normalized):
+                result = {
+                    "error": "final_answer_write_denied",
+                    "reason": "terminal_answer_requires_submit_answer",
+                    "path": normalized,
+                    "message": (
+                        "Global answer files are protected protocol outputs. Use submit_answer "
+                        "when a runtime-authorized delivery agent is ready to submit."
+                    ),
+                }
+                self._emit(agent.id, "final_answer_write_denied", result)
+                return result
         handler = tool_info["handler"]
         try:
             if tool_info.get("is_meta"):
