@@ -10,6 +10,7 @@ SHOULD use shell. Dedicated tools exist only when shell cannot be reliable.
 from __future__ import annotations
 
 import asyncio
+import re
 import uuid
 from pathlib import Path
 from typing import Any, TYPE_CHECKING
@@ -26,12 +27,36 @@ async def tool_shell(args: dict[str, Any], workspace: Path, ctx: "ToolContext") 
         SHARED    — shared directory visible to all agents
     """
     from nanoma.sandbox import shell_exec
+    from nanoma.core import classify_shell_capability
+
     cmd = args.get("command", "")
     timeout = args.get("timeout", 30)
     max_output = ctx.shell_max_output
 
     if not cmd or not cmd.strip():
         return {"error": "command is required"}
+
+    capability = classify_shell_capability(cmd)
+    allowed = getattr(ctx, "allowed_shell_capabilities", None)
+    if allowed and capability not in allowed:
+        return {
+            "exit_code": -1,
+            "stdout": "",
+            "stderr": f"Blocked shell capability by constraint: {capability}",
+            "blocked": True,
+            "blocked_capability": capability,
+            "allowed_shell_capabilities": sorted(allowed),
+        }
+
+    for pattern in ctx.blocked_shell_patterns:
+        if re.search(pattern, cmd, flags=re.IGNORECASE):
+            return {
+                "exit_code": -1,
+                "stdout": "",
+                "stderr": f"Blocked shell command by policy pattern: {pattern}",
+                "blocked": True,
+                "pattern": pattern,
+            }
 
     result = await shell_exec(cmd, workspace, ctx.shared_dir, timeout)
 

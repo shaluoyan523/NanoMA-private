@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import os
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -16,6 +17,18 @@ _DEFAULT_CONTEXT_LIMIT = 128_000
 
 # Fallback pricing — imported from cost.py for consistency
 from nanoma.cost import _FALLBACK_PRICE_INPUT, _FALLBACK_PRICE_CACHED, _FALLBACK_PRICE_OUTPUT
+
+
+def _context_limit_from_env(default: int) -> int:
+    raw = os.environ.get("NANOMA_CONTEXT_LIMIT")
+    if not raw:
+        return default
+    try:
+        value = int(raw)
+    except ValueError:
+        logger.warning("Invalid NANOMA_CONTEXT_LIMIT=%r; using %s", raw, default)
+        return default
+    return max(1, value)
 
 
 @dataclass
@@ -41,7 +54,7 @@ class ModelRegistry:
             self.models[name] = ModelDef(
                 name=name,
                 provider=cfg.get("provider", "unknown"),
-                context_limit=cfg.get("context_limit", _DEFAULT_CONTEXT_LIMIT),
+                context_limit=_context_limit_from_env(cfg.get("context_limit", _DEFAULT_CONTEXT_LIMIT)),
                 price_input=p.get("input", _FALLBACK_PRICE_INPUT),
                 price_cached=p.get("cached_input", _FALLBACK_PRICE_CACHED),
                 price_output=p.get("output", _FALLBACK_PRICE_OUTPUT),
@@ -59,7 +72,7 @@ class ModelRegistry:
 
     def context_limit(self, name: str) -> int:
         m = self.models.get(name)
-        return m.context_limit if m else _DEFAULT_CONTEXT_LIMIT
+        return m.context_limit if m else _context_limit_from_env(_DEFAULT_CONTEXT_LIMIT)
 
     def route(self, budget: float, allowed: list[str] | None = None) -> str:
         """Pick strongest model that fits budget.

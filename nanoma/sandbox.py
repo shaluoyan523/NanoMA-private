@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import os
 from pathlib import Path
 from typing import Any
@@ -25,7 +26,8 @@ async def shell_exec(
             cwd=str(workspace),
             env=env,
         )
-        stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=timeout)
+        communicate_task = asyncio.create_task(proc.communicate())
+        stdout, stderr = await asyncio.wait_for(asyncio.shield(communicate_task), timeout=timeout)
         return {
             "exit_code": proc.returncode,
             "stdout": stdout.decode(errors="replace"),
@@ -33,6 +35,9 @@ async def shell_exec(
         }
     except asyncio.TimeoutError:
         proc.kill()
+        with contextlib.suppress(asyncio.CancelledError):
+            await communicate_task
+        await proc.wait()
         return {"exit_code": -1, "stdout": "", "stderr": f"Timeout after {timeout}s"}
     except Exception as e:
         return {"exit_code": -1, "stdout": "", "stderr": str(e)}

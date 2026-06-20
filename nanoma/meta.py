@@ -29,6 +29,18 @@ async def meta_spawn(args: dict[str, Any], agent: "Agent", runtime: "Runtime") -
         return {"error": f"Max depth ({runtime.config.max_depth}) exceeded"}
     if len(runtime.agents) >= runtime.config.max_agents:
         return {"error": f"Max agents ({runtime.config.max_agents}) reached"}
+    violation = runtime.spawn_policy_violation(agent)
+    if violation:
+        event = {
+            "tool": "spawn",
+            "reason": violation,
+        }
+        if runtime.config.tool_policy_log_events:
+            event["policy"] = runtime.current_tool_policy(agent)
+        runtime._emit(agent.id, "tool_policy_block", event)
+        return {
+            "error": f"spawn blocked by tool policy: {violation}",
+        }
 
     # Model selection
     if not model:
@@ -305,11 +317,11 @@ async def meta_get_cost(args: dict[str, Any], agent: "Agent", runtime: "Runtime"
     """Get resource status."""
     elapsed = time.time() - runtime._start_time
     context_pct = round(agent.context_tokens / max(1, agent.context_limit) * 100, 1)
+    coordination_tools = {"spawn", "send", "wait", "query", "kill", "transfer", "set_bio"}
+    has_coordination_tools = bool(coordination_tools - runtime.config.disabled_tools)
     result = {
         "agent_id": agent.id,
         "bio": agent.bio,
-        "spawned_by": agent.parent,
-        "sub_agents": list(agent.children),
         "context_tokens": agent.context_tokens,
         "context_limit": agent.context_limit,
         "context_usage_pct": context_pct,
@@ -322,6 +334,12 @@ async def meta_get_cost(args: dict[str, Any], agent: "Agent", runtime: "Runtime"
         "elapsed_seconds": round(elapsed, 1),
         "total_agents": len(runtime.agents),
     }
+    if has_coordination_tools:
+        result["spawned_by"] = agent.parent
+        result["sub_agents"] = list(agent.children)
+    else:
+        result["parent"] = agent.parent
+        result["children"] = list(agent.children)
     if agent.quota.time_limit > 0:
         result["time_remaining"] = round(max(0, agent.quota.time_limit - elapsed), 1)
     return result
@@ -374,11 +392,14 @@ async def meta_submit(args: dict[str, Any], agent: "Agent", runtime: "Runtime") 
     # Copy to shared
     shared = runtime._tool_context.shared_dir
     shared.mkdir(parents=True, exist_ok=True)
-    shutil.copy2(path, shared / path.name)
+    dest = shared / path.name
+    if dest.exists() and dest.is_dir():
+        return {"error": f"Shared destination is a directory: {dest}"}
+    shutil.copy2(path, dest)
 
     artifact = Artifact(path=path_str, absolute_path=path, description=args.get("description", ""), agent_id=agent.id)
     agent.artifacts.append(artifact)
-    return {"submitted": path_str, "shared_copy": str(shared / path.name)}
+    return {"submitted": path_str, "shared_copy": str(dest)}
 
 
 # ─── batch ───────────────────────────────────────────────────────────────────
@@ -404,7 +425,12 @@ async def meta_batch(args: dict[str, Any], agent: "Agent", runtime: "Runtime") -
 
     from nanoma.tools import WORK_TOOLS
     from nanoma.plugins.workspace_tools import WORKSPACE_TOOLS
-    all_tools = {**WORK_TOOLS, **WORKSPACE_TOOLS, **META_TOOLS}
+    all_tools = {
+        name: tool
+        for name, tool in {**WORK_TOOLS, **WORKSPACE_TOOLS, **META_TOOLS}.items()
+        if name not in runtime.config.disabled_tools
+    }
+    all_tools, _ = runtime._apply_state_tool_policy(agent, all_tools)
     results = []
 
     for i, call in enumerate(calls):

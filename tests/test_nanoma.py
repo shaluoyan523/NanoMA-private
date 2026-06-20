@@ -9,7 +9,15 @@ from unittest.mock import AsyncMock
 
 from nanoma.core import Agent, Envelope, ResourceQuota, Runtime, RuntimeConfig, ToolContext
 from nanoma.cost import CostLedger, UsageRecord
-from nanoma.llm import LLMResponse, ToolCall, estimate_tokens, count_message_tokens
+from nanoma.llm import (
+    LLMResponse,
+    ToolCall,
+    openai_compatible_call,
+    _openai_messages_to_anthropic,
+    _openai_tool_to_anthropic,
+    estimate_tokens,
+    count_message_tokens,
+)
 from nanoma.meta import (
     meta_spawn, meta_kill, meta_send, meta_query, meta_wait,
     meta_transfer, meta_set_bio, meta_get_cost, meta_set_status,
@@ -88,6 +96,439 @@ async def test_multi_turn(runtime_multi_turn):
     """Agent runs multiple turns before completing."""
     result = await runtime_multi_turn.run("Do something complex")
     assert "done after 3 turns" in result
+
+
+@pytest.mark.asyncio
+async def test_zero_max_turns_disables_turn_limit(tmp_workspace):
+    """max_turns=0 means unlimited turns."""
+    calls = {"n": 0}
+
+    async def mock_llm(messages, model, tools=None, **kwargs):
+        calls["n"] += 1
+        if calls["n"] >= 4:
+            return LLMResponse(
+                tool_calls=[ToolCall(id="done", name="set_status", arguments={"status": "done", "result": "finished"})],
+                usage=UsageRecord(input_tokens=10, output_tokens=5, model=model),
+            )
+        return LLMResponse(
+            tool_calls=[ToolCall(id=f"cost-{calls['n']}", name="get_cost", arguments={})],
+            usage=UsageRecord(input_tokens=10, output_tokens=5, model=model),
+        )
+
+    config = RuntimeConfig(workspace_root=tmp_workspace, budget=10.0, max_turns=0, log_dir=None)
+    rt = Runtime(config=config, llm_call=mock_llm)
+    result = await rt.run("needs several turns")
+    assert result == "finished"
+    assert calls["n"] == 4
+
+
+@pytest.mark.asyncio
+async def test_state_tool_policy_keeps_spawn_available_for_neutral_root(tmp_workspace):
+    """A neutral root agent can still create subagents."""
+    captured = {}
+
+    async def mock_llm(messages, model, tools=None, **kwargs):
+        captured["tools"] = [t["function"]["name"] for t in tools]
+        return LLMResponse(
+            tool_calls=[ToolCall(id="done", name="set_status", arguments={"status": "done", "result": "finished"})],
+            usage=UsageRecord(input_tokens=10, output_tokens=5, model=model),
+        )
+
+    config = RuntimeConfig(workspace_root=tmp_workspace, budget=10.0, max_agents=50, log_dir=None)
+    rt = Runtime(config=config, llm_call=mock_llm)
+    result = await rt.run("Solve a generic task")
+    assert result == "finished"
+    assert "spawn" in captured["tools"]
+
+
+@pytest.mark.asyncio
+async def test_state_tool_policy_hides_spawn_without_prompt_injection(tmp_workspace):
+    """State weights narrow schemas without adding policy text to the agent loop."""
+    captured = {}
+
+    async def mock_llm(messages, model, tools=None, **kwargs):
+        captured["messages"] = [dict(m) for m in messages]
+        captured["tools"] = [t["function"]["name"] for t in tools]
+        return LLMResponse(
+            tool_calls=[ToolCall(id="done", name="set_status", arguments={"status": "done", "result": "finished"})],
+            usage=UsageRecord(input_tokens=10, output_tokens=5, model=model),
+        )
+
+    config = RuntimeConfig(workspace_root=tmp_workspace, budget=10.0, max_agents=1, log_dir=None)
+    rt = Runtime(config=config, llm_call=mock_llm)
+    result = await rt.run("Solve the task and write `answer.json`")
+    assert result == "finished"
+    assert "spawn" not in captured["tools"]
+    assert "set_status" in captured["tools"]
+
+    visible_text = "\n".join(str(m.get("content") or "") for m in captured["messages"][1:])
+    assert "tool_policy" not in visible_text.lower()
+    assert "create weight" not in visible_text.lower()
+    assert "spawn_closed" not in visible_text.lower()
+
+
+@pytest.mark.asyncio
+async def test_state_tool_policy_blocks_direct_spawn_when_dependency_active(tmp_workspace):
+    """The spawn handler enforces the same state policy used for tool schemas."""
+    config = RuntimeConfig(
+        workspace_root=tmp_workspace,
+        budget=10.0,
+        max_agents=50,
+        tool_policy_dependency_window=1,
+        log_dir=None,
+    )
+    rt = Runtime(config=config)
+    parent = rt.create_agent("parent")
+    child = rt.create_agent("active child", parent=parent.id)
+    child.status = "running"
+
+    result = await meta_spawn({"task": "second child"}, parent, rt)
+    assert "error" in result
+    assert "spawn blocked by tool policy" in result["error"]
+    assert any(e["event"] == "tool_policy_block" for e in rt._events)
+
+
+@pytest.mark.asyncio
+async def test_state_tool_policy_prunes_tools_without_prompt_injection(tmp_workspace):
+    """Optional pruning shrinks schemas structurally without adding policy text."""
+    captured = {}
+
+    async def mock_llm(messages, model, tools=None, **kwargs):
+        captured["messages"] = [dict(m) for m in messages]
+        captured["tools"] = [t["function"]["name"] for t in tools]
+        return LLMResponse(
+            tool_calls=[ToolCall(id="done", name="set_status", arguments={"status": "done", "result": "finished"})],
+            usage=UsageRecord(input_tokens=10, output_tokens=5, model=model),
+        )
+
+    config = RuntimeConfig(
+        workspace_root=tmp_workspace,
+        budget=10.0,
+        max_total_tokens=100,
+        tool_policy_prune_tools=True,
+        tool_policy_prune_pressure_start=0.0,
+        tool_policy_prune_pressure_end=0.0,
+        tool_policy_prune_min_tools=6,
+        log_dir=None,
+    )
+    rt = Runtime(config=config, llm_call=mock_llm)
+    result = await rt.run("Solve the task and write `answer.json`")
+    assert result == "finished"
+
+    assert len(captured["tools"]) < len(rt._all_tools())
+    assert "set_status" in captured["tools"]
+    assert "submit" in captured["tools"]
+    assert "ws_create_file" in captured["tools"]
+
+    visible_text = "\n".join(str(m.get("content") or "") for m in captured["messages"][1:])
+    assert "tool_policy" not in visible_text.lower()
+    assert "prune_tools" not in visible_text.lower()
+
+
+@pytest.mark.asyncio
+async def test_soft_total_tokens_drives_pruning_without_hard_stop(tmp_workspace):
+    """Policy-only token pressure can prune tools without ending the task."""
+    captured = {}
+
+    async def mock_llm(messages, model, tools=None, **kwargs):
+        calls = captured.get("calls", 0) + 1
+        captured["calls"] = calls
+        captured.setdefault("tool_counts", []).append(len(tools))
+        if calls == 1:
+            return LLMResponse(
+                tool_calls=[ToolCall(id="cost", name="get_cost", arguments={})],
+                usage=UsageRecord(input_tokens=100, output_tokens=0, model=model),
+            )
+        return LLMResponse(
+            tool_calls=[ToolCall(id="done", name="set_status", arguments={"status": "done", "result": "finished"})],
+            usage=UsageRecord(input_tokens=10, output_tokens=5, model=model),
+        )
+
+    config = RuntimeConfig(
+        workspace_root=tmp_workspace,
+        budget=10.0,
+        max_total_tokens=0,
+        tool_policy_soft_total_tokens=50,
+        tool_policy_prune_tools=True,
+        tool_policy_prune_pressure_start=0.5,
+        tool_policy_prune_pressure_end=1.0,
+        tool_policy_prune_min_tools=6,
+        log_dir=None,
+    )
+    rt = Runtime(config=config, llm_call=mock_llm)
+    result = await rt.run("Solve the task and write `answer.json`")
+
+    assert result == "finished"
+    assert captured["calls"] == 2
+    assert captured["tool_counts"][1] < captured["tool_counts"][0]
+    assert all("Max total tokens reached" not in (agent.result or "") for agent in rt.agents.values())
+
+
+@pytest.mark.asyncio
+async def test_shell_subcapability_pruning_keeps_shell_schema(tmp_workspace):
+    """Constraint can prune shell sub-capabilities without creating new tools."""
+    captured = {}
+
+    async def mock_llm(messages, model, tools=None, **kwargs):
+        calls = captured.get("calls", 0) + 1
+        captured["calls"] = calls
+        captured.setdefault("tool_names", []).append([
+            t["function"]["name"] for t in tools
+        ])
+        if calls == 1:
+            return LLMResponse(
+                tool_calls=[ToolCall(id="cost", name="get_cost", arguments={})],
+                usage=UsageRecord(input_tokens=100, output_tokens=0, model=model),
+            )
+        if calls == 2:
+            return LLMResponse(
+                tool_calls=[ToolCall(id="pip", name="shell", arguments={"command": "pip install requests"})],
+                usage=UsageRecord(input_tokens=10, output_tokens=5, model=model),
+            )
+        return LLMResponse(
+            tool_calls=[ToolCall(id="done", name="set_status", arguments={"status": "done", "result": "finished"})],
+            usage=UsageRecord(input_tokens=10, output_tokens=5, model=model),
+        )
+
+    config = RuntimeConfig(
+        workspace_root=tmp_workspace,
+        budget=10.0,
+        max_total_tokens=0,
+        tool_policy_soft_total_tokens=50,
+        tool_policy_prune_tools=True,
+        tool_policy_prune_shell_capabilities=True,
+        tool_policy_shell_capability_pressure_start=0.5,
+        tool_policy_shell_capability_pressure_end=1.0,
+        tool_policy_prune_pressure_start=0.5,
+        tool_policy_prune_pressure_end=1.0,
+        log_dir=None,
+    )
+    rt = Runtime(config=config, llm_call=mock_llm)
+    result = await rt.run("Solve the task")
+
+    assert result == "finished"
+    assert "shell" in captured["tool_names"][1]
+    blocked = [
+        e for e in rt._events
+        if e["event"] == "tool_call" and e["data"]["tool"] == "shell"
+    ][0]
+    assert "Blocked shell capability by constraint: package" in blocked["data"]["result"]
+
+
+@pytest.mark.asyncio
+async def test_web_saturation_blocks_web_without_prompt_injection(tmp_workspace):
+    """Runtime web saturation removes shell web capability without asking the LLM to compute it."""
+    captured = {"messages": [], "tools": []}
+
+    async def mock_llm(messages, model, tools=None, **kwargs):
+        calls = captured.get("calls", 0) + 1
+        captured["calls"] = calls
+        captured["messages"].append([dict(m) for m in messages])
+        captured["tools"].append([t["function"]["name"] for t in tools])
+        if calls <= 3:
+            return LLMResponse(
+                tool_calls=[
+                    ToolCall(
+                        id=f"web-{calls}",
+                        name="shell",
+                        arguments={"command": f'printf "No results\\n" # https://example.com/search?q=repeat{calls % 2}'},
+                    )
+                ],
+                usage=UsageRecord(input_tokens=10, output_tokens=5, model=model),
+            )
+        if calls == 4:
+            return LLMResponse(
+                tool_calls=[
+                    ToolCall(
+                        id="web-blocked",
+                        name="shell",
+                        arguments={"command": 'printf "No results\\n" # https://example.com/search?q=repeat0'},
+                    )
+                ],
+                usage=UsageRecord(input_tokens=10, output_tokens=5, model=model),
+            )
+        return LLMResponse(
+            tool_calls=[ToolCall(id="done", name="set_status", arguments={"status": "done", "result": "finished"})],
+            usage=UsageRecord(input_tokens=10, output_tokens=5, model=model),
+        )
+
+    config = RuntimeConfig(
+        workspace_root=tmp_workspace,
+        budget=10.0,
+        max_total_tokens=0,
+        tool_policy_soft_total_tokens=10,
+        tool_policy_prune_shell_capabilities=True,
+        tool_policy_shell_capability_pressure_start=0.0,
+        tool_policy_shell_capability_pressure_end=1.0,
+        tool_policy_web_saturation_min_calls=3,
+        tool_policy_web_saturation_threshold=0.3,
+        log_dir=None,
+    )
+    rt = Runtime(config=config, llm_call=mock_llm)
+    result = await rt.run("Search public evidence, then finish")
+
+    assert result == "finished"
+    blocked_shell_events = [
+        e for e in rt._events
+        if e["event"] == "tool_call"
+        and e["data"]["tool"] == "shell"
+        and "Blocked shell capability by constraint: web" in e["data"]["result"]
+    ]
+    assert blocked_shell_events
+    assert rt.agents["alpha"]._shell_activity.web_saturation >= config.tool_policy_web_saturation_threshold
+    assert all("shell" in names for names in captured["tools"])
+
+    visible_text = "\n".join(
+        str(m.get("content") or "")
+        for call_messages in captured["messages"]
+        for m in call_messages[1:]
+    )
+    assert "web_saturation" not in visible_text.lower()
+    assert "saturation threshold" not in visible_text.lower()
+    assert "repeated_web_queries" not in visible_text.lower()
+
+
+@pytest.mark.asyncio
+async def test_web_saturation_finalize_scope_removes_shell_schema(tmp_workspace):
+    """Repeated web blocks after saturation force a finalization-only schema."""
+    captured = {"messages": [], "tools": []}
+
+    async def mock_llm(messages, model, tools=None, **kwargs):
+        calls = captured.get("calls", 0) + 1
+        captured["calls"] = calls
+        names = [t["function"]["name"] for t in tools]
+        captured["messages"].append([dict(m) for m in messages])
+        captured["tools"].append(names)
+        if calls <= 3:
+            return LLMResponse(
+                tool_calls=[
+                    ToolCall(
+                        id=f"web-{calls}",
+                        name="shell",
+                        arguments={"command": f'printf "No results\\n" # https://example.com/search?q=repeat{calls % 2}'},
+                    )
+                ],
+                usage=UsageRecord(input_tokens=10, output_tokens=5, model=model),
+            )
+        if calls <= 5:
+            return LLMResponse(
+                tool_calls=[
+                    ToolCall(
+                        id=f"blocked-{calls}",
+                        name="shell",
+                        arguments={"command": 'printf "No results\\n" # https://example.com/search?q=repeat0'},
+                    )
+                ],
+                usage=UsageRecord(input_tokens=10, output_tokens=5, model=model),
+            )
+        assert "shell" not in names
+        return LLMResponse(
+            tool_calls=[ToolCall(id="done", name="set_status", arguments={"status": "done", "result": "finished"})],
+            usage=UsageRecord(input_tokens=10, output_tokens=5, model=model),
+        )
+
+    config = RuntimeConfig(
+        workspace_root=tmp_workspace,
+        budget=10.0,
+        max_total_tokens=0,
+        tool_policy_soft_total_tokens=10,
+        tool_policy_prune_shell_capabilities=True,
+        tool_policy_shell_capability_pressure_start=0.0,
+        tool_policy_shell_capability_pressure_end=1.0,
+        tool_policy_web_saturation_min_calls=3,
+        tool_policy_web_saturation_threshold=0.3,
+        tool_policy_web_saturation_finalize_after_blocks=2,
+        log_dir=None,
+    )
+    rt = Runtime(config=config, llm_call=mock_llm)
+    result = await rt.run("Search public evidence, then finish")
+
+    assert result == "finished"
+    assert rt.agents["alpha"]._shell_activity.finalize_after_web_saturation is True
+    assert "shell" in captured["tools"][4]
+    assert "shell" not in captured["tools"][5]
+    assert set(captured["tools"][5]) <= {"ws_create_file", "ws_append_file", "ws_read_file", "submit", "set_status", "get_cost"}
+
+    visible_text = "\n".join(
+        str(m.get("content") or "")
+        for call_messages in captured["messages"]
+        for m in call_messages[1:]
+    )
+    assert "web_saturation" not in visible_text.lower()
+    assert "finalize_after_web_saturation" not in visible_text.lower()
+
+
+@pytest.mark.asyncio
+async def test_web_saturation_finalize_rejects_idle_and_empty_done(tmp_workspace):
+    """Finalization scope keeps the agent running until it submits a non-empty answer."""
+    captured = {"tool_results": []}
+
+    async def mock_llm(messages, model, tools=None, **kwargs):
+        calls = captured.get("calls", 0) + 1
+        captured["calls"] = calls
+        captured["tool_results"].extend([
+            str(m.get("content") or "")
+            for m in messages
+            if m.get("role") == "tool"
+        ])
+        if calls <= 3:
+            return LLMResponse(
+                tool_calls=[
+                    ToolCall(
+                        id=f"web-{calls}",
+                        name="shell",
+                        arguments={"command": f'printf "No results\\n" # https://example.com/search?q=repeat{calls % 2}'},
+                    )
+                ],
+                usage=UsageRecord(input_tokens=10, output_tokens=5, model=model),
+            )
+        if calls <= 5:
+            return LLMResponse(
+                tool_calls=[
+                    ToolCall(
+                        id=f"blocked-{calls}",
+                        name="shell",
+                        arguments={"command": 'printf "No results\\n" # https://example.com/search?q=repeat0'},
+                    )
+                ],
+                usage=UsageRecord(input_tokens=10, output_tokens=5, model=model),
+            )
+        if calls == 6:
+            return LLMResponse(
+                tool_calls=[ToolCall(id="idle", name="set_status", arguments={"status": "idle"})],
+                usage=UsageRecord(input_tokens=10, output_tokens=5, model=model),
+            )
+        if calls == 7:
+            return LLMResponse(
+                tool_calls=[ToolCall(id="empty", name="set_status", arguments={"status": "done", "result": ""})],
+                usage=UsageRecord(input_tokens=10, output_tokens=5, model=model),
+            )
+        return LLMResponse(
+            tool_calls=[ToolCall(id="done", name="set_status", arguments={"status": "done", "result": "142"})],
+            usage=UsageRecord(input_tokens=10, output_tokens=5, model=model),
+        )
+
+    config = RuntimeConfig(
+        workspace_root=tmp_workspace,
+        budget=10.0,
+        max_total_tokens=0,
+        tool_policy_soft_total_tokens=10,
+        tool_policy_prune_shell_capabilities=True,
+        tool_policy_shell_capability_pressure_start=0.0,
+        tool_policy_shell_capability_pressure_end=1.0,
+        tool_policy_web_saturation_min_calls=3,
+        tool_policy_web_saturation_threshold=0.3,
+        tool_policy_web_saturation_finalize_after_blocks=2,
+        log_dir=None,
+    )
+    rt = Runtime(config=config, llm_call=mock_llm)
+    result = await rt.run("Search public evidence, then finish")
+
+    assert result == "142"
+    assert captured["calls"] == 8
+    joined_tool_results = "\n".join(captured["tool_results"])
+    assert "idle is unavailable after web saturation" in joined_tool_results
+    assert "empty done result is unavailable after web saturation" in joined_tool_results
 
 
 # ─── Test: ID generation ─────────────────────────────────────────────────────
@@ -323,8 +764,8 @@ async def test_meta_batch(runtime):
     a = runtime.create_agent("worker")
     # Write a batch file
     batch_data = [
-        {"tool": "file_write", "args": {"path": "hello.txt", "content": "world"}},
-        {"tool": "file_list", "args": {"path": "."}},
+        {"tool": "ws_create_file", "args": {"path": "hello.txt", "content": "world"}},
+        {"tool": "ws_read_file", "args": {"path": "hello.txt"}},
         {"tool": "nonexistent_tool", "args": {}},
     ]
     batch_file = a.workspace / "batch.json"
@@ -384,42 +825,42 @@ async def test_meta_wait_immediate(runtime):
 
 @pytest.mark.asyncio
 async def test_tool_file_write_read(tmp_workspace):
-    from nanoma.tools import tool_file_write, tool_file_read
+    from nanoma.plugins.workspace_tools import tool_create_file, tool_read_file_advanced
     ctx = ToolContext(shared_dir=tmp_workspace / "shared", workspace_root=tmp_workspace)
     ws = tmp_workspace / "agent"
     ws.mkdir()
 
     # Write
-    result = await tool_file_write({"path": "test.txt", "content": "hello world"}, ws, ctx)
-    assert result["bytes"] == 11
+    result = await tool_create_file({"path": "test.txt", "content": "hello world"}, ws, ctx)
+    assert result["bytes_written"] == 11
 
     # Read
-    result = await tool_file_read({"path": "test.txt"}, ws, ctx)
+    result = await tool_read_file_advanced({"path": "test.txt"}, ws, ctx)
     assert result["content"] == "hello world"
 
 
 @pytest.mark.asyncio
 async def test_tool_file_read_sandbox(tmp_workspace):
-    from nanoma.tools import tool_file_read
+    from nanoma.plugins.workspace_tools import tool_read_file_advanced
     ctx = ToolContext(shared_dir=tmp_workspace / "shared", workspace_root=tmp_workspace)
     ws = tmp_workspace / "agent"
     ws.mkdir()
-    result = await tool_file_read({"path": "/etc/passwd"}, ws, ctx)
+    result = await tool_read_file_advanced({"path": "/etc/passwd"}, ws, ctx)
     assert "error" in result  # outside workspace
 
 
 @pytest.mark.asyncio
-async def test_tool_file_list(tmp_workspace):
-    from nanoma.tools import tool_file_list
+async def test_tool_shell_file_list(tmp_workspace):
+    from nanoma.tools import tool_shell
     ctx = ToolContext(shared_dir=tmp_workspace / "shared", workspace_root=tmp_workspace)
     ws = tmp_workspace / "agent"
     ws.mkdir()
     (ws / "a.txt").write_text("a")
     (ws / "b.txt").write_text("b")
-    result = await tool_file_list({"path": "."}, ws, ctx)
-    names = [e["name"] for e in result["entries"]]
-    assert "a.txt" in names
-    assert "b.txt" in names
+    result = await tool_shell({"command": "find . -maxdepth 1 -type f -printf '%f\\n'"}, ws, ctx)
+    assert result["exit_code"] == 0
+    assert "a.txt" in result["stdout"]
+    assert "b.txt" in result["stdout"]
 
 
 @pytest.mark.asyncio
@@ -446,14 +887,14 @@ async def test_tool_shell_timeout(tmp_workspace):
 
 @pytest.mark.asyncio
 async def test_tool_grep(tmp_workspace):
-    from nanoma.tools import tool_grep
+    from nanoma.plugins.workspace_tools import tool_grep_search
     ctx = ToolContext(shared_dir=tmp_workspace / "shared", workspace_root=tmp_workspace)
     ws = tmp_workspace / "agent"
     ws.mkdir()
     (ws / "code.py").write_text("def hello():\n    return 42\n")
-    result = await tool_grep({"pattern": "hello", "path": "."}, ws, ctx)
+    result = await tool_grep_search({"query": "hello"}, ws, ctx)
     assert result["count"] >= 1
-    assert any("hello" in m for m in result["matches"])
+    assert any("hello" in m["content"] for m in result["matches"])
 
 
 # ─── Test: Model registry ────────────────────────────────────────────────────
@@ -493,6 +934,74 @@ def test_count_message_tokens():
     ]
     tokens = count_message_tokens(msgs)
     assert tokens > 0
+
+
+def test_anthropic_message_conversion():
+    messages = [
+        {"role": "system", "content": "System prompt"},
+        {"role": "assistant", "content": "I will use a tool.", "tool_calls": [
+            {"id": "tc1", "type": "function", "function": {"name": "shell", "arguments": "{\"command\":\"echo ok\"}"}}
+        ]},
+        {"role": "tool", "tool_call_id": "tc1", "content": "{\"stdout\":\"ok\\n\"}"},
+    ]
+    system, converted = _openai_messages_to_anthropic(messages)
+    assert system == "System prompt"
+    assert converted[0]["role"] == "assistant"
+    assert converted[0]["content"][1]["type"] == "tool_use"
+    assert converted[0]["content"][1]["input"] == {"command": "echo ok"}
+    assert converted[1]["role"] == "user"
+    assert converted[1]["content"][0]["type"] == "tool_result"
+
+
+def test_anthropic_tool_conversion():
+    tool = {
+        "type": "function",
+        "function": {
+            "name": "shell",
+            "description": "Run shell",
+            "parameters": {"type": "object", "properties": {"command": {"type": "string"}}, "required": ["command"]},
+        },
+    }
+    converted = _openai_tool_to_anthropic(tool)
+    assert converted["name"] == "shell"
+    assert converted["input_schema"]["required"] == ["command"]
+
+
+@pytest.mark.asyncio
+async def test_openai_call_passes_top_p(monkeypatch):
+    captured = {}
+
+    class FakeResponse:
+        status_code = 200
+
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return {
+                "choices": [{"message": {"content": "ok"}}],
+                "usage": {"prompt_tokens": 1, "completion_tokens": 2},
+            }
+
+    class FakeClient:
+        async def post(self, url, headers=None, json=None):
+            captured["body"] = json
+            return FakeResponse()
+
+    monkeypatch.setattr("nanoma.llm._get_client", lambda timeout=180.0: FakeClient())
+    response = await openai_compatible_call(
+        [{"role": "user", "content": "hello"}],
+        "test-model",
+        base_url="https://example.invalid/v1",
+        api_key="test",
+        temperature=0.2,
+        top_p=1.0,
+        max_tokens=8192,
+    )
+    assert response.content == "ok"
+    assert captured["body"]["temperature"] == 0.2
+    assert captured["body"]["top_p"] == 1.0
+    assert captured["body"]["max_tokens"] == 8192
 
 
 # ─── Test: Full integration (spawn + message + wait) ─────────────────────────

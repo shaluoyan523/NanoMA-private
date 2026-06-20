@@ -32,6 +32,21 @@ coverage.xml
 logs/
 workspace/
 shared/
+logs_cf73_*/
+workspace_cf73_*/
+
+# Benchmark generated artifacts
+benchmarks/*/runs/
+benchmarks/*/*_workspace/
+benchmarks/*/*_logs/
+benchmarks/*/__pycache__/
+benchmarks/cf73/.venv/
+benchmarks/cf73/__pycache__/
+benchmarks/cf73/work/
+benchmarks/cf73/wine_work/
+benchmarks/cf73/runs/
+benchmarks/gaia/data/
+benchmarks/gaia/reports/
 
 # OS and editor noise
 .DS_Store

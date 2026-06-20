@@ -3,19 +3,23 @@
 from __future__ import annotations
 
 import asyncio
+import copy
 import json
 import logging
 import math
+import re
+import shutil
 import threading
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Awaitable, Literal
+from urllib.parse import parse_qsl, unquote, urlparse
 
 from nanoma.cost import CostLedger, UsageRecord
 from nanoma.llm import (
     LLMResponse, Message, RetryConfig, ToolCall, ToolDef,
-    count_message_tokens, estimate_tokens, openai_compatible_call, set_log_dir,
+    count_message_tokens, default_llm_call, estimate_tokens, set_log_dir,
 )
 from nanoma.scheduler import Scheduler
 from nanoma.tools import WORK_TOOLS
@@ -31,6 +35,218 @@ _NATO = [
     "oscar", "papa", "quebec", "romeo", "sierra", "tango", "uniform",
     "victor", "whiskey", "xray", "yankee", "zulu",
 ]
+
+ToolPolicyMode = Literal["off", "adaptive", "enforce"]
+ShellCapability = Literal["web", "python", "fs", "process", "package", "system", "unknown"]
+
+_CREATE_TOOLS = {"spawn", "spawn_many"}
+_COORDINATION_TOOLS = {"send", "wait", "query", "kill", "transfer", "set_bio"}
+_LIFECYCLE_TOOLS = {"get_cost", "set_status", "rebirth", "submit"}
+_READ_TOOLS = {"ws_read_file", "ws_grep", "ws_code_outline", "ws_read_symbol", "query", "get_cost", "shell"}
+_WORK_TOOLS = {
+    "shell", "ws_create_file", "ws_append_file", "ws_replace_string",
+    "ws_multi_replace", "ws_apply_patch", "batch", "submit",
+}
+_FINISH_TOOLS = {"set_status", "submit"}
+_OUTPUT_SUFFIXES = {
+    ".answer", ".csv", ".html", ".json", ".jsonl", ".md", ".out",
+    ".pdf", ".txt", ".tsv", ".xml", ".yaml", ".yml",
+}
+_SHELL_CAPABILITIES = {"web", "python", "fs", "process", "package", "system", "unknown"}
+_BACKTICK_PATH_RE = re.compile(r"`([^`]+)`")
+_NAMED_PATH_RE = re.compile(r"\bnamed\s+([A-Za-z0-9_./$-]+\.[A-Za-z0-9]+)", re.IGNORECASE)
+_WEB_URL_RE = re.compile(r"https?://[^\s'\"<>]+", re.IGNORECASE)
+_WEB_LOW_SIGNAL_PATTERNS = (
+    "access denied",
+    "attention required",
+    "blocked",
+    "captcha",
+    "cloudflare",
+    "forbidden",
+    "no results",
+    "not found",
+    "permission denied",
+    "rate limit",
+    "robot check",
+    "temporarily unavailable",
+    "traceback",
+    "validation-failure",
+)
+
+
+def _clamp01(value: float) -> float:
+    return max(0.0, min(1.0, value))
+
+
+def _looks_like_output_path(text: str) -> bool:
+    text = text.strip().strip("'\".,);:")
+    if not text or "://" in text:
+        return False
+    return Path(text).suffix.lower() in _OUTPUT_SUFFIXES
+
+
+def _extract_expected_output_paths(task: str) -> list[str]:
+    """Best-effort extraction for explicit deliverable paths in benchmark prompts."""
+    paths: list[str] = []
+    for match in _BACKTICK_PATH_RE.finditer(task):
+        raw = match.group(1).strip()
+        if _looks_like_output_path(raw):
+            paths.append(raw.strip("'\".,);:"))
+    for match in _NAMED_PATH_RE.finditer(task):
+        raw = match.group(1).strip()
+        if _looks_like_output_path(raw):
+            paths.append(raw.strip("'\".,);:"))
+
+    seen: set[str] = set()
+    unique: list[str] = []
+    for path in paths:
+        key = path.lower()
+        if key not in seen:
+            seen.add(key)
+            unique.append(path)
+    return unique
+
+
+def classify_shell_capability(command: str) -> ShellCapability:
+    """Classify a shell command for internal policy pruning.
+
+    The public tool remains a single `shell` function. This classification is
+    used only by the runtime to narrow what that tool may execute under
+    constraint pressure.
+    """
+    cmd = command.strip()
+    if not cmd:
+        return "unknown"
+
+    first = re.split(r"\s+", cmd, maxsplit=1)[0].split("/")[-1]
+    lowered = cmd.lower()
+
+    python_network_markers = (
+        "http.client",
+        "requests.",
+        "urllib.",
+        "socket.",
+        "ssl.",
+        "aiohttp",
+        "httpx",
+        "urlopen",
+        "wrap_socket",
+        "create_connection",
+    )
+
+    imports_network_module = bool(
+        re.search(r"\b(?:import|from)\s+(?:aiohttp|http\.client|httpx|requests|socket|ssl|urllib)\b", lowered)
+        or re.search(r"\bimport\s+[A-Za-z0-9_.,\s]*(?:socket|ssl|urllib|requests|httpx|aiohttp)\b", lowered)
+    )
+
+    if (
+        first in {"curl", "wget"}
+        or re.search(r"https?://", lowered)
+        or any(marker in lowered for marker in python_network_markers)
+        or imports_network_module
+    ):
+        return "web"
+    if first in {"python", "python3", "python2"} or re.match(r"python\d?\s*<<", lowered):
+        return "python"
+    if first in {
+        "cat", "cd", "cp", "du", "echo", "file", "find", "head", "ls", "mkdir",
+        "grep", "mv", "pwd", "realpath", "rm", "rmdir", "sed", "sort", "stat",
+        "tail", "tee", "touch", "tree", "uniq", "wc",
+    }:
+        return "fs"
+    if first in {"ps", "pkill", "kill", "killall", "jobs", "pgrep", "sleep", "timeout"}:
+        return "process"
+    if first in {"apt", "apt-get", "brew", "conda", "npm", "npx", "pip", "pip3", "pnpm", "yarn"}:
+        return "package"
+    if first in {
+        "bash", "chmod", "chown", "docker", "git", "make", "node", "perl", "ruby",
+        "sh", "sudo", "tar", "unzip", "xz", "zip",
+    }:
+        return "system"
+    return "unknown"
+
+
+def _extract_web_urls(command: str) -> list[str]:
+    urls: list[str] = []
+    for match in _WEB_URL_RE.finditer(command):
+        url = match.group(0).rstrip("),.;]")
+        if url:
+            urls.append(url)
+    return urls
+
+
+def _web_command_domain(command: str) -> str:
+    urls = _extract_web_urls(command)
+    if not urls:
+        return ""
+    try:
+        return (urlparse(urls[0]).netloc or "").lower()
+    except Exception:
+        return ""
+
+
+def _web_command_signature(command: str) -> str:
+    urls = _extract_web_urls(command)
+    if not urls:
+        return re.sub(r"\s+", " ", command.strip().lower())[:240]
+
+    try:
+        parsed = urlparse(urls[0])
+    except Exception:
+        return urls[0].lower()[:240]
+
+    query = dict(parse_qsl(parsed.query, keep_blank_values=True))
+    query_text = (
+        query.get("q")
+        or query.get("query")
+        or query.get("search")
+        or query.get("srsearch")
+        or query.get("title")
+        or ""
+    )
+    if query_text:
+        query_part = unquote(query_text).lower()
+    else:
+        stable_params = [
+            (k, v)
+            for k, v in parse_qsl(parsed.query, keep_blank_values=True)
+            if k.lower() not in {"api_key", "apikey", "key", "token", "access_token"}
+        ][:6]
+        query_part = "&".join(f"{k}={v}" for k, v in stable_params).lower()
+
+    path = parsed.path.rstrip("/") or "/"
+    return re.sub(
+        r"\s+",
+        " ",
+        f"{(parsed.netloc or '').lower()}{path.lower()}?{query_part}",
+    )[:240]
+
+
+def _web_result_low_signal(result: Any) -> bool:
+    if not isinstance(result, dict):
+        return True
+
+    try:
+        exit_code = int(result.get("exit_code", 0))
+    except Exception:
+        exit_code = 0
+    if exit_code != 0:
+        return True
+
+    text = f"{result.get('stdout', '')}\n{result.get('stderr', '')}".strip()
+    if len(text) < 80:
+        return True
+
+    lowered = text.lower()
+    if any(pattern in lowered for pattern in _WEB_LOW_SIGNAL_PATTERNS):
+        return True
+
+    if re.search(r'"(?:totalhits|count|total|num_found)"\s*:\s*0\b', lowered):
+        return True
+    if re.search(r'"(?:items|results|search)"\s*:\s*\[\s*\]', lowered):
+        return True
+
+    return False
 
 
 class IdGenerator:
@@ -86,6 +302,85 @@ class ToolContext:
     file_read_max_chars: int = 50000
     file_list_max_entries: int = 500
     grep_max_results: int = 100
+    blocked_shell_patterns: list[str] = field(default_factory=list)
+    allowed_shell_capabilities: set[str] = field(default_factory=lambda: set(_SHELL_CAPABILITIES))
+
+
+# ─── Tool Policy ─────────────────────────────────────────────────────────────
+
+@dataclass
+class ToolPolicyState:
+    create: float = 0.0
+    read: float = 0.0
+    message: float = 0.0
+    work: float = 0.0
+    finish: float = 0.0
+    resource_pressure: float = 0.0
+    dependency_pressure: float = 0.0
+    artifact_gap: float = 0.0
+    stagnation_pressure: float = 0.0
+    expected_outputs: int = 0
+    missing_outputs: int = 0
+    active_children: int = 0
+    reason: str = "off"
+    scoped_tools: list[str] = field(default_factory=list)
+    removed_tools: list[str] = field(default_factory=list)
+
+    def as_event(self) -> dict[str, Any]:
+        return {
+            "weights": {
+                "create": round(self.create, 3),
+                "read": round(self.read, 3),
+                "message": round(self.message, 3),
+                "work": round(self.work, 3),
+                "finish": round(self.finish, 3),
+            },
+            "pressures": {
+                "resource": round(self.resource_pressure, 3),
+                "dependency": round(self.dependency_pressure, 3),
+                "artifact_gap": round(self.artifact_gap, 3),
+                "stagnation": round(self.stagnation_pressure, 3),
+            },
+            "expected_outputs": self.expected_outputs,
+            "missing_outputs": self.missing_outputs,
+            "active_children": self.active_children,
+            "reason": self.reason,
+            "scoped_tools": self.scoped_tools,
+            "removed_tools": self.removed_tools,
+        }
+
+
+@dataclass
+class ShellActivityState:
+    web_calls: int = 0
+    web_low_signal_calls: int = 0
+    blocked_web_calls: int = 0
+    consecutive_web_low_signal: int = 0
+    repeated_web_queries: int = 0
+    repeated_web_domains: int = 0
+    unique_web_signatures: set[str] = field(default_factory=set)
+    unique_web_domains: set[str] = field(default_factory=set)
+    last_web_signature: str = ""
+    last_web_domain: str = ""
+    web_domain_sprawl: float = 0.0
+    web_saturation: float = 0.0
+    finalize_after_web_saturation: bool = False
+
+    def as_event(self) -> dict[str, Any]:
+        return {
+            "web_calls": self.web_calls,
+            "web_low_signal_calls": self.web_low_signal_calls,
+            "blocked_web_calls": self.blocked_web_calls,
+            "consecutive_web_low_signal": self.consecutive_web_low_signal,
+            "repeated_web_queries": self.repeated_web_queries,
+            "repeated_web_domains": self.repeated_web_domains,
+            "unique_web_signatures": len(self.unique_web_signatures),
+            "unique_web_domains": len(self.unique_web_domains),
+            "last_web_domain": self.last_web_domain,
+            "web_domain_sprawl": round(self.web_domain_sprawl, 3),
+            "web_saturation": round(self.web_saturation, 3),
+            "finalize_after_web_saturation": self.finalize_after_web_saturation,
+        }
 
 
 # ─── Configuration ───────────────────────────────────────────────────────────
@@ -96,15 +391,42 @@ class RuntimeConfig:
     max_depth: int = 100
     max_concurrent_llm: int = 50
     budget: float = 10.0
+    max_total_tokens: int = 0
+    tool_policy_soft_total_tokens: int = 0
     time_limit: float = 0.0
     max_turns: int = 200
     allowed_models: list[str] | None = None
+    disabled_tools: set[str] = field(default_factory=set)
     context_compress_ratio: float = 0.8
     default_model: str = "deepseek-v4-flash"
     log_dir: Path | None = field(default_factory=lambda: Path("./logs"))
     workspace_root: Path = field(default_factory=lambda: Path("./workspace"))
     shared_dir: str = "shared"
     retry: RetryConfig = field(default_factory=RetryConfig)
+    # Runtime tool policy: state variables narrow tool availability without
+    # injecting policy text into the agent loop.
+    tool_policy_mode: ToolPolicyMode = "adaptive"
+    tool_policy_spawn_min_weight: float = 0.30
+    tool_policy_resource_threshold: float = 0.85
+    tool_policy_dependency_threshold: float = 0.65
+    tool_policy_dependency_window: int = 8
+    tool_policy_finish_threshold: float = 0.75
+    tool_policy_prune_tools: bool = False
+    tool_policy_prune_min_tools: int = 6
+    tool_policy_prune_pressure_start: float = 0.65
+    tool_policy_prune_pressure_end: float = 0.95
+    tool_policy_prune_preserve_tools: set[str] = field(default_factory=lambda: {
+        "shell", "get_cost", "set_status", "submit",
+        "ws_read_file", "ws_create_file", "ws_append_file",
+    })
+    tool_policy_prune_shell_capabilities: bool = False
+    tool_policy_shell_capability_pressure_start: float = 0.55
+    tool_policy_shell_capability_pressure_end: float = 0.95
+    tool_policy_web_saturation_enabled: bool = True
+    tool_policy_web_saturation_min_calls: int = 10
+    tool_policy_web_saturation_threshold: float = 0.85
+    tool_policy_web_saturation_finalize_after_blocks: int = 2
+    tool_policy_log_events: bool = False
     # Resource notification thresholds (fraction consumed, e.g. 0.5 = 50%)
     notify_thresholds: list[float] = field(default_factory=lambda: [0.25, 0.50, 0.70, 0.80, 0.90, 0.95])
     # Compression / truncation settings
@@ -115,6 +437,12 @@ class RuntimeConfig:
     file_read_max_chars: int = 50000        # max chars for file_read (0 = unlimited)
     file_list_max_entries: int = 500        # max entries for file_list (0 = unlimited)
     grep_max_results: int = 100             # max grep results (0 = unlimited)
+    blocked_shell_patterns: list[str] = field(default_factory=list)
+    probe_dir: Path | None = None
+    probe_every_llm: bool = False
+    probe_stop_after: int = 0
+    force_spawn_turns: int = 0
+    probe_resume_instruction: str | None = None
 
 
 # ─── Agent ───────────────────────────────────────────────────────────────────
@@ -158,6 +486,10 @@ class Agent:
     _last_active: float = field(default_factory=time.time)
     _rebirth_pending: dict | None = field(default=None, repr=False)
     _notified_thresholds: set = field(default_factory=set)  # resource thresholds already fired
+    _tool_calls: int = 0
+    _no_tool_turns: int = 0
+    _last_tool_policy: dict[str, Any] | None = field(default=None, repr=False)
+    _shell_activity: ShellActivityState = field(default_factory=ShellActivityState, repr=False)
 
 
 # ─── Runtime ─────────────────────────────────────────────────────────────────
@@ -181,8 +513,9 @@ class Runtime:
             file_read_max_chars=self.config.file_read_max_chars,
             file_list_max_entries=self.config.file_list_max_entries,
             grep_max_results=self.config.grep_max_results,
+            blocked_shell_patterns=list(self.config.blocked_shell_patterns),
         )
-        self.llm_call = llm_call or openai_compatible_call
+        self.llm_call = llm_call or default_llm_call
         self.router = router
         self.scheduler = Scheduler(max_concurrent=self.config.max_concurrent_llm)
         self.on_event = on_event or (lambda e: None)
@@ -190,6 +523,7 @@ class Runtime:
         self._events: list[dict] = []  # all events for post-hoc analysis
         self._messages_sent: list[tuple[str, str, int]] = []  # (from, to, tokens) for comm graph
         self._emit_lock = threading.Lock()  # protects events.jsonl writes
+        self._probe_counter = 0
 
         self.config.workspace_root.mkdir(parents=True, exist_ok=True)
         self._tool_context.shared_dir.mkdir(parents=True, exist_ok=True)
@@ -241,9 +575,7 @@ class Runtime:
         # Context limit from model registry
         try:
             from nanoma.models import get_registry
-            m = get_registry().get(model)
-            if m:
-                agent.context_limit = m.context_limit
+            agent.context_limit = get_registry().context_limit(model)
         except Exception:
             pass
 
@@ -297,8 +629,11 @@ class Runtime:
     async def _agent_loop(self, agent: Agent):
         from nanoma.meta import META_TOOLS
         # Tool set: shell (universal primitive) + workspace (structured I/O) + meta (coordination)
-        all_tools = {**WORK_TOOLS, **WORKSPACE_TOOLS, **META_TOOLS}
-        tool_schemas = [t["schema"] for t in all_tools.values()]
+        all_tools = {
+            name: tool
+            for name, tool in {**WORK_TOOLS, **WORKSPACE_TOOLS, **META_TOOLS}.items()
+            if name not in self.config.disabled_tools
+        }
 
         try:
             while agent.status == "running":
@@ -306,7 +641,7 @@ class Runtime:
                 agent._last_active = time.time()
 
                 # Turn limits
-                if agent._turns > agent.quota.max_turns:
+                if agent.quota.max_turns > 0 and agent._turns > agent.quota.max_turns:
                     agent.status = "done"
                     agent.result = agent.result or "[Max turns reached]"
                     break
@@ -352,6 +687,47 @@ class Runtime:
                     agent.history = await self._compress(agent.history)
                     agent.context_tokens = count_message_tokens(agent.history)
 
+                turn_tools, tool_policy = self._apply_state_tool_policy(agent, all_tools)
+                if (
+                    self.config.force_spawn_turns > 0
+                    and agent.parent is None
+                    and not agent.children
+                    and agent._turns <= self.config.force_spawn_turns
+                    and "spawn" in turn_tools
+                ):
+                    preferred = _CREATE_TOOLS | {"get_cost", "set_status"}
+                    forced = {name: tool for name, tool in turn_tools.items() if name in preferred}
+                    if forced:
+                        turn_tools = forced
+                        tool_policy.reason = f"{tool_policy.reason},force_spawn_turns"
+                        tool_policy.scoped_tools = list(turn_tools)
+                        agent.history.append({
+                            "role": "user",
+                            "content": (
+                                "[Probe branch tool override]\n"
+                                "For this resumed branch, shell and workspace write tools are intentionally unavailable "
+                                "until you create at least one child agent. Call spawn now. Prefer spawning separate "
+                                "solver, verifier, and golfer agents, each with complete task context. Omit the spawn "
+                                f"model argument or use {self.config.default_model}; do not request other models. "
+                                "Do not call shell."
+                            ),
+                        })
+                tool_schemas = [t["schema"] for t in turn_tools.values()]
+                agent._last_tool_policy = tool_policy.as_event()
+
+                if self.config.probe_every_llm:
+                    probe_path = self._write_probe(agent, turn_tools, tool_policy)
+                    self._emit(agent.id, "probe", {
+                        "path": str(probe_path),
+                        "turn": agent._turns,
+                        "tools": list(turn_tools),
+                        "tool_policy": tool_policy.as_event(),
+                    })
+                    if self.config.probe_stop_after > 0 and self._probe_counter >= self.config.probe_stop_after:
+                        agent.status = "done"
+                        agent.result = f"[Probe stop after {self._probe_counter} probes]"
+                        break
+
                 # LLM call
                 await self.scheduler.acquire()
                 try:
@@ -366,7 +742,7 @@ class Runtime:
                 cost = self.ledger.record(agent.id, response.usage)
                 agent.tokens_consumed += response.usage.total_tokens
                 agent.quota.budget -= cost
-                self._emit(agent.id, "llm_done", {
+                llm_event = {
                     "tokens": response.usage.total_tokens,
                     "input_tokens": response.usage.input_tokens,
                     "output_tokens": response.usage.output_tokens,
@@ -376,10 +752,32 @@ class Runtime:
                     "tool_calls": [tc.name for tc in response.tool_calls] if response.tool_calls else [],
                     "has_content": bool(response.content),
                     "content_preview": (response.content or "")[:200],
-                })
+                }
+                if self.config.tool_policy_log_events:
+                    llm_event["tool_policy"] = tool_policy.as_event()
+                self._emit(agent.id, "llm_done", llm_event)
+
+                if self.config.max_total_tokens > 0:
+                    total_tokens = sum(a.tokens_consumed for a in self.agents.values())
+                    if total_tokens >= self.config.max_total_tokens:
+                        agent.status = "done"
+                        agent.result = agent.result or f"[Max total tokens reached: {total_tokens}]"
+                        for other in self.agents.values():
+                            if other.status in {"running", "idle"}:
+                                other.status = "done"
+                                other.result = other.result or agent.result
+                        self._emit(agent.id, "done", {
+                            "status": "done",
+                            "reason": "max_total_tokens",
+                            "tokens": total_tokens,
+                            "max_total_tokens": self.config.max_total_tokens,
+                            "result": agent.result,
+                        })
+                        break
 
                 # Process response
                 if response.tool_calls:
+                    agent._no_tool_turns = 0
                     # Append assistant message with tool calls
                     agent.history.append({
                         "role": "assistant", "content": response.content,
@@ -401,7 +799,8 @@ class Runtime:
                                 })
                             break
 
-                        result = await self._execute_tool(tc, agent, all_tools)
+                        result = await self._execute_tool(tc, agent, turn_tools)
+                        agent._tool_calls += 1
                         result_json = json.dumps(result, ensure_ascii=False, default=str)
                         agent.history.append({
                             "role": "tool", "tool_call_id": tc.id,
@@ -419,8 +818,10 @@ class Runtime:
                     self._inject_messages(agent, agent._steer_inbox)
 
                 elif response.content:
+                    agent._no_tool_turns += 1
                     agent.history.append({"role": "assistant", "content": response.content})
                 else:
+                    agent._no_tool_turns += 1
                     agent.history.append({"role": "assistant", "content": "(empty)"})
 
                 if agent.status != "running":
@@ -482,13 +883,14 @@ class Runtime:
                     alerts.append(f"⏱️ TIME {int(t*100)}% used — {remaining:.0f}s remaining")
 
         # Turns consumed
-        turn_frac = agent._turns / agent.quota.max_turns
-        for t in thresholds:
-            key = f"turns_{t}"
-            if turn_frac >= t and key not in agent._notified_thresholds:
-                agent._notified_thresholds.add(key)
-                remaining = agent.quota.max_turns - agent._turns
-                alerts.append(f"🔄 TURNS {int(t*100)}% used — {remaining} turns remaining")
+        if agent.quota.max_turns > 0:
+            turn_frac = agent._turns / agent.quota.max_turns
+            for t in thresholds:
+                key = f"turns_{t}"
+                if turn_frac >= t and key not in agent._notified_thresholds:
+                    agent._notified_thresholds.add(key)
+                    remaining = agent.quota.max_turns - agent._turns
+                    alerts.append(f"🔄 TURNS {int(t*100)}% used — {remaining} turns remaining")
 
         # Budget consumed (global ledger)
         total_budget = self.ledger.total_budget
@@ -538,6 +940,450 @@ class Runtime:
         for msg in msgs:
             agent.history.append({"role": "user", "content": f"[Message from {msg.from_id}]: {msg.content}"})
         return msgs
+
+    def _path_candidates_for_agent(self, agent: Agent, raw_path: str) -> list[Path]:
+        path_text = raw_path.strip().strip("'\".,);:")
+        path_text = path_text.replace("$SHARED", self.config.shared_dir)
+        path = Path(path_text)
+        if path.is_absolute():
+            return [path]
+
+        candidates = [agent.workspace / path, self.config.workspace_root / path]
+        if path.parts and path.parts[0] == self.config.shared_dir:
+            candidates.append(self.config.workspace_root / path)
+        else:
+            candidates.append(self._tool_context.shared_dir / path)
+        return candidates
+
+    def _missing_expected_outputs(self, agent: Agent) -> list[str]:
+        expected = _extract_expected_output_paths(agent.task)
+        missing: list[str] = []
+        artifact_paths = {a.path for a in agent.artifacts}
+        artifact_names = {Path(a.path).name for a in agent.artifacts}
+        for raw_path in expected:
+            if raw_path in artifact_paths or Path(raw_path).name in artifact_names:
+                continue
+            if not any(path.exists() for path in self._path_candidates_for_agent(agent, raw_path)):
+                missing.append(raw_path)
+        return missing
+
+    def _resource_pressure(self, agent: Agent) -> float:
+        pressures: list[float] = []
+        if self.ledger.total_budget > 0:
+            pressures.append(_clamp01(self.ledger.total_spent / self.ledger.total_budget))
+        if agent.quota.time_limit > 0:
+            pressures.append(_clamp01((time.time() - self._start_time) / agent.quota.time_limit))
+        if agent.quota.max_turns > 0:
+            pressures.append(_clamp01(agent._turns / agent.quota.max_turns))
+        if self.config.max_total_tokens > 0:
+            total_tokens = sum(a.tokens_consumed for a in self.agents.values())
+            pressures.append(_clamp01(total_tokens / self.config.max_total_tokens))
+        if self.config.tool_policy_soft_total_tokens > 0:
+            total_tokens = sum(a.tokens_consumed for a in self.agents.values())
+            pressures.append(_clamp01(total_tokens / self.config.tool_policy_soft_total_tokens))
+        if agent.context_limit > 0 and agent.context_tokens > 0:
+            pressures.append(_clamp01(agent.context_tokens / agent.context_limit))
+        if self.config.max_agents > 0:
+            pressures.append(_clamp01(len(self.agents) / self.config.max_agents))
+        return max(pressures, default=0.0)
+
+    def _compute_tool_policy_state(self, agent: Agent) -> ToolPolicyState:
+        expected = _extract_expected_output_paths(agent.task)
+        missing = self._missing_expected_outputs(agent)
+        artifact_gap = len(missing) / len(expected) if expected else 0.0
+
+        active_children = [
+            cid for cid in agent.children
+            if cid in self.agents and self.agents[cid].status not in {"done", "failed"}
+        ]
+        dependency_window = max(1, self.config.tool_policy_dependency_window)
+        dependency_pressure = len(active_children) / max(1, dependency_window, len(agent.children))
+        depth_pressure = _clamp01(agent.depth / self.config.max_depth) if self.config.max_depth > 0 else 1.0
+        resource_pressure = self._resource_pressure(agent)
+        stagnation_pressure = _clamp01(agent._no_tool_turns / 3.0)
+
+        can_create = self._spawn_unavailable_reason(agent) is None
+
+        create = (
+            0.40
+            + 0.55 * artifact_gap
+            + 0.25 * stagnation_pressure
+            - 0.75 * resource_pressure
+            - 0.55 * dependency_pressure
+            - 0.45 * depth_pressure
+        )
+        if agent.parent:
+            create -= 0.20
+        if not can_create:
+            create = 0.0
+
+        read = 0.25 + 0.25 * stagnation_pressure + 0.20 * (0.0 if expected else 1.0) + 0.15 * dependency_pressure
+        message = 0.20 + 0.65 * dependency_pressure + (0.10 if agent.children else 0.0)
+        work = 0.45 + 0.45 * artifact_gap + 0.15 * (1.0 - dependency_pressure) - 0.25 * resource_pressure
+        finish = (
+            0.10
+            + (0.65 if expected and not missing else 0.0)
+            + (0.20 if not expected and agent._turns > 1 else 0.0)
+            + 0.25 * resource_pressure
+            - 0.55 * artifact_gap
+            - 0.45 * dependency_pressure
+        )
+
+        return ToolPolicyState(
+            create=_clamp01(create),
+            read=_clamp01(read),
+            message=_clamp01(message),
+            work=_clamp01(work),
+            finish=_clamp01(finish),
+            resource_pressure=resource_pressure,
+            dependency_pressure=_clamp01(dependency_pressure),
+            artifact_gap=_clamp01(artifact_gap),
+            stagnation_pressure=stagnation_pressure,
+            expected_outputs=len(expected),
+            missing_outputs=len(missing),
+            active_children=len(active_children),
+        )
+
+    def _allowed_shell_capabilities(self, state: ToolPolicyState, agent: Agent | None = None) -> set[str]:
+        """Return the current shell sub-capabilities allowed by constraints."""
+        all_caps = set(_SHELL_CAPABILITIES)
+        if (
+            self.config.tool_policy_mode == "off"
+            or not self.config.tool_policy_prune_shell_capabilities
+        ):
+            return all_caps
+
+        web_saturated = (
+            agent is not None
+            and self.config.tool_policy_web_saturation_enabled
+            and agent._shell_activity.web_calls >= self.config.tool_policy_web_saturation_min_calls
+            and agent._shell_activity.web_saturation >= self.config.tool_policy_web_saturation_threshold
+        )
+        web_pressure = (
+            agent._shell_activity.web_saturation
+            if agent is not None and agent._shell_activity.web_calls >= self.config.tool_policy_web_saturation_min_calls
+            else 0.0
+        )
+
+        start = self.config.tool_policy_shell_capability_pressure_start
+        end = self.config.tool_policy_shell_capability_pressure_end
+        pressure = max(state.resource_pressure, state.finish, web_pressure)
+        if pressure < start and not web_saturated:
+            return all_caps
+
+        if end <= start:
+            ratio = 1.0
+        else:
+            ratio = _clamp01((pressure - start) / (end - start))
+
+        if ratio < 0.35:
+            allowed = {"web", "python", "fs", "process", "unknown"}
+        elif ratio < 0.70:
+            allowed = {"web", "python", "fs"}
+        elif state.finish >= self.config.tool_policy_finish_threshold:
+            allowed = {"python", "fs"}
+        else:
+            allowed = {"web", "python", "fs"}
+
+        if web_saturated:
+            allowed.discard("web")
+
+        return allowed
+
+    def _refresh_tool_context_policy(self, agent: Agent) -> ToolPolicyState:
+        state = self._compute_tool_policy_state(agent)
+        self._tool_context.allowed_shell_capabilities = self._allowed_shell_capabilities(state, agent)
+        return state
+
+    def _update_shell_activity(self, agent: Agent, command: str, result: Any) -> None:
+        if not self.config.tool_policy_prune_shell_capabilities:
+            return
+        capability = classify_shell_capability(command)
+        if capability != "web":
+            return
+
+        activity = agent._shell_activity
+        if isinstance(result, dict) and result.get("blocked") and result.get("blocked_capability") == "web":
+            activity.blocked_web_calls += 1
+            if (
+                self.config.tool_policy_web_saturation_enabled
+                and activity.web_saturation >= self.config.tool_policy_web_saturation_threshold
+                and activity.blocked_web_calls >= self.config.tool_policy_web_saturation_finalize_after_blocks
+            ):
+                activity.finalize_after_web_saturation = True
+                self._emit(agent.id, "shell_activity", activity.as_event())
+            return
+
+        activity.web_calls += 1
+
+        signature = _web_command_signature(command)
+        domain = _web_command_domain(command)
+
+        repeated_query = bool(signature and signature in activity.unique_web_signatures)
+        repeated_domain = bool(domain and domain == activity.last_web_domain)
+        low_signal = _web_result_low_signal(result)
+
+        if repeated_query:
+            activity.repeated_web_queries += 1
+        if repeated_domain:
+            activity.repeated_web_domains += 1
+        if low_signal:
+            activity.web_low_signal_calls += 1
+            activity.consecutive_web_low_signal += 1
+        else:
+            activity.consecutive_web_low_signal = 0
+
+        if signature:
+            activity.unique_web_signatures.add(signature)
+            activity.last_web_signature = signature
+        if domain:
+            activity.unique_web_domains.add(domain)
+            activity.last_web_domain = domain
+
+        calls = max(1, activity.web_calls)
+        low_signal_ratio = activity.web_low_signal_calls / calls
+        repeat_query_ratio = activity.repeated_web_queries / calls
+        repeat_domain_ratio = activity.repeated_web_domains / calls
+        # Two loop shapes are common:
+        # 1. drilling into the same source/query, captured by repeat ratios;
+        # 2. broad source hopping after evidence stalls, captured by sprawl.
+        # Both are runtime-only signals and never become prompt text.
+        activity.web_domain_sprawl = min(
+            1.0,
+            max(0, len(activity.unique_web_domains) - 6) / 10.0,
+        )
+        consecutive_ratio = min(1.0, activity.consecutive_web_low_signal / 4.0)
+        volume_ratio = min(1.0, max(0, calls - self.config.tool_policy_web_saturation_min_calls + 1) / 16.0)
+
+        activity.web_saturation = _clamp01(
+            0.20 * low_signal_ratio
+            + 0.15 * repeat_query_ratio
+            + 0.10 * repeat_domain_ratio
+            + 0.25 * activity.web_domain_sprawl
+            + 0.05 * consecutive_ratio
+            + 0.25 * volume_ratio
+        )
+
+        if (
+            self.config.tool_policy_log_events
+            or activity.web_saturation >= self.config.tool_policy_web_saturation_threshold
+        ):
+            self._emit(agent.id, "shell_activity", activity.as_event())
+
+    def _apply_state_tool_policy(self, agent: Agent, tools: dict[str, dict[str, Any]]) -> tuple[dict[str, dict[str, Any]], ToolPolicyState]:
+        state = self._compute_tool_policy_state(agent)
+        if self.config.tool_policy_mode == "off":
+            state.reason = "off"
+            state.scoped_tools = list(tools)
+            return tools, state
+
+        scoped = dict(tools)
+        original_order = {name: idx for idx, name in enumerate(tools)}
+        removed: set[str] = set()
+        reasons: list[str] = []
+
+        if agent._shell_activity.finalize_after_web_saturation:
+            finalize_allowed = {
+                "ws_create_file", "ws_append_file", "ws_read_file",
+                "submit", "set_status", "get_cost",
+            }
+            finalized = {name: tool for name, tool in scoped.items() if name in finalize_allowed}
+            if finalized:
+                removed.update(set(scoped) - set(finalized))
+                scoped = finalized
+                state.finish = max(state.finish, 1.0)
+                state.work = min(state.work, 0.25)
+                state.read = min(state.read, 0.35)
+                scoped = self._order_tools_by_policy(scoped, state, original_order)
+                state.removed_tools = sorted(removed)
+                state.scoped_tools = list(scoped)
+                state.reason = "web_saturation_finalize"
+                return scoped, state
+
+        spawn_unavailable = self._spawn_unavailable_reason(agent)
+        spawn_should_close = (
+            spawn_unavailable is not None
+            or state.resource_pressure >= self.config.tool_policy_resource_threshold
+            or state.dependency_pressure >= self.config.tool_policy_dependency_threshold
+            or (
+                self.config.tool_policy_mode == "enforce"
+                and state.create < self.config.tool_policy_spawn_min_weight
+            )
+        )
+        if spawn_should_close:
+            for name in _CREATE_TOOLS:
+                if name in scoped:
+                    removed.add(name)
+                    scoped.pop(name, None)
+            reasons.append(spawn_unavailable or "spawn_closed")
+
+        if state.finish >= self.config.tool_policy_finish_threshold:
+            for name in _CREATE_TOOLS:
+                if name in scoped:
+                    removed.add(name)
+                    scoped.pop(name, None)
+            reasons.append("finish_weight_high")
+
+        if self.config.tool_policy_mode == "enforce":
+            if state.dependency_pressure >= self.config.tool_policy_dependency_threshold:
+                allowed = _COORDINATION_TOOLS | _READ_TOOLS | _LIFECYCLE_TOOLS
+                reasons.append("dependency_scope")
+            elif state.finish >= self.config.tool_policy_finish_threshold:
+                allowed = _READ_TOOLS | _LIFECYCLE_TOOLS | {"shell"}
+                reasons.append("finish_scope")
+            elif state.create >= self.config.tool_policy_spawn_min_weight and state.create >= state.work:
+                allowed = _CREATE_TOOLS | _COORDINATION_TOOLS | _READ_TOOLS | _LIFECYCLE_TOOLS | {"shell"}
+                reasons.append("create_scope")
+            else:
+                allowed = _WORK_TOOLS | _READ_TOOLS | _LIFECYCLE_TOOLS | {"query"}
+                reasons.append("work_scope")
+
+            enforced = {name: tool for name, tool in scoped.items() if name in allowed}
+            if enforced:
+                removed.update(set(scoped) - set(enforced))
+                scoped = enforced
+
+        if not scoped:
+            scoped = {name: tool for name, tool in tools.items() if name in _LIFECYCLE_TOOLS}
+            if not scoped:
+                scoped = tools
+            reasons.append("fallback_scope")
+
+        scoped = self._order_tools_by_policy(scoped, state, original_order)
+        if self.config.tool_policy_prune_tools:
+            scoped, pruned = self._prune_tools_by_policy(scoped, state)
+            if pruned:
+                removed.update(pruned)
+                reasons.append("prune_tools")
+        state.removed_tools = sorted(removed)
+        state.scoped_tools = list(scoped)
+        state.reason = ",".join(dict.fromkeys(reasons)) or "all_tools"
+        return scoped, state
+
+    def _tool_policy_score(self, tool_name: str, state: ToolPolicyState) -> float:
+        scores: list[float] = []
+        if tool_name in _CREATE_TOOLS:
+            scores.append(state.create)
+        if tool_name in _COORDINATION_TOOLS:
+            scores.append(state.message)
+        if tool_name in _READ_TOOLS:
+            scores.append(state.read)
+        if tool_name in _WORK_TOOLS:
+            scores.append(state.work)
+        if tool_name in _FINISH_TOOLS:
+            scores.append(state.finish)
+        elif tool_name in _LIFECYCLE_TOOLS:
+            scores.append(max(state.read, state.finish))
+        return max(scores, default=0.0)
+
+    def _order_tools_by_policy(
+        self,
+        tools: dict[str, dict[str, Any]],
+        state: ToolPolicyState,
+        original_order: dict[str, int],
+    ) -> dict[str, dict[str, Any]]:
+        # Structural steering only: preferred tools appear earlier in the schema
+        # list. No policy text or weights are injected into the agent loop.
+        names = sorted(
+            tools,
+            key=lambda name: (
+                -self._tool_policy_score(name, state),
+                original_order.get(name, len(original_order)),
+                name,
+            ),
+        )
+        return {name: tools[name] for name in names}
+
+    def _prune_tools_by_policy(
+        self,
+        tools: dict[str, dict[str, Any]],
+        state: ToolPolicyState,
+    ) -> tuple[dict[str, dict[str, Any]], set[str]]:
+        """Optionally shrink the tool schema based on runtime pressure.
+
+        This is structural steering only: no policy text or weights are added to
+        the agent history. Tools have already been ordered by policy score, so
+        pruning keeps the strongest prefix plus a small set of finalization
+        primitives needed to produce an answer.
+        """
+        if not tools:
+            return tools, set()
+
+        start = self.config.tool_policy_prune_pressure_start
+        end = self.config.tool_policy_prune_pressure_end
+        pressure = max(state.resource_pressure, state.finish)
+        if pressure < start:
+            return tools, set()
+
+        if end <= start:
+            ratio = 1.0
+        else:
+            ratio = _clamp01((pressure - start) / (end - start))
+
+        total = len(tools)
+        min_tools = max(1, self.config.tool_policy_prune_min_tools)
+        target = math.ceil(total - ratio * max(0, total - min_tools))
+        target = max(1, min(total, target))
+
+        preserve = set(self.config.tool_policy_prune_preserve_tools)
+        keep: set[str] = {name for name in tools if name in preserve}
+
+        for name in tools:
+            if len(keep) >= target:
+                break
+            keep.add(name)
+
+        pruned = {name for name in tools if name not in keep}
+        if not pruned:
+            return tools, set()
+
+        scoped = {name: tool for name, tool in tools.items() if name in keep}
+        if not scoped:
+            fallback = {
+                name: tool
+                for name, tool in tools.items()
+                if name in _LIFECYCLE_TOOLS or name in _FINISH_TOOLS
+            }
+            scoped = fallback or tools
+            pruned = set(tools) - set(scoped)
+        return scoped, pruned
+
+    def current_tool_policy(self, agent: Agent) -> dict[str, Any]:
+        all_tools = self._all_tools()
+        _, state = self._apply_state_tool_policy(agent, all_tools)
+        return state.as_event()
+
+    def spawn_policy_violation(self, agent: Agent) -> str | None:
+        if self.config.tool_policy_mode == "off":
+            return None
+        unavailable = self._spawn_unavailable_reason(agent)
+        if unavailable:
+            return unavailable
+        state = self._compute_tool_policy_state(agent)
+        if state.resource_pressure >= self.config.tool_policy_resource_threshold:
+            return f"resource pressure {state.resource_pressure:.2f} >= {self.config.tool_policy_resource_threshold:.2f}"
+        if state.dependency_pressure >= self.config.tool_policy_dependency_threshold:
+            return f"dependency pressure {state.dependency_pressure:.2f} >= {self.config.tool_policy_dependency_threshold:.2f}"
+        if self.config.tool_policy_mode == "enforce" and state.create < self.config.tool_policy_spawn_min_weight:
+            return f"create weight {state.create:.2f} < {self.config.tool_policy_spawn_min_weight:.2f}"
+        return None
+
+    def _spawn_unavailable_reason(self, agent: Agent) -> str | None:
+        if "spawn" in self.config.disabled_tools:
+            return "spawn disabled"
+        if agent.depth + 1 > self.config.max_depth:
+            return f"max depth {self.config.max_depth} reached"
+        if len(self.agents) >= self.config.max_agents:
+            return f"max agents {self.config.max_agents} reached"
+        return None
+
+    def _all_tools(self) -> dict[str, dict[str, Any]]:
+        from nanoma.meta import META_TOOLS
+        return {
+            name: tool
+            for name, tool in {**WORK_TOOLS, **WORKSPACE_TOOLS, **META_TOOLS}.items()
+            if name not in self.config.disabled_tools
+        }
 
     def _execute_rebirth(self, agent: Agent):
         params = agent._rebirth_pending
@@ -590,13 +1436,48 @@ class Runtime:
     async def _execute_tool(self, tc: ToolCall, agent: Agent, tools: dict) -> Any:
         tool_info = tools.get(tc.name)
         if not tool_info:
-            return {"error": f"Unknown tool: {tc.name}"}
+            return {
+                "error": f"Unknown or unavailable tool this turn: {tc.name}",
+                "available_tools": sorted(tools),
+        }
         handler = tool_info["handler"]
         try:
             if tool_info.get("is_meta"):
+                if (
+                    tc.name == "set_status"
+                    and agent._shell_activity.finalize_after_web_saturation
+                ):
+                    requested_status = str(tc.arguments.get("status", "done"))
+                    requested_result = str(tc.arguments.get("result", "") or "").strip()
+                    if requested_status == "idle":
+                        return {
+                            "error": (
+                                "idle is unavailable after web saturation; "
+                                "call set_status(done, result=...) or submit instead"
+                            ),
+                            "required_status": "done",
+                        }
+                    if requested_status == "done" and not requested_result:
+                        return {
+                            "error": (
+                                "empty done result is unavailable after web saturation; "
+                                "call set_status(done, result=<answer>) or submit instead"
+                            ),
+                            "required_status": "done",
+                            "required_result": "non-empty answer",
+                        }
                 return await handler(tc.arguments, agent, self)
             else:
-                return await handler(tc.arguments, agent.workspace, self._tool_context)
+                self._refresh_tool_context_policy(agent)
+                result = await handler(tc.arguments, agent.workspace, self._tool_context)
+                if tc.name == "shell":
+                    self._update_shell_activity(
+                        agent,
+                        str(tc.arguments.get("command", "")),
+                        result,
+                    )
+                    self._refresh_tool_context_policy(agent)
+                return result
         except Exception as e:
             return {"error": str(e)}
 
@@ -638,6 +1519,13 @@ class Runtime:
 - When you finish, send your spawner a message with results, then call set_status("done").
 """
 
+        coordination_tools = {"spawn", "send", "wait", "query", "kill", "transfer", "set_bio"}
+        has_coordination_tools = bool(coordination_tools - self.config.disabled_tools)
+        if has_coordination_tools:
+            meta_line = "- meta tools: coordination (spawn, send, wait, query, kill, transfer, etc.)"
+        else:
+            meta_line = "- meta tools: single-agent lifecycle and deliverables (get_cost, set_status, rebirth, submit, batch)"
+
         return f"""You are agent "{agent_id}" in a multi-agent system.
 
 Task: {task}
@@ -648,7 +1536,7 @@ Shared: {shared} (visible to all agents){time_info}
 You have tools in 3 layers:
 - shell: universal primitive. Use for mkdir, rm, mv, ls, find, tree, git, pip, curl, etc.
 - ws_* tools: structured operations (file create/read/edit, grep, code outline)
-- meta tools: coordination (spawn, send, wait, query, kill, transfer, etc.)
+{meta_line}
 
 When in doubt, use shell. The ws_* tools exist only for operations shell can't do reliably.
 """
@@ -711,9 +1599,9 @@ When in doubt, use shell. The ws_* tools exist only for operations shell can't d
         for e in self._events:
             aid = e["agent"]
             t = e["t"]
-            if e["event"] == "spawn":
+            if e["event"] == "agent_new":
                 running_at[aid] = [t, None]
-            elif e["event"] == "done":
+            elif e["event"] in {"done", "failed"}:
                 if aid in running_at:
                     running_at[aid][1] = t
         # Fill in end times for agents still running
@@ -832,3 +1720,232 @@ When in doubt, use shell. The ws_* tools exist only for operations shell can't d
         tasks = [a._task for a in self.agents.values() if a._task and not a._task.done()]
         if tasks:
             await asyncio.gather(*tasks, return_exceptions=True)
+
+    def _queue_snapshot(self, queue: asyncio.Queue[Envelope]) -> list[Envelope]:
+        return list(getattr(queue, "_queue", []))
+
+    def _make_queue(self, items: list[Envelope]) -> asyncio.Queue[Envelope]:
+        queue: asyncio.Queue[Envelope] = asyncio.Queue()
+        for item in items:
+            queue.put_nowait(item)
+        return queue
+
+    def _agent_snapshot(self, agent: Agent) -> dict[str, Any]:
+        return {
+            "id": agent.id,
+            "task": agent.task,
+            "model": agent.model,
+            "bio": agent.bio,
+            "status": agent.status,
+            "history": copy.deepcopy(agent.history),
+            "children": sorted(agent.children),
+            "parent": agent.parent,
+            "depth": agent.depth,
+            "result": agent.result,
+            "quota": copy.deepcopy(agent.quota),
+            "context_tokens": agent.context_tokens,
+            "context_limit": agent.context_limit,
+            "tokens_consumed": agent.tokens_consumed,
+            "created_at": agent._created_at,
+            "workspace": str(agent.workspace),
+            "artifacts": copy.deepcopy(agent.artifacts),
+            "queue_inbox": self._queue_snapshot(agent._queue_inbox),
+            "steer_inbox": self._queue_snapshot(agent._steer_inbox),
+            "immediate_inbox": self._queue_snapshot(agent._immediate_inbox),
+            "turns": agent._turns,
+            "last_active": agent._last_active,
+            "rebirth_pending": copy.deepcopy(agent._rebirth_pending),
+            "notified_thresholds": sorted(agent._notified_thresholds),
+            "tool_calls": agent._tool_calls,
+            "no_tool_turns": agent._no_tool_turns,
+            "last_tool_policy": copy.deepcopy(agent._last_tool_policy),
+            "shell_activity": {
+                "web_calls": agent._shell_activity.web_calls,
+                "web_low_signal_calls": agent._shell_activity.web_low_signal_calls,
+                "blocked_web_calls": agent._shell_activity.blocked_web_calls,
+                "consecutive_web_low_signal": agent._shell_activity.consecutive_web_low_signal,
+                "repeated_web_queries": agent._shell_activity.repeated_web_queries,
+                "repeated_web_domains": agent._shell_activity.repeated_web_domains,
+                "unique_web_signatures": sorted(agent._shell_activity.unique_web_signatures),
+                "unique_web_domains": sorted(agent._shell_activity.unique_web_domains),
+                "last_web_signature": agent._shell_activity.last_web_signature,
+                "last_web_domain": agent._shell_activity.last_web_domain,
+                "web_domain_sprawl": agent._shell_activity.web_domain_sprawl,
+                "web_saturation": agent._shell_activity.web_saturation,
+                "finalize_after_web_saturation": agent._shell_activity.finalize_after_web_saturation,
+            },
+        }
+
+    def _restore_agent(
+        self,
+        data: dict[str, Any],
+        old_workspace_root: Path | None = None,
+    ) -> Agent:
+        workspace = Path(data.get("workspace", self.config.workspace_root / data["id"]))
+        if old_workspace_root is not None:
+            try:
+                workspace = self.config.workspace_root / workspace.relative_to(old_workspace_root)
+            except ValueError:
+                pass
+        history = copy.deepcopy(data.get("history", []))
+        if old_workspace_root is not None:
+            old_shared = old_workspace_root / self.config.shared_dir
+            new_shared = self.config.workspace_root / self.config.shared_dir
+            for msg in history:
+                content = msg.get("content")
+                if isinstance(content, str):
+                    content = content.replace(str(old_workspace_root), str(self.config.workspace_root))
+                    content = content.replace(str(old_shared), str(new_shared))
+                    msg["content"] = content
+        agent = Agent(
+            id=data["id"],
+            task=data["task"],
+            model=data["model"],
+            bio=data.get("bio", ""),
+            status=data.get("status", "running"),
+            history=history,
+            children=set(data.get("children", [])),
+            parent=data.get("parent"),
+            depth=int(data.get("depth", 0)),
+            result=data.get("result"),
+            quota=copy.deepcopy(data.get("quota", ResourceQuota())),
+            context_tokens=int(data.get("context_tokens", 0)),
+            context_limit=int(data.get("context_limit", 128000)),
+            tokens_consumed=int(data.get("tokens_consumed", 0)),
+            workspace=workspace,
+            artifacts=copy.deepcopy(data.get("artifacts", [])),
+        )
+        agent._queue_inbox = self._make_queue(data.get("queue_inbox", []))
+        agent._steer_inbox = self._make_queue(data.get("steer_inbox", []))
+        agent._immediate_inbox = self._make_queue(data.get("immediate_inbox", []))
+        agent._turns = int(data.get("turns", 0))
+        agent._last_active = float(data.get("last_active", time.time()))
+        agent._rebirth_pending = copy.deepcopy(data.get("rebirth_pending"))
+        agent._notified_thresholds = set(data.get("notified_thresholds", []))
+        agent._tool_calls = int(data.get("tool_calls", 0))
+        agent._no_tool_turns = int(data.get("no_tool_turns", 0))
+        agent._last_tool_policy = copy.deepcopy(data.get("last_tool_policy"))
+        shell_activity = data.get("shell_activity") or {}
+        agent._shell_activity = ShellActivityState(
+            web_calls=int(shell_activity.get("web_calls", 0)),
+            web_low_signal_calls=int(shell_activity.get("web_low_signal_calls", 0)),
+            blocked_web_calls=int(shell_activity.get("blocked_web_calls", 0)),
+            consecutive_web_low_signal=int(shell_activity.get("consecutive_web_low_signal", 0)),
+            repeated_web_queries=int(shell_activity.get("repeated_web_queries", 0)),
+            repeated_web_domains=int(shell_activity.get("repeated_web_domains", 0)),
+            unique_web_signatures=set(shell_activity.get("unique_web_signatures", [])),
+            unique_web_domains=set(shell_activity.get("unique_web_domains", [])),
+            last_web_signature=str(shell_activity.get("last_web_signature", "")),
+            last_web_domain=str(shell_activity.get("last_web_domain", "")),
+            web_domain_sprawl=float(shell_activity.get("web_domain_sprawl", 0.0)),
+            web_saturation=float(shell_activity.get("web_saturation", 0.0)),
+            finalize_after_web_saturation=bool(shell_activity.get("finalize_after_web_saturation", False)),
+        )
+        return agent
+
+    def _write_probe(
+        self,
+        agent: Agent,
+        turn_tools: dict[str, dict[str, Any]],
+        tool_policy: ToolPolicyState,
+    ) -> Path:
+        if not self.config.probe_dir:
+            raise RuntimeError("probe_dir is required when probe_every_llm is enabled")
+        self._probe_counter += 1
+        probe_dir = self.config.probe_dir / f"{self._probe_counter:05d}_{agent.id}_turn{agent._turns}"
+        snapshot_dir = probe_dir / "workspace_snapshot"
+        if snapshot_dir.exists():
+            shutil.rmtree(snapshot_dir)
+        probe_dir.mkdir(parents=True, exist_ok=True)
+        if self.config.workspace_root.exists():
+            ignore = shutil.ignore_patterns(".probes", "probes")
+            shutil.copytree(self.config.workspace_root, snapshot_dir, ignore=ignore)
+
+        state = {
+            "schema_version": 1,
+            "created_at": time.time(),
+            "active_agent": agent.id,
+            "workspace_root": str(self.config.workspace_root),
+            "probe_counter": self._probe_counter,
+            "id_counter": self._id_gen._counter,
+            "ledger": copy.deepcopy(self.ledger),
+            "messages_sent": copy.deepcopy(self._messages_sent),
+            "events": copy.deepcopy(self._events),
+            "agents": {
+                agent_id: self._agent_snapshot(agent_obj)
+                for agent_id, agent_obj in self.agents.items()
+            },
+            "turn_tools": list(turn_tools),
+            "tool_policy": tool_policy.as_event(),
+        }
+        import pickle
+        probe_path = probe_dir / "state.pkl"
+        with probe_path.open("wb") as f:
+            pickle.dump(state, f)
+
+        (probe_dir / "meta.json").write_text(json.dumps({
+            "schema_version": 1,
+            "active_agent": agent.id,
+            "probe_counter": self._probe_counter,
+            "agent_turn": agent._turns,
+            "turn_tools": list(turn_tools),
+            "tool_policy": tool_policy.as_event(),
+            "workspace_snapshot": str(snapshot_dir),
+        }, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+        return probe_path
+
+    def restore_probe(self, probe_path: Path) -> str:
+        import pickle
+        with probe_path.open("rb") as f:
+            state = pickle.load(f)
+        snapshot_dir = probe_path.parent / "workspace_snapshot"
+        if snapshot_dir.exists():
+            if self.config.workspace_root.exists():
+                shutil.rmtree(self.config.workspace_root)
+            shutil.copytree(snapshot_dir, self.config.workspace_root)
+            self._tool_context.workspace_root = self.config.workspace_root
+            self._tool_context.shared_dir = self.config.workspace_root / self.config.shared_dir
+
+        self.ledger = copy.deepcopy(state["ledger"])
+        self._messages_sent = copy.deepcopy(state.get("messages_sent", []))
+        self._events = copy.deepcopy(state.get("events", []))
+        self._id_gen._counter = int(state.get("id_counter", 0))
+        self._probe_counter = int(state.get("probe_counter", 0))
+        old_workspace_root = state.get("workspace_root")
+        if old_workspace_root is None and state.get("agents"):
+            first_agent = next(iter(state["agents"].values()))
+            old_workspace_root = str(Path(first_agent.get("workspace", "")).parent)
+        old_workspace_root_path = Path(old_workspace_root) if old_workspace_root else None
+        self.agents = {
+            agent_id: self._restore_agent(agent_data, old_workspace_root_path)
+            for agent_id, agent_data in state.get("agents", {}).items()
+        }
+        for agent in self.agents.values():
+            agent._task = None
+        return str(state["active_agent"])
+
+    async def continue_from_probe(self, probe_path: Path, agent_id: str | None = None) -> str:
+        active = agent_id or self.restore_probe(probe_path)
+        agent = self.agents[active]
+        if self.config.max_turns > 0:
+            agent.quota.max_turns = self.config.max_turns
+        if self.config.time_limit > 0:
+            agent.quota.time_limit = self.config.time_limit
+        if self.config.probe_resume_instruction:
+            agent.history.append({
+                "role": "user",
+                "content": (
+                    "[Probe branch instruction]\n"
+                    f"{self.config.probe_resume_instruction}"
+                ),
+            })
+        agent.status = "running"
+        self.start_agent(agent)
+        await agent._task
+        running = [
+            a for a in self.agents.values()
+            if a.status in ("running", "idle") and a.id != agent.id
+        ]
+        if running:
+            await self.shutdown()
+        return agent.result or ""

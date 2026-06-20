@@ -150,9 +150,99 @@ class TestShell:
         assert str(ws) in r["stdout"]
 
     @pytest.mark.asyncio
+    async def test_blocked_shell_pattern(self, ws):
+        ctx = ToolContext(
+            shared_dir=ws / "shared",
+            workspace_root=ws,
+            blocked_shell_patterns=[r"gaia-benchmark/GAIA"],
+        )
+        r = await tool_shell({"command": "curl https://huggingface.co/datasets/gaia-benchmark/GAIA"}, ws, ctx)
+        assert r["blocked"] is True
+        assert r["exit_code"] == -1
+        assert "gaia-benchmark/GAIA" in r["pattern"]
+
+    @pytest.mark.asyncio
+    async def test_gaia_prior_runs_pattern_blocks_old_logs(self, ws):
+        from benchmarks.gaia.run_nanoma_gaia_l2 import ANSWER_SOURCE_BLOCK_PATTERNS
+
+        ctx = ToolContext(
+            shared_dir=ws / "shared",
+            workspace_root=ws,
+            blocked_shell_patterns=ANSWER_SOURCE_BLOCK_PATTERNS,
+        )
+        r = await tool_shell(
+            {
+                "command": (
+                    "grep -r \"incorrect as to their claims\" "
+                    "/data/workspace/NanoMA/benchmarks/gaia/runs/ 2>/dev/null"
+                )
+            },
+            ws,
+            ctx,
+        )
+        assert r["blocked"] is True
+        assert r["exit_code"] == -1
+        assert "gaia/runs" in r["pattern"]
+
+    @pytest.mark.asyncio
+    async def test_gaia_block_rules_allow_staged_attachment(self, ws):
+        from benchmarks.gaia.run_nanoma_gaia_l2 import ANSWER_SOURCE_BLOCK_PATTERNS
+
+        shared = ws / "shared"
+        attachment = shared / "attachments" / "task.txt"
+        attachment.parent.mkdir(parents=True)
+        attachment.write_text("visible", encoding="utf-8")
+        ctx = ToolContext(
+            shared_dir=shared,
+            workspace_root=ws,
+            blocked_shell_patterns=ANSWER_SOURCE_BLOCK_PATTERNS,
+        )
+        r = await tool_shell({"command": "cat $SHARED/attachments/task.txt"}, ws, ctx)
+        assert r["exit_code"] == 0
+        assert "visible" in r["stdout"]
+
+    @pytest.mark.asyncio
     async def test_cwd_is_workspace(self, ws, ctx):
         r = await tool_shell({"command": "pwd"}, ws, ctx)
         assert str(ws) in r["stdout"]
+
+    @pytest.mark.asyncio
+    async def test_shell_capability_constraint_blocks_subcommand(self, ws):
+        ctx = ToolContext(
+            shared_dir=ws / "shared",
+            workspace_root=ws,
+            allowed_shell_capabilities={"fs", "python", "web"},
+        )
+        r = await tool_shell({"command": "pip install requests"}, ws, ctx)
+        assert r["blocked"] is True
+        assert r["blocked_capability"] == "package"
+        assert "package" not in r["allowed_shell_capabilities"]
+
+    @pytest.mark.asyncio
+    async def test_shell_capability_constraint_allows_matching_subcommand(self, ws):
+        ctx = ToolContext(
+            shared_dir=ws / "shared",
+            workspace_root=ws,
+            allowed_shell_capabilities={"fs"},
+        )
+        r = await tool_shell({"command": "echo ok"}, ws, ctx)
+        assert r["exit_code"] == 0
+        assert "ok" in r["stdout"]
+
+    @pytest.mark.asyncio
+    async def test_python_network_command_classifies_as_web(self, ws):
+        ctx = ToolContext(
+            shared_dir=ws / "shared",
+            workspace_root=ws,
+            allowed_shell_capabilities={"python", "fs"},
+        )
+        r = await tool_shell(
+            {"command": "python3 -c \"import socket, ssl; print('net')\""},
+            ws,
+            ctx,
+        )
+        assert r["blocked"] is True
+        assert r["blocked_capability"] == "web"
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
