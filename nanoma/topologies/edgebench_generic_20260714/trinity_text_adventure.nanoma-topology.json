@@ -1,0 +1,169 @@
+{
+  "schema_version": 2,
+  "source": "edgebench_multiagent_topology_simulator.html",
+  "task": {
+    "id": "trinity_text_adventure",
+    "title": "Trinity Text Adventure",
+    "category": "Interactive Games & Simulators",
+    "plan": "P4",
+    "objective": "Explorer 只交付状态图和动作序列，Root 统一保存，Replay Verifier 从初始状态执行。",
+    "streams": [
+      "校园/城市区域路线",
+      "物品与时间旅行依赖",
+      "关键谜题的替代动作序列",
+      "状态合并和初始存档重放"
+    ],
+    "gates": [
+      "子 Agent 禁止直接 submit",
+      "每个状态含前置和 next_state",
+      "最终路线可从初始状态重放"
+    ],
+    "risk_flags": [
+      "A",
+      "V",
+      "M"
+    ],
+    "edgebench_cwd": "/home/jericho_agent",
+    "submit_paths": []
+  },
+  "runtime": {
+    "budget_minutes": 120,
+    "root_role": "Root / Controller",
+    "root_source_writes": 0,
+    "max_live_agents": 6,
+    "max_concurrent_llm": 6,
+    "task_repo": "",
+    "source_isolation": "shared-tree-serial",
+    "merge_policy": "runtime-judge-gated",
+    "build_gate": "official-sforge-submit",
+    "best_green_gate": "judge-valid && score>=best",
+    "snapshot_enabled": false,
+    "snapshot_paths": [],
+    "services": {
+      "verification_gate": {
+        "owner": "runtime",
+        "argv": [
+          "sforge-submit"
+        ],
+        "shell": false,
+        "timeout_seconds": 900,
+        "acceptance": "judge-valid-nondecreasing",
+        "score_direction": "maximize",
+        "always_run": true
+      }
+    },
+    "completion_checkpoint": "spawn-replay",
+    "nodes": [
+      {
+        "id": "explorer-a",
+        "role": "Explorer A",
+        "assignment": "校园/城市区域路线",
+        "guide": "只拥有当前工作流，在隔离环境中交付可验证结果。",
+        "spawn_parent": "root",
+        "depends_on": [],
+        "start_minute": 6,
+        "end_minute": 78,
+        "mode": "progress",
+        "progress_logic": "all",
+        "min_parent_turns": 2,
+        "min_parent_tool_calls": 3,
+        "min_parent_age_seconds": 90,
+        "read_only": false,
+        "allowed_paths": [
+          "*"
+        ],
+        "spawn_executor": "parent_agent",
+        "spawn_tool": "nanoma"
+      },
+      {
+        "id": "explorer-b",
+        "role": "Explorer B",
+        "assignment": "物品与时间旅行依赖",
+        "guide": "只拥有当前工作流，在隔离环境中交付可验证结果。",
+        "spawn_parent": "root",
+        "depends_on": [],
+        "start_minute": 6,
+        "end_minute": 82,
+        "mode": "progress",
+        "progress_logic": "all",
+        "min_parent_turns": 2,
+        "min_parent_tool_calls": 3,
+        "min_parent_age_seconds": 90,
+        "read_only": false,
+        "allowed_paths": [
+          "*"
+        ],
+        "spawn_executor": "parent_agent",
+        "spawn_tool": "nanoma"
+      },
+      {
+        "id": "explorer-c",
+        "role": "Explorer C",
+        "assignment": "关键谜题的替代动作序列",
+        "guide": "只拥有当前工作流，在隔离环境中交付可验证结果。",
+        "spawn_parent": "root",
+        "depends_on": [],
+        "start_minute": 6,
+        "end_minute": 72,
+        "mode": "progress",
+        "progress_logic": "all",
+        "min_parent_turns": 2,
+        "min_parent_tool_calls": 3,
+        "min_parent_age_seconds": 90,
+        "read_only": false,
+        "allowed_paths": [
+          "*"
+        ],
+        "spawn_executor": "parent_agent",
+        "spawn_tool": "nanoma"
+      },
+      {
+        "id": "cartographer",
+        "role": "Cartographer",
+        "assignment": "状态合并和初始存档重放",
+        "guide": "只拥有当前工作流，在隔离环境中交付可验证结果。",
+        "spawn_parent": "explorer-a",
+        "depends_on": [
+          "spawn-explorer-a",
+          "spawn-explorer-b",
+          "spawn-explorer-c"
+        ],
+        "start_minute": 12,
+        "end_minute": 100,
+        "mode": "settled",
+        "progress_logic": "all",
+        "min_parent_turns": 4,
+        "min_parent_tool_calls": 5,
+        "min_parent_age_seconds": 180,
+        "read_only": false,
+        "allowed_paths": [
+          "*"
+        ],
+        "spawn_executor": "parent_agent",
+        "spawn_tool": "nanoma"
+      },
+      {
+        "id": "replay",
+        "role": "Replay Verifier",
+        "assignment": "子 Agent 禁止直接 submit；每个状态含前置和 next_state；最终路线可从初始状态重放",
+        "guide": "独立检查构建、功能、必需产物和 best-green 回归。",
+        "spawn_parent": "root",
+        "depends_on": [],
+        "start_minute": 78,
+        "end_minute": 118,
+        "mode": "settled",
+        "progress_logic": "all",
+        "min_parent_turns": 2,
+        "min_parent_tool_calls": 3,
+        "min_parent_age_seconds": 90,
+        "read_only": true,
+        "allowed_paths": [],
+        "spawn_executor": "parent_agent",
+        "spawn_tool": "nanoma"
+      }
+    ],
+    "checkpoint_action": "steer_parent_spawn_tool",
+    "spawn_execution": "parent_agent_via_nanoma_tool",
+    "runtime_creates_agents": false
+  }
+}

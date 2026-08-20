@@ -18,6 +18,8 @@ class Scheduler:
     _waiting: int = field(default=0, init=False)
 
     def __post_init__(self):
+        if self.max_concurrent <= 0:
+            self.max_concurrent = 1_000_000
         self._semaphore = asyncio.Semaphore(self.max_concurrent)
 
     async def acquire(self):

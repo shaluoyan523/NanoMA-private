@@ -17,6 +17,8 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any, TYPE_CHECKING
 
+from nanoma.plugins.workspace_tools.path_utils import resolve_workspace_path
+
 
 async def tool_create_file(args: dict[str, Any], workspace: Path, ctx: "ToolContext") -> dict[str, Any]:
     """Create a new file. Auto-creates parent directories.
@@ -35,13 +37,8 @@ async def tool_create_file(args: dict[str, Any], workspace: Path, ctx: "ToolCont
     if content is None:
         return {"error": "content is required"}
 
-    path = Path(file_path)
-    if not path.is_absolute():
-        path = workspace / path
-
-    # Sandbox check
     try:
-        path.resolve().relative_to(ctx.workspace_root.resolve())
+        path = resolve_workspace_path(file_path, workspace, ctx)
     except ValueError:
         return {"error": "Access denied: path is outside workspace root"}
 
@@ -70,12 +67,8 @@ async def tool_append_file(args: dict[str, Any], workspace: Path, ctx: "ToolCont
     if content is None:
         return {"error": "content is required"}
 
-    path = Path(file_path)
-    if not path.is_absolute():
-        path = workspace / path
-
     try:
-        path.resolve().relative_to(ctx.workspace_root.resolve())
+        path = resolve_workspace_path(file_path, workspace, ctx)
     except ValueError:
         return {"error": "Access denied: path is outside workspace root"}
 
@@ -102,12 +95,8 @@ async def tool_read_file_advanced(args: dict[str, Any], workspace: Path, ctx: "T
     if not file_path or not file_path.strip():
         return {"error": "path is required"}
 
-    path = Path(file_path)
-    if not path.is_absolute():
-        path = workspace / path
-
     try:
-        path.resolve().relative_to(ctx.workspace_root.resolve())
+        path = resolve_workspace_path(file_path, workspace, ctx)
     except ValueError:
         return {"error": "Access denied: path is outside workspace root"}
 

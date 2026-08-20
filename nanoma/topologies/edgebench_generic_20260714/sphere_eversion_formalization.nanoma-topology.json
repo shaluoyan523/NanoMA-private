@@ -1,0 +1,237 @@
+{
+  "schema_version": 2,
+  "source": "edgebench_multiagent_topology_simulator.html",
+  "task": {
+    "id": "sphere_eversion_formalization",
+    "title": "Sphere Eversion Formalization",
+    "category": "Formal Math & Theorem Proving",
+    "plan": "P3",
+    "objective": "按文件簇隔离证明，并把每次 repaired 增长保存为绿色 commit，避免后续证明覆盖。",
+    "streams": [
+      "依赖图与几何基础 bridge",
+      "Immersion/regular homotopy 文件簇",
+      "Eversion 核心声明簇",
+      "Repaired count、build 与 new-bad 验证"
+    ],
+    "gates": [
+      "每个 batch 全局 build 通过",
+      "repaired count 不得从 32 回退",
+      "上下文达 65% 时生成最小交接包"
+    ],
+    "risk_flags": [
+      "A",
+      "V",
+      "C",
+      "M"
+    ],
+    "edgebench_cwd": "/home/workspace/",
+    "submit_paths": [
+      "se-bmk-intern/sphere-eversion"
+    ]
+  },
+  "runtime": {
+    "budget_minutes": 120,
+    "root_role": "Green Branch Owner",
+    "root_source_writes": 0,
+    "max_live_agents": 9,
+    "max_concurrent_llm": 8,
+    "task_repo": "",
+    "source_isolation": "shared-tree-serial",
+    "merge_policy": "runtime-judge-gated",
+    "build_gate": "official-sforge-submit",
+    "best_green_gate": "judge-valid && score>=best",
+    "snapshot_enabled": true,
+    "snapshot_paths": [
+      "se-bmk-intern/sphere-eversion"
+    ],
+    "services": {
+      "verification_gate": {
+        "owner": "runtime",
+        "argv": [
+          "sforge-submit"
+        ],
+        "shell": false,
+        "timeout_seconds": 2580,
+        "acceptance": "judge-valid-nondecreasing",
+        "score_direction": "maximize",
+        "always_run": true
+      }
+    },
+    "completion_checkpoint": "spawn-verifier",
+    "nodes": [
+      {
+        "id": "mapper",
+        "role": "Dependency Mapper",
+        "assignment": "扫描并拆解：依赖图与几何基础 bridge / Immersion/regular homotopy 文件簇 / Eversion 核心声明簇 / Repaired count、build 与 new-bad 验证",
+        "guide": "只读扫描任务、测试和依赖，尽早形成可执行验收矩阵。",
+        "spawn_parent": "root",
+        "depends_on": [],
+        "start_minute": 0,
+        "end_minute": 18,
+        "mode": "progress",
+        "progress_logic": "all",
+        "min_parent_turns": 0,
+        "min_parent_tool_calls": 0,
+        "min_parent_age_seconds": 0,
+        "read_only": true,
+        "allowed_paths": [],
+        "spawn_executor": "parent_agent",
+        "spawn_tool": "nanoma"
+      },
+      {
+        "id": "lead-a",
+        "role": "Domain Lead A",
+        "assignment": "依赖图与几何基础 bridge",
+        "guide": "只拥有当前工作流，在隔离环境中交付可验证结果。",
+        "spawn_parent": "root",
+        "depends_on": [],
+        "start_minute": 8,
+        "end_minute": 78,
+        "mode": "progress",
+        "progress_logic": "all",
+        "min_parent_turns": 2,
+        "min_parent_tool_calls": 3,
+        "min_parent_age_seconds": 90,
+        "read_only": false,
+        "allowed_paths": [
+          "*"
+        ],
+        "spawn_executor": "parent_agent",
+        "spawn_tool": "nanoma"
+      },
+      {
+        "id": "lead-b",
+        "role": "Domain Lead B",
+        "assignment": "Immersion/regular homotopy 文件簇",
+        "guide": "只拥有当前工作流，在隔离环境中交付可验证结果。",
+        "spawn_parent": "root",
+        "depends_on": [],
+        "start_minute": 8,
+        "end_minute": 84,
+        "mode": "progress",
+        "progress_logic": "all",
+        "min_parent_turns": 2,
+        "min_parent_tool_calls": 3,
+        "min_parent_age_seconds": 90,
+        "read_only": false,
+        "allowed_paths": [
+          "*"
+        ],
+        "spawn_executor": "parent_agent",
+        "spawn_tool": "nanoma"
+      },
+      {
+        "id": "lead-c",
+        "role": "Domain Lead C",
+        "assignment": "Eversion 核心声明簇",
+        "guide": "只拥有当前工作流，在隔离环境中交付可验证结果。",
+        "spawn_parent": "root",
+        "depends_on": [],
+        "start_minute": 8,
+        "end_minute": 70,
+        "mode": "progress",
+        "progress_logic": "all",
+        "min_parent_turns": 2,
+        "min_parent_tool_calls": 3,
+        "min_parent_age_seconds": 90,
+        "read_only": false,
+        "allowed_paths": [
+          "*"
+        ],
+        "spawn_executor": "parent_agent",
+        "spawn_tool": "nanoma"
+      },
+      {
+        "id": "verifier",
+        "role": "Build Verifier",
+        "assignment": "每个 batch 全局 build 通过；repaired count 不得从 32 回退；上下文达 65% 时生成最小交接包",
+        "guide": "独立检查构建、功能、必需产物和 best-green 回归。",
+        "spawn_parent": "root",
+        "depends_on": [],
+        "start_minute": 16,
+        "end_minute": 118,
+        "mode": "settled",
+        "progress_logic": "all",
+        "min_parent_turns": 2,
+        "min_parent_tool_calls": 3,
+        "min_parent_age_seconds": 90,
+        "read_only": true,
+        "allowed_paths": [],
+        "spawn_executor": "parent_agent",
+        "spawn_tool": "nanoma"
+      },
+      {
+        "id": "proof-a",
+        "role": "Proof Worker A1",
+        "assignment": "依赖图与几何基础 bridge",
+        "guide": "只拥有当前工作流，在隔离环境中交付可验证结果。",
+        "spawn_parent": "lead-a",
+        "depends_on": [
+          "spawn-lead-a"
+        ],
+        "start_minute": 22,
+        "end_minute": 62,
+        "mode": "progress",
+        "progress_logic": "all",
+        "min_parent_turns": 4,
+        "min_parent_tool_calls": 5,
+        "min_parent_age_seconds": 180,
+        "read_only": false,
+        "allowed_paths": [
+          "*"
+        ],
+        "spawn_executor": "parent_agent",
+        "spawn_tool": "nanoma"
+      },
+      {
+        "id": "proof-b",
+        "role": "Proof Worker B1",
+        "assignment": "Immersion/regular homotopy 文件簇",
+        "guide": "只拥有当前工作流，在隔离环境中交付可验证结果。",
+        "spawn_parent": "lead-b",
+        "depends_on": [
+          "spawn-lead-b"
+        ],
+        "start_minute": 22,
+        "end_minute": 68,
+        "mode": "progress",
+        "progress_logic": "all",
+        "min_parent_turns": 4,
+        "min_parent_tool_calls": 5,
+        "min_parent_age_seconds": 180,
+        "read_only": false,
+        "allowed_paths": [
+          "*"
+        ],
+        "spawn_executor": "parent_agent",
+        "spawn_tool": "nanoma"
+      },
+      {
+        "id": "proof-c",
+        "role": "Proof Worker C1",
+        "assignment": "Eversion 核心声明簇",
+        "guide": "只拥有当前工作流，在隔离环境中交付可验证结果。",
+        "spawn_parent": "lead-c",
+        "depends_on": [
+          "spawn-lead-c"
+        ],
+        "start_minute": 22,
+        "end_minute": 60,
+        "mode": "progress",
+        "progress_logic": "all",
+        "min_parent_turns": 4,
+        "min_parent_tool_calls": 5,
+        "min_parent_age_seconds": 180,
+        "read_only": false,
+        "allowed_paths": [
+          "*"
+        ],
+        "spawn_executor": "parent_agent",
+        "spawn_tool": "nanoma"
+      }
+    ],
+    "checkpoint_action": "steer_parent_spawn_tool",
+    "spawn_execution": "parent_agent_via_nanoma_tool",
+    "runtime_creates_agents": false
+  }
+}

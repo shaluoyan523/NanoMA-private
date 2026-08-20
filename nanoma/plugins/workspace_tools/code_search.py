@@ -8,9 +8,15 @@ Implements the following tools:
 
 from __future__ import annotations
 
+import asyncio
+import contextlib
+import os
 import re
+import signal
 from pathlib import Path
 from typing import Any, TYPE_CHECKING
+
+from nanoma.plugins.workspace_tools.path_utils import resolve_workspace_path
 
 if TYPE_CHECKING:
     from nanoma.core import ToolContext
@@ -237,19 +243,29 @@ async def tool_grep_search(args: dict[str, Any], workspace: Path, ctx: "ToolCont
     case_sensitive = args.get("case_sensitive", False)
     include_pattern = args.get("include_pattern")
     max_results = min(args.get("max_results", 100), ctx.grep_max_results or 200)
+    search_path = args.get("path") or args.get("root") or ""
 
     if not query:
         return {"error": "query is required"}
 
+    root = workspace
+    if search_path:
+        try:
+            root = resolve_workspace_path(str(search_path), workspace, ctx)
+        except ValueError:
+            return {"error": "Access denied: path is outside workspace root"}
+        if not root.exists():
+            return {"error": f"Path not found: {root}"}
+
     # Try subprocess grep for performance
     result = await _try_subprocess_grep(
-        query, workspace, is_regexp, case_sensitive, include_pattern, max_results
+        query, root, is_regexp, case_sensitive, include_pattern, max_results
     )
     if result is not None:
         return result
 
     # Fallback: pure Python implementation
-    return _python_grep(query, workspace, is_regexp, case_sensitive, include_pattern, max_results)
+    return _python_grep(query, root, is_regexp, case_sensitive, include_pattern, max_results)
 
 
 async def _try_subprocess_grep(
@@ -288,17 +304,29 @@ async def _try_subprocess_grep(
     else:
         return None  # No subprocess available, use Python fallback
 
+    proc: asyncio.subprocess.Process | None = None
+    communicate_task: asyncio.Task[tuple[bytes, bytes]] | None = None
     try:
         proc = await asyncio.create_subprocess_exec(
             *cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+            start_new_session=True,
         )
-        stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=30)
+        communicate_task = asyncio.create_task(proc.communicate())
+        stdout, stderr = await asyncio.wait_for(communicate_task, timeout=30)
         output = stdout.decode(errors="replace")
         # Exit code 2+ means error (invalid regex, permission denied, etc.)
         # Fall back to Python for proper error reporting
         if proc.returncode and proc.returncode >= 2:
             return None
-    except (asyncio.TimeoutError, OSError):
+    except asyncio.TimeoutError:
+        if communicate_task is not None:
+            communicate_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await communicate_task
+        await _terminate_subprocess_group(proc)
+        return None  # Fallback to Python on timeout
+    except OSError:
+        await _terminate_subprocess_group(proc)
         return None  # Fallback to Python on error
 
     # Parse output: "filepath:line:content"
@@ -327,6 +355,19 @@ async def _try_subprocess_grep(
         })
 
     return {"matches": results, "count": len(results), "truncated": len(results) >= max_results}
+
+
+async def _terminate_subprocess_group(proc: Any) -> None:
+    if proc is None or proc.returncode is not None:
+        return
+    with contextlib.suppress(ProcessLookupError):
+        os.killpg(proc.pid, signal.SIGTERM)
+    wait_task = asyncio.create_task(proc.wait())
+    done, _ = await asyncio.wait({wait_task}, timeout=2)
+    if not done:
+        with contextlib.suppress(ProcessLookupError):
+            os.killpg(proc.pid, signal.SIGKILL)
+        await wait_task
 
 
 def _python_grep(
@@ -412,12 +453,8 @@ async def tool_code_outline(args: dict[str, Any], workspace: Path, ctx: "ToolCon
     if not file_path or not file_path.strip():
         return {"error": "path is required"}
 
-    path = Path(file_path)
-    if not path.is_absolute():
-        path = workspace / path
-
     try:
-        path.resolve().relative_to(ctx.workspace_root.resolve())
+        path = resolve_workspace_path(file_path, workspace, ctx)
     except ValueError:
         return {"error": "Access denied: path is outside workspace root"}
 
@@ -447,12 +484,8 @@ async def tool_read_symbol(args: dict[str, Any], workspace: Path, ctx: "ToolCont
     if not file_path or not symbol_name:
         return {"error": "Both path and symbol_name are required"}
 
-    path = Path(file_path)
-    if not path.is_absolute():
-        path = workspace / path
-
     try:
-        path.resolve().relative_to(ctx.workspace_root.resolve())
+        path = resolve_workspace_path(file_path, workspace, ctx)
     except ValueError:
         return {"error": "Access denied: path is outside workspace root"}
 
@@ -482,4 +515,3 @@ async def tool_read_symbol(args: dict[str, Any], workspace: Path, ctx: "ToolCont
         "end_line": target["end_line"],
         "kind": target["kind"],
     }
-

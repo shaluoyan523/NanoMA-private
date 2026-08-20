@@ -1,0 +1,174 @@
+{
+  "schema_version": 2,
+  "source": "edgebench_multiagent_topology_simulator.html",
+  "task": {
+    "id": "openrct2_theme_park_ai",
+    "title": "OpenRCT2 Theme Park AI",
+    "category": "Interactive Games & Simulators",
+    "plan": "P4",
+    "objective": "按场景策略并行，所有动作先经合法性检查，再由 Replay Verifier 比较稳定收益。",
+    "streams": [
+      "园区布局与道路/设施",
+      "游乐设施建设与定价",
+      "财务、维护与游客满意度",
+      "Action legality 和场景回放"
+    ],
+    "gates": [
+      "非法动作在提交前被拦截",
+      "同一场景可重复运行",
+      "最终分不低于 26.025"
+    ],
+    "risk_flags": [
+      "A",
+      "V",
+      "C",
+      "M"
+    ],
+    "edgebench_cwd": "/home/workspace/openrct2",
+    "submit_paths": [
+      "my_plugin.js"
+    ]
+  },
+  "runtime": {
+    "budget_minutes": 120,
+    "root_role": "Root / Controller",
+    "root_source_writes": 0,
+    "max_live_agents": 6,
+    "max_concurrent_llm": 6,
+    "task_repo": "",
+    "source_isolation": "shared-tree-serial",
+    "merge_policy": "runtime-judge-gated",
+    "build_gate": "official-sforge-submit",
+    "best_green_gate": "judge-valid && score>=best",
+    "snapshot_enabled": true,
+    "snapshot_paths": [
+      "my_plugin.js"
+    ],
+    "services": {
+      "verification_gate": {
+        "owner": "runtime",
+        "argv": [
+          "sforge-submit"
+        ],
+        "shell": false,
+        "timeout_seconds": 2580,
+        "acceptance": "judge-valid-nondecreasing",
+        "score_direction": "maximize",
+        "always_run": true
+      }
+    },
+    "completion_checkpoint": "spawn-replay",
+    "nodes": [
+      {
+        "id": "explorer-a",
+        "role": "Explorer A",
+        "assignment": "园区布局与道路/设施",
+        "guide": "只拥有当前工作流，在隔离环境中交付可验证结果。",
+        "spawn_parent": "root",
+        "depends_on": [],
+        "start_minute": 6,
+        "end_minute": 78,
+        "mode": "progress",
+        "progress_logic": "all",
+        "min_parent_turns": 2,
+        "min_parent_tool_calls": 3,
+        "min_parent_age_seconds": 90,
+        "read_only": false,
+        "allowed_paths": [
+          "*"
+        ],
+        "spawn_executor": "parent_agent",
+        "spawn_tool": "nanoma"
+      },
+      {
+        "id": "explorer-b",
+        "role": "Explorer B",
+        "assignment": "游乐设施建设与定价",
+        "guide": "只拥有当前工作流，在隔离环境中交付可验证结果。",
+        "spawn_parent": "root",
+        "depends_on": [],
+        "start_minute": 6,
+        "end_minute": 82,
+        "mode": "progress",
+        "progress_logic": "all",
+        "min_parent_turns": 2,
+        "min_parent_tool_calls": 3,
+        "min_parent_age_seconds": 90,
+        "read_only": false,
+        "allowed_paths": [
+          "*"
+        ],
+        "spawn_executor": "parent_agent",
+        "spawn_tool": "nanoma"
+      },
+      {
+        "id": "explorer-c",
+        "role": "Explorer C",
+        "assignment": "财务、维护与游客满意度",
+        "guide": "只拥有当前工作流，在隔离环境中交付可验证结果。",
+        "spawn_parent": "root",
+        "depends_on": [],
+        "start_minute": 6,
+        "end_minute": 72,
+        "mode": "progress",
+        "progress_logic": "all",
+        "min_parent_turns": 2,
+        "min_parent_tool_calls": 3,
+        "min_parent_age_seconds": 90,
+        "read_only": false,
+        "allowed_paths": [
+          "*"
+        ],
+        "spawn_executor": "parent_agent",
+        "spawn_tool": "nanoma"
+      },
+      {
+        "id": "cartographer",
+        "role": "Cartographer",
+        "assignment": "Action legality 和场景回放",
+        "guide": "只拥有当前工作流，在隔离环境中交付可验证结果。",
+        "spawn_parent": "explorer-a",
+        "depends_on": [
+          "spawn-explorer-a",
+          "spawn-explorer-b",
+          "spawn-explorer-c"
+        ],
+        "start_minute": 12,
+        "end_minute": 100,
+        "mode": "settled",
+        "progress_logic": "all",
+        "min_parent_turns": 4,
+        "min_parent_tool_calls": 5,
+        "min_parent_age_seconds": 180,
+        "read_only": false,
+        "allowed_paths": [
+          "*"
+        ],
+        "spawn_executor": "parent_agent",
+        "spawn_tool": "nanoma"
+      },
+      {
+        "id": "replay",
+        "role": "Replay Verifier",
+        "assignment": "非法动作在提交前被拦截；同一场景可重复运行；最终分不低于 26.025",
+        "guide": "独立检查构建、功能、必需产物和 best-green 回归。",
+        "spawn_parent": "root",
+        "depends_on": [],
+        "start_minute": 78,
+        "end_minute": 118,
+        "mode": "settled",
+        "progress_logic": "all",
+        "min_parent_turns": 2,
+        "min_parent_tool_calls": 3,
+        "min_parent_age_seconds": 90,
+        "read_only": true,
+        "allowed_paths": [],
+        "spawn_executor": "parent_agent",
+        "spawn_tool": "nanoma"
+      }
+    ],
+    "checkpoint_action": "steer_parent_spawn_tool",
+    "spawn_execution": "parent_agent_via_nanoma_tool",
+    "runtime_creates_agents": false
+  }
+}

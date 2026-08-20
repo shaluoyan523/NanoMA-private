@@ -149,6 +149,8 @@ WORKSPACE_TOOLS: dict[str, dict[str, Any]] = {
                 "is_regexp": {"type": "boolean", "description": "Whether query is a regex", "default": False},
                 "case_sensitive": {"type": "boolean", "description": "Case-sensitive search", "default": False},
                 "include_pattern": {"type": "string", "description": "Glob to filter files (e.g. '*.py')"},
+                "path": {"type": "string", "description": "Optional directory or file path to search. Supports $SHARED/..."},
+                "root": {"type": "string", "description": "Alias for path. Optional directory or file path to search."},
                 "max_results": {"type": "integer", "description": "Max results (default: 100)", "default": 100},
             }, "required": ["query"]},
         }},

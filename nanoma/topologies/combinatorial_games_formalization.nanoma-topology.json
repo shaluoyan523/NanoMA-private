@@ -1,0 +1,214 @@
+{
+  "schema_version": 1,
+  "source": "edgebench_multiagent_topology_simulator.html",
+  "task": {
+    "id": "combinatorial_games_formalization",
+    "title": "Combinatorial Games Formalization",
+    "category": "Formal Math & Theorem Proving",
+    "plan": "P3",
+    "objective": "保留多级证明拆分，Runtime 强制 Lead/Worker 的文件所有权，Root 只保留构建通过的绿色 proof batch。",
+    "streams": [
+      "Dyadic 转换、Player 与 Functor 短证明",
+      "IGame/LGame 序、等价与 Domineering",
+      "Surreal Pow/Ordinal/Real 数值桥接",
+      "主分支构建、得分与声明回归"
+    ],
+    "gates": [
+      "Runtime 强制文件/声明所有权",
+      "子节点禁止 sforge-submit",
+      "任何红色 batch 不进入主分支"
+    ],
+    "risk_flags": [
+      "A",
+      "V",
+      "C",
+      "M"
+    ]
+  },
+  "runtime": {
+    "budget_minutes": 120,
+    "root_role": "Green Branch Owner",
+    "max_live_agents": 9,
+    "max_concurrent_llm": 8,
+    "task_repo": "/home/workspace/se-bmk-intern/combinatorial-games",
+    "completion_checkpoint": "spawn-verifier",
+    "nodes": [
+      {
+        "id": "mapper",
+        "role": "Dependency Mapper",
+        "assignment": "只读扫描全部 sorry、声明依赖和当前 build 失败；10 分钟内向 Root 发送按文件/声明划分的验收矩阵，然后 set_status(done)，不要修改源码。",
+        "guide": "只读扫描任务、测试和依赖，尽早形成可执行验收矩阵。",
+        "spawn_parent": "root",
+        "depends_on": [],
+        "start_minute": 0,
+        "end_minute": 18,
+        "mode": "progress",
+        "progress_logic": "all",
+        "min_parent_turns": 0,
+        "min_parent_tool_calls": 0,
+        "read_only": true,
+        "allowed_paths": [],
+        "spawn_executor": "parent_agent",
+        "spawn_tool": "nanoma"
+      },
+      {
+        "id": "lead-a",
+        "role": "Domain Lead A",
+        "assignment": "只处理 Player.lean 与 Functor.lean：选择短证明，逐批 focused build，并向 Root 汇报已通过声明和剩余错误。不要修改 Dyadic.lean。",
+        "guide": "只拥有当前工作流，在隔离环境中交付可验证结果。",
+        "spawn_parent": "root",
+        "depends_on": [],
+        "start_minute": 8,
+        "end_minute": 78,
+        "mode": "progress",
+        "progress_logic": "all",
+        "min_parent_turns": 2,
+        "min_parent_tool_calls": 3,
+        "min_parent_age_seconds": 90,
+        "read_only": false,
+        "allowed_paths": [
+          "CombinatorialGames/Game/Player.lean",
+          "CombinatorialGames/Game/Functor.lean"
+        ],
+        "spawn_executor": "parent_agent",
+        "spawn_tool": "nanoma"
+      },
+      {
+        "id": "lead-b",
+        "role": "Domain Lead B",
+        "assignment": "只处理 Game/Classes.lean 与 Game/Order.lean 的类、序和等价证明；逐批 focused build，并向 Root 汇报。不要修改 IGame.lean 或 Domineering.lean。",
+        "guide": "只拥有当前工作流，在隔离环境中交付可验证结果。",
+        "spawn_parent": "root",
+        "depends_on": [],
+        "start_minute": 8,
+        "end_minute": 84,
+        "mode": "progress",
+        "progress_logic": "all",
+        "min_parent_turns": 2,
+        "min_parent_tool_calls": 3,
+        "min_parent_age_seconds": 90,
+        "read_only": false,
+        "allowed_paths": [
+          "CombinatorialGames/Game/Classes.lean",
+          "CombinatorialGames/Game/Order.lean"
+        ],
+        "spawn_executor": "parent_agent",
+        "spawn_tool": "nanoma"
+      },
+      {
+        "id": "lead-c",
+        "role": "Domain Lead C",
+        "assignment": "只处理 Surreal/Pow.lean 与 Surreal/Ordinal.lean 的幂和序数桥接；逐批 focused build，并向 Root 汇报。不要修改 Real.lean。",
+        "guide": "只拥有当前工作流，在隔离环境中交付可验证结果。",
+        "spawn_parent": "root",
+        "depends_on": [],
+        "start_minute": 8,
+        "end_minute": 70,
+        "mode": "progress",
+        "progress_logic": "all",
+        "min_parent_turns": 2,
+        "min_parent_tool_calls": 3,
+        "min_parent_age_seconds": 90,
+        "read_only": false,
+        "allowed_paths": [
+          "CombinatorialGames/Surreal/Pow.lean",
+          "CombinatorialGames/Surreal/Ordinal.lean"
+        ],
+        "spawn_executor": "parent_agent",
+        "spawn_tool": "nanoma"
+      },
+      {
+        "id": "verifier",
+        "role": "Build Verifier",
+        "assignment": "保持只读；运行全量 lake build、必需声明和 sorry 数回归，向 Root 报告当前绿色状态、失败文件与最后可提交建议。",
+        "guide": "独立检查构建、功能、必需产物和 best-green 回归。",
+        "spawn_parent": "root",
+        "depends_on": [],
+        "start_minute": 16,
+        "end_minute": 118,
+        "mode": "settled",
+        "progress_logic": "all",
+        "min_parent_turns": 2,
+        "min_parent_tool_calls": 3,
+        "min_parent_age_seconds": 90,
+        "read_only": true,
+        "allowed_paths": [],
+        "spawn_executor": "parent_agent",
+        "spawn_tool": "nanoma"
+      },
+      {
+        "id": "proof-a",
+        "role": "Proof Worker A1",
+        "assignment": "只处理 Mathlib/Dyadic.lean 的转换、cast、order 与 simp 证明；每个小批次编译后向 Lead A 交接。不要修改 Player.lean 或 Functor.lean。",
+        "guide": "只拥有当前工作流，在隔离环境中交付可验证结果。",
+        "spawn_parent": "lead-a",
+        "depends_on": [
+          "spawn-lead-a"
+        ],
+        "start_minute": 22,
+        "end_minute": 62,
+        "mode": "progress",
+        "progress_logic": "all",
+        "min_parent_turns": 4,
+        "min_parent_tool_calls": 5,
+        "min_parent_age_seconds": 180,
+        "read_only": false,
+        "allowed_paths": [
+          "CombinatorialGames/Mathlib/Dyadic.lean"
+        ],
+        "spawn_executor": "parent_agent",
+        "spawn_tool": "nanoma"
+      },
+      {
+        "id": "proof-b",
+        "role": "Proof Worker B1",
+        "assignment": "只处理 Game/IGame.lean 与 Game/Specific/Domineering.lean；保持实例依赖可编译，每个小批次验证后向 Lead B 交接。",
+        "guide": "只拥有当前工作流，在隔离环境中交付可验证结果。",
+        "spawn_parent": "lead-b",
+        "depends_on": [
+          "spawn-lead-b"
+        ],
+        "start_minute": 22,
+        "end_minute": 68,
+        "mode": "progress",
+        "progress_logic": "all",
+        "min_parent_turns": 4,
+        "min_parent_tool_calls": 5,
+        "min_parent_age_seconds": 180,
+        "read_only": false,
+        "allowed_paths": [
+          "CombinatorialGames/Game/IGame.lean",
+          "CombinatorialGames/Game/Specific/Domineering.lean"
+        ],
+        "spawn_executor": "parent_agent",
+        "spawn_tool": "nanoma"
+      },
+      {
+        "id": "proof-c",
+        "role": "Proof Worker C1",
+        "assignment": "只处理 Surreal/Real.lean 的实数桥接证明；每个小批次验证后向 Lead C 交接。不要修改 Pow.lean 或 Ordinal.lean。",
+        "guide": "只拥有当前工作流，在隔离环境中交付可验证结果。",
+        "spawn_parent": "lead-c",
+        "depends_on": [
+          "spawn-lead-c"
+        ],
+        "start_minute": 22,
+        "end_minute": 60,
+        "mode": "progress",
+        "progress_logic": "all",
+        "min_parent_turns": 4,
+        "min_parent_tool_calls": 5,
+        "min_parent_age_seconds": 180,
+        "read_only": false,
+        "allowed_paths": [
+          "CombinatorialGames/Surreal/Real.lean"
+        ],
+        "spawn_executor": "parent_agent",
+        "spawn_tool": "nanoma"
+      }
+    ],
+    "checkpoint_action": "steer_parent_spawn_tool",
+    "spawn_execution": "parent_agent_via_nanoma_tool",
+    "runtime_creates_agents": false
+  }
+}

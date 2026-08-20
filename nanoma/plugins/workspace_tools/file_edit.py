@@ -14,6 +14,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, TYPE_CHECKING
 
+from nanoma.plugins.workspace_tools.path_utils import resolve_workspace_path
+
 if TYPE_CHECKING:
     from nanoma.core import ToolContext
 
@@ -380,12 +382,8 @@ async def tool_replace_string(args: dict[str, Any], workspace: Path, ctx: "ToolC
     if new_string is None:
         return {"error": "new_string is required"}
 
-    path = Path(file_path)
-    if not path.is_absolute():
-        path = workspace / path
-
     try:
-        path.resolve().relative_to(ctx.workspace_root.resolve())
+        path = resolve_workspace_path(file_path, workspace, ctx)
     except ValueError:
         return {"error": "Access denied: path is outside workspace root"}
 
@@ -417,12 +415,8 @@ async def tool_multi_replace_string(args: dict[str, Any], workspace: Path, ctx: 
     if not replacements:
         return {"error": "replacements array must not be empty"}
 
-    path = Path(file_path)
-    if not path.is_absolute():
-        path = workspace / path
-
     try:
-        path.resolve().relative_to(ctx.workspace_root.resolve())
+        path = resolve_workspace_path(file_path, workspace, ctx)
     except ValueError:
         return {"error": "Access denied: path is outside workspace root"}
 
@@ -478,13 +472,8 @@ async def tool_apply_patch(args: dict[str, Any], workspace: Path, ctx: "ToolCont
 
     for op in operations:
         # Resolve path relative to workspace
-        abs_path = Path(op.file_path)
-        if not abs_path.is_absolute():
-            abs_path = workspace / op.file_path
-
-        # Sandbox check: ensure all patch paths are within workspace
         try:
-            abs_path.resolve().relative_to(ctx.workspace_root.resolve())
+            abs_path = resolve_workspace_path(op.file_path, workspace, ctx)
         except ValueError:
             return {"error": f"Access denied: patch path '{op.file_path}' is outside workspace root"}
 

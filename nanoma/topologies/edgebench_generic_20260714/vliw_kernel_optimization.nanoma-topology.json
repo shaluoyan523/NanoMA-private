@@ -1,0 +1,169 @@
+{
+  "schema_version": 2,
+  "source": "edgebench_multiagent_topology_simulator.html",
+  "task": {
+    "id": "vliw_kernel_optimization",
+    "title": "VLIW Kernel Optimization",
+    "category": "Systems & Software Engineering",
+    "plan": "P2",
+    "objective": "并行软件流水、展开和寄存器分配路线，Benchmarker 用 cycles 与正确性统一淘汰。",
+    "streams": [
+      "依赖感知指令调度",
+      "循环展开与软件流水",
+      "寄存器压力/访存优化",
+      "Kernel 正确性和 cycles benchmark"
+    ],
+    "gates": [
+      "输出结果完全正确",
+      "cycles 必须显著低于 12233",
+      "两次同分后更换调度家族"
+    ],
+    "risk_flags": [
+      "A",
+      "C",
+      "M"
+    ],
+    "edgebench_cwd": "/home/workspace/sebench_performance_takehome",
+    "submit_paths": [
+      "solution.py"
+    ]
+  },
+  "runtime": {
+    "budget_minutes": 120,
+    "root_role": "Tournament Manager",
+    "root_source_writes": 0,
+    "max_live_agents": 6,
+    "max_concurrent_llm": 6,
+    "task_repo": "",
+    "source_isolation": "shared-tree-serial",
+    "merge_policy": "runtime-judge-gated",
+    "build_gate": "official-sforge-submit",
+    "best_green_gate": "judge-valid && score>=best",
+    "snapshot_enabled": true,
+    "snapshot_paths": [
+      "solution.py"
+    ],
+    "services": {
+      "verification_gate": {
+        "owner": "runtime",
+        "argv": [
+          "sforge-submit"
+        ],
+        "shell": false,
+        "timeout_seconds": 900,
+        "acceptance": "judge-valid-nondecreasing",
+        "score_direction": "minimize",
+        "always_run": true
+      }
+    },
+    "completion_checkpoint": "spawn-validator",
+    "nodes": [
+      {
+        "id": "candidate-a",
+        "role": "Candidate A",
+        "assignment": "依赖感知指令调度",
+        "guide": "只拥有当前工作流，在隔离环境中交付可验证结果。",
+        "spawn_parent": "root",
+        "depends_on": [],
+        "start_minute": 7,
+        "end_minute": 72,
+        "mode": "progress",
+        "progress_logic": "all",
+        "min_parent_turns": 2,
+        "min_parent_tool_calls": 3,
+        "min_parent_age_seconds": 90,
+        "read_only": false,
+        "allowed_paths": [
+          "*"
+        ],
+        "spawn_executor": "parent_agent",
+        "spawn_tool": "nanoma"
+      },
+      {
+        "id": "candidate-b",
+        "role": "Candidate B",
+        "assignment": "循环展开与软件流水",
+        "guide": "只拥有当前工作流，在隔离环境中交付可验证结果。",
+        "spawn_parent": "root",
+        "depends_on": [],
+        "start_minute": 7,
+        "end_minute": 82,
+        "mode": "progress",
+        "progress_logic": "all",
+        "min_parent_turns": 2,
+        "min_parent_tool_calls": 3,
+        "min_parent_age_seconds": 90,
+        "read_only": false,
+        "allowed_paths": [
+          "*"
+        ],
+        "spawn_executor": "parent_agent",
+        "spawn_tool": "nanoma"
+      },
+      {
+        "id": "candidate-c",
+        "role": "Candidate C",
+        "assignment": "寄存器压力/访存优化",
+        "guide": "只拥有当前工作流，在隔离环境中交付可验证结果。",
+        "spawn_parent": "root",
+        "depends_on": [],
+        "start_minute": 7,
+        "end_minute": 47,
+        "mode": "progress",
+        "progress_logic": "all",
+        "min_parent_turns": 2,
+        "min_parent_tool_calls": 3,
+        "min_parent_age_seconds": 90,
+        "read_only": false,
+        "allowed_paths": [
+          "*"
+        ],
+        "spawn_executor": "parent_agent",
+        "spawn_tool": "nanoma"
+      },
+      {
+        "id": "benchmarker",
+        "role": "Benchmarker",
+        "assignment": "Kernel 正确性和 cycles benchmark",
+        "guide": "只拥有当前工作流，在隔离环境中交付可验证结果。",
+        "spawn_parent": "root",
+        "depends_on": [],
+        "start_minute": 18,
+        "end_minute": 102,
+        "mode": "progress",
+        "progress_logic": "all",
+        "min_parent_turns": 2,
+        "min_parent_tool_calls": 3,
+        "min_parent_age_seconds": 90,
+        "read_only": false,
+        "allowed_paths": [
+          "*"
+        ],
+        "spawn_executor": "parent_agent",
+        "spawn_tool": "nanoma"
+      },
+      {
+        "id": "validator",
+        "role": "Final Validator",
+        "assignment": "输出结果完全正确；cycles 必须显著低于 12233；两次同分后更换调度家族",
+        "guide": "独立检查构建、功能、必需产物和 best-green 回归。",
+        "spawn_parent": "root",
+        "depends_on": [],
+        "start_minute": 84,
+        "end_minute": 118,
+        "mode": "settled",
+        "progress_logic": "all",
+        "min_parent_turns": 2,
+        "min_parent_tool_calls": 3,
+        "min_parent_age_seconds": 90,
+        "read_only": true,
+        "allowed_paths": [],
+        "spawn_executor": "parent_agent",
+        "spawn_tool": "nanoma"
+      }
+    ],
+    "checkpoint_action": "steer_parent_spawn_tool",
+    "spawn_execution": "parent_agent_via_nanoma_tool",
+    "runtime_creates_agents": false
+  }
+}

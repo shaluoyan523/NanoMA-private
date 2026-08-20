@@ -1,0 +1,169 @@
+{
+  "schema_version": 2,
+  "source": "edgebench_multiagent_topology_simulator.html",
+  "task": {
+    "id": "wireless_electricity_layout",
+    "title": "Wireless Electricity Layout",
+    "category": "Combinatorial Optimization",
+    "plan": "P2",
+    "objective": "并行几何构造、连续优化和随机布局，按能量传输目标淘汰而非只看格式有效。",
+    "streams": [
+      "规则化几何初始布局",
+      "连续坐标/梯度式优化",
+      "随机重启与局部移动",
+      "格式、约束和能量目标 benchmark"
+    ],
+    "gates": [
+      "所有布局约束有效",
+      "目标值必须离开零分区间",
+      "第二次零分后更换布局家族"
+    ],
+    "risk_flags": [
+      "A",
+      "C",
+      "M"
+    ],
+    "edgebench_cwd": "/home/workspace/wirel",
+    "submit_paths": [
+      "solution.cpp"
+    ]
+  },
+  "runtime": {
+    "budget_minutes": 120,
+    "root_role": "Tournament Manager",
+    "root_source_writes": 0,
+    "max_live_agents": 6,
+    "max_concurrent_llm": 6,
+    "task_repo": "",
+    "source_isolation": "shared-tree-serial",
+    "merge_policy": "runtime-judge-gated",
+    "build_gate": "official-sforge-submit",
+    "best_green_gate": "judge-valid && score>=best",
+    "snapshot_enabled": true,
+    "snapshot_paths": [
+      "solution.cpp"
+    ],
+    "services": {
+      "verification_gate": {
+        "owner": "runtime",
+        "argv": [
+          "sforge-submit"
+        ],
+        "shell": false,
+        "timeout_seconds": 900,
+        "acceptance": "judge-valid-nondecreasing",
+        "score_direction": "minimize",
+        "always_run": true
+      }
+    },
+    "completion_checkpoint": "spawn-validator",
+    "nodes": [
+      {
+        "id": "candidate-a",
+        "role": "Candidate A",
+        "assignment": "规则化几何初始布局",
+        "guide": "只拥有当前工作流，在隔离环境中交付可验证结果。",
+        "spawn_parent": "root",
+        "depends_on": [],
+        "start_minute": 7,
+        "end_minute": 72,
+        "mode": "progress",
+        "progress_logic": "all",
+        "min_parent_turns": 2,
+        "min_parent_tool_calls": 3,
+        "min_parent_age_seconds": 90,
+        "read_only": false,
+        "allowed_paths": [
+          "*"
+        ],
+        "spawn_executor": "parent_agent",
+        "spawn_tool": "nanoma"
+      },
+      {
+        "id": "candidate-b",
+        "role": "Candidate B",
+        "assignment": "连续坐标/梯度式优化",
+        "guide": "只拥有当前工作流，在隔离环境中交付可验证结果。",
+        "spawn_parent": "root",
+        "depends_on": [],
+        "start_minute": 7,
+        "end_minute": 82,
+        "mode": "progress",
+        "progress_logic": "all",
+        "min_parent_turns": 2,
+        "min_parent_tool_calls": 3,
+        "min_parent_age_seconds": 90,
+        "read_only": false,
+        "allowed_paths": [
+          "*"
+        ],
+        "spawn_executor": "parent_agent",
+        "spawn_tool": "nanoma"
+      },
+      {
+        "id": "candidate-c",
+        "role": "Candidate C",
+        "assignment": "随机重启与局部移动",
+        "guide": "只拥有当前工作流，在隔离环境中交付可验证结果。",
+        "spawn_parent": "root",
+        "depends_on": [],
+        "start_minute": 7,
+        "end_minute": 47,
+        "mode": "progress",
+        "progress_logic": "all",
+        "min_parent_turns": 2,
+        "min_parent_tool_calls": 3,
+        "min_parent_age_seconds": 90,
+        "read_only": false,
+        "allowed_paths": [
+          "*"
+        ],
+        "spawn_executor": "parent_agent",
+        "spawn_tool": "nanoma"
+      },
+      {
+        "id": "benchmarker",
+        "role": "Benchmarker",
+        "assignment": "格式、约束和能量目标 benchmark",
+        "guide": "只拥有当前工作流，在隔离环境中交付可验证结果。",
+        "spawn_parent": "root",
+        "depends_on": [],
+        "start_minute": 18,
+        "end_minute": 102,
+        "mode": "progress",
+        "progress_logic": "all",
+        "min_parent_turns": 2,
+        "min_parent_tool_calls": 3,
+        "min_parent_age_seconds": 90,
+        "read_only": false,
+        "allowed_paths": [
+          "*"
+        ],
+        "spawn_executor": "parent_agent",
+        "spawn_tool": "nanoma"
+      },
+      {
+        "id": "validator",
+        "role": "Final Validator",
+        "assignment": "所有布局约束有效；目标值必须离开零分区间；第二次零分后更换布局家族",
+        "guide": "独立检查构建、功能、必需产物和 best-green 回归。",
+        "spawn_parent": "root",
+        "depends_on": [],
+        "start_minute": 84,
+        "end_minute": 118,
+        "mode": "settled",
+        "progress_logic": "all",
+        "min_parent_turns": 2,
+        "min_parent_tool_calls": 3,
+        "min_parent_age_seconds": 90,
+        "read_only": true,
+        "allowed_paths": [],
+        "spawn_executor": "parent_agent",
+        "spawn_tool": "nanoma"
+      }
+    ],
+    "checkpoint_action": "steer_parent_spawn_tool",
+    "spawn_execution": "parent_agent_via_nanoma_tool",
+    "runtime_creates_agents": false
+  }
+}

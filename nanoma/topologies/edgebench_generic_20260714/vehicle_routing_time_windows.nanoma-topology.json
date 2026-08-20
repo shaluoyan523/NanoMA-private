@@ -1,0 +1,172 @@
+{
+  "schema_version": 2,
+  "source": "edgebench_multiagent_topology_simulator.html",
+  "task": {
+    "id": "vehicle_routing_time_windows",
+    "title": "Vehicle Routing Time Windows",
+    "category": "Combinatorial Optimization",
+    "plan": "P2",
+    "objective": "让构造、局搜和求解器各交付完整路线，Root 先按 56/56 可行性，再按成本选 winner。",
+    "streams": [
+      "时间窗贪心插入",
+      "2-opt*/relocate/swap 局搜",
+      "OR/CP 或大邻域搜索",
+      "56 case 可行性与路线成本 benchmark"
+    ],
+    "gates": [
+      "所有 56 case 必须可行",
+      "成本比较只在全可行候选间进行",
+      "最终提交锁定 32.58 best-green"
+    ],
+    "risk_flags": [
+      "V",
+      "M"
+    ],
+    "edgebench_cwd": "/home/workspace/task_cvrptw_905da6dd/workspace",
+    "submit_paths": [
+      "src",
+      "include",
+      "Makefile"
+    ]
+  },
+  "runtime": {
+    "budget_minutes": 120,
+    "root_role": "Tournament Manager",
+    "root_source_writes": 0,
+    "max_live_agents": 6,
+    "max_concurrent_llm": 6,
+    "task_repo": "",
+    "source_isolation": "shared-tree-serial",
+    "merge_policy": "runtime-judge-gated",
+    "build_gate": "official-sforge-submit",
+    "best_green_gate": "judge-valid && score>=best",
+    "snapshot_enabled": true,
+    "snapshot_paths": [
+      "src",
+      "include",
+      "Makefile"
+    ],
+    "services": {
+      "verification_gate": {
+        "owner": "runtime",
+        "argv": [
+          "sforge-submit"
+        ],
+        "shell": false,
+        "timeout_seconds": 1380,
+        "acceptance": "judge-valid-nondecreasing",
+        "score_direction": "maximize",
+        "always_run": true
+      }
+    },
+    "completion_checkpoint": "spawn-validator",
+    "nodes": [
+      {
+        "id": "candidate-a",
+        "role": "Candidate A",
+        "assignment": "时间窗贪心插入",
+        "guide": "只拥有当前工作流，在隔离环境中交付可验证结果。",
+        "spawn_parent": "root",
+        "depends_on": [],
+        "start_minute": 7,
+        "end_minute": 72,
+        "mode": "progress",
+        "progress_logic": "all",
+        "min_parent_turns": 2,
+        "min_parent_tool_calls": 3,
+        "min_parent_age_seconds": 90,
+        "read_only": false,
+        "allowed_paths": [
+          "*"
+        ],
+        "spawn_executor": "parent_agent",
+        "spawn_tool": "nanoma"
+      },
+      {
+        "id": "candidate-b",
+        "role": "Candidate B",
+        "assignment": "2-opt*/relocate/swap 局搜",
+        "guide": "只拥有当前工作流，在隔离环境中交付可验证结果。",
+        "spawn_parent": "root",
+        "depends_on": [],
+        "start_minute": 7,
+        "end_minute": 82,
+        "mode": "progress",
+        "progress_logic": "all",
+        "min_parent_turns": 2,
+        "min_parent_tool_calls": 3,
+        "min_parent_age_seconds": 90,
+        "read_only": false,
+        "allowed_paths": [
+          "*"
+        ],
+        "spawn_executor": "parent_agent",
+        "spawn_tool": "nanoma"
+      },
+      {
+        "id": "candidate-c",
+        "role": "Candidate C",
+        "assignment": "OR/CP 或大邻域搜索",
+        "guide": "只拥有当前工作流，在隔离环境中交付可验证结果。",
+        "spawn_parent": "root",
+        "depends_on": [],
+        "start_minute": 7,
+        "end_minute": 47,
+        "mode": "progress",
+        "progress_logic": "all",
+        "min_parent_turns": 2,
+        "min_parent_tool_calls": 3,
+        "min_parent_age_seconds": 90,
+        "read_only": false,
+        "allowed_paths": [
+          "*"
+        ],
+        "spawn_executor": "parent_agent",
+        "spawn_tool": "nanoma"
+      },
+      {
+        "id": "benchmarker",
+        "role": "Benchmarker",
+        "assignment": "56 case 可行性与路线成本 benchmark",
+        "guide": "只拥有当前工作流，在隔离环境中交付可验证结果。",
+        "spawn_parent": "root",
+        "depends_on": [],
+        "start_minute": 18,
+        "end_minute": 102,
+        "mode": "progress",
+        "progress_logic": "all",
+        "min_parent_turns": 2,
+        "min_parent_tool_calls": 3,
+        "min_parent_age_seconds": 90,
+        "read_only": false,
+        "allowed_paths": [
+          "*"
+        ],
+        "spawn_executor": "parent_agent",
+        "spawn_tool": "nanoma"
+      },
+      {
+        "id": "validator",
+        "role": "Final Validator",
+        "assignment": "所有 56 case 必须可行；成本比较只在全可行候选间进行；最终提交锁定 32.58 best-green",
+        "guide": "独立检查构建、功能、必需产物和 best-green 回归。",
+        "spawn_parent": "root",
+        "depends_on": [],
+        "start_minute": 84,
+        "end_minute": 118,
+        "mode": "settled",
+        "progress_logic": "all",
+        "min_parent_turns": 2,
+        "min_parent_tool_calls": 3,
+        "min_parent_age_seconds": 90,
+        "read_only": true,
+        "allowed_paths": [],
+        "spawn_executor": "parent_agent",
+        "spawn_tool": "nanoma"
+      }
+    ],
+    "checkpoint_action": "steer_parent_spawn_tool",
+    "spawn_execution": "parent_agent_via_nanoma_tool",
+    "runtime_creates_agents": false
+  }
+}

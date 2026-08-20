@@ -1,0 +1,173 @@
+{
+  "schema_version": 2,
+  "source": "edgebench_multiagent_topology_simulator.html",
+  "task": {
+    "id": "smt_solver",
+    "title": "SMT Solver",
+    "category": "Combinatorial Optimization",
+    "plan": "P2",
+    "objective": "先验证 parser→solve→result 的最小闭环，再让不同理论和搜索路线形成完整 solver 候选。",
+    "streams": [
+      "Parser、AST 与结果协议",
+      "布尔搜索/CDCL 核心",
+      "算术或等式 theory 模块",
+      "独立 validator 与正确性 corpus"
+    ],
+    "gates": [
+      "最小 SAT/UNSAT case 均能判定",
+      "Judge 显示 correct 非 0/0",
+      "同一错误三轮后压缩上下文并换路线"
+    ],
+    "risk_flags": [
+      "A",
+      "C",
+      "M"
+    ],
+    "edgebench_cwd": "/home/workspace/smt_solver",
+    "submit_paths": [
+      "build.sh",
+      "solve",
+      "src"
+    ]
+  },
+  "runtime": {
+    "budget_minutes": 120,
+    "root_role": "Tournament Manager",
+    "root_source_writes": 0,
+    "max_live_agents": 6,
+    "max_concurrent_llm": 6,
+    "task_repo": "",
+    "source_isolation": "shared-tree-serial",
+    "merge_policy": "runtime-judge-gated",
+    "build_gate": "official-sforge-submit",
+    "best_green_gate": "judge-valid && score>=best",
+    "snapshot_enabled": true,
+    "snapshot_paths": [
+      "build.sh",
+      "solve",
+      "src"
+    ],
+    "services": {
+      "verification_gate": {
+        "owner": "runtime",
+        "argv": [
+          "sforge-submit"
+        ],
+        "shell": false,
+        "timeout_seconds": 7380,
+        "acceptance": "judge-valid-nondecreasing",
+        "score_direction": "maximize",
+        "always_run": true
+      }
+    },
+    "completion_checkpoint": "spawn-validator",
+    "nodes": [
+      {
+        "id": "candidate-a",
+        "role": "Candidate A",
+        "assignment": "Parser、AST 与结果协议",
+        "guide": "只拥有当前工作流，在隔离环境中交付可验证结果。",
+        "spawn_parent": "root",
+        "depends_on": [],
+        "start_minute": 7,
+        "end_minute": 72,
+        "mode": "progress",
+        "progress_logic": "all",
+        "min_parent_turns": 2,
+        "min_parent_tool_calls": 3,
+        "min_parent_age_seconds": 90,
+        "read_only": false,
+        "allowed_paths": [
+          "*"
+        ],
+        "spawn_executor": "parent_agent",
+        "spawn_tool": "nanoma"
+      },
+      {
+        "id": "candidate-b",
+        "role": "Candidate B",
+        "assignment": "布尔搜索/CDCL 核心",
+        "guide": "只拥有当前工作流，在隔离环境中交付可验证结果。",
+        "spawn_parent": "root",
+        "depends_on": [],
+        "start_minute": 7,
+        "end_minute": 82,
+        "mode": "progress",
+        "progress_logic": "all",
+        "min_parent_turns": 2,
+        "min_parent_tool_calls": 3,
+        "min_parent_age_seconds": 90,
+        "read_only": false,
+        "allowed_paths": [
+          "*"
+        ],
+        "spawn_executor": "parent_agent",
+        "spawn_tool": "nanoma"
+      },
+      {
+        "id": "candidate-c",
+        "role": "Candidate C",
+        "assignment": "算术或等式 theory 模块",
+        "guide": "只拥有当前工作流，在隔离环境中交付可验证结果。",
+        "spawn_parent": "root",
+        "depends_on": [],
+        "start_minute": 7,
+        "end_minute": 47,
+        "mode": "progress",
+        "progress_logic": "all",
+        "min_parent_turns": 2,
+        "min_parent_tool_calls": 3,
+        "min_parent_age_seconds": 90,
+        "read_only": false,
+        "allowed_paths": [
+          "*"
+        ],
+        "spawn_executor": "parent_agent",
+        "spawn_tool": "nanoma"
+      },
+      {
+        "id": "benchmarker",
+        "role": "Benchmarker",
+        "assignment": "独立 validator 与正确性 corpus",
+        "guide": "只拥有当前工作流，在隔离环境中交付可验证结果。",
+        "spawn_parent": "root",
+        "depends_on": [],
+        "start_minute": 18,
+        "end_minute": 102,
+        "mode": "progress",
+        "progress_logic": "all",
+        "min_parent_turns": 2,
+        "min_parent_tool_calls": 3,
+        "min_parent_age_seconds": 90,
+        "read_only": false,
+        "allowed_paths": [
+          "*"
+        ],
+        "spawn_executor": "parent_agent",
+        "spawn_tool": "nanoma"
+      },
+      {
+        "id": "validator",
+        "role": "Final Validator",
+        "assignment": "最小 SAT/UNSAT case 均能判定；Judge 显示 correct 非 0/0；同一错误三轮后压缩上下文并换路线",
+        "guide": "独立检查构建、功能、必需产物和 best-green 回归。",
+        "spawn_parent": "root",
+        "depends_on": [],
+        "start_minute": 84,
+        "end_minute": 118,
+        "mode": "settled",
+        "progress_logic": "all",
+        "min_parent_turns": 2,
+        "min_parent_tool_calls": 3,
+        "min_parent_age_seconds": 90,
+        "read_only": true,
+        "allowed_paths": [],
+        "spawn_executor": "parent_agent",
+        "spawn_tool": "nanoma"
+      }
+    ],
+    "checkpoint_action": "steer_parent_spawn_tool",
+    "spawn_execution": "parent_agent_via_nanoma_tool",
+    "runtime_creates_agents": false
+  }
+}

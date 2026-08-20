@@ -1,0 +1,185 @@
+{
+  "schema_version": 2,
+  "source": "edgebench_multiagent_topology_simulator.html",
+  "task": {
+    "id": "cta_risk_budget_optimization",
+    "title": "CTA Risk Budget Optimization",
+    "category": "Professional Knowledge Work",
+    "plan": "P6",
+    "objective": "把信号、回测、风险约束和证据审计拆开，Root 只整合可复现实验。",
+    "streams": [
+      "趋势信号与仓位生成",
+      "走样本回测与成本模型",
+      "风险预算、杠杆与约束",
+      "报告证据和数值一致性审计"
+    ],
+    "gates": [
+      "回测无未来数据泄漏",
+      "风险预算与报告数字一致",
+      "最终版本不低于 38.125"
+    ],
+    "risk_flags": [
+      "V",
+      "C",
+      "M"
+    ],
+    "edgebench_cwd": "/home/workspace",
+    "submit_paths": [
+      "run.py",
+      "main.py",
+      "config.json",
+      "config.yaml",
+      "nav_history.csv",
+      "signal_matrix.csv",
+      "positions.csv",
+      "trades.csv",
+      "risk_budget_allocation.csv",
+      "performance_report.md",
+      "performance_report.xlsx",
+      "stress_test_report.md",
+      "stress_test_results.xlsx",
+      "sensitivity_analysis_report.md",
+      "sensitivity_analysis.xlsx",
+      "diagnostics.json",
+      "outputs"
+    ]
+  },
+  "runtime": {
+    "budget_minutes": 120,
+    "root_role": "Deliverable Owner",
+    "root_source_writes": 0,
+    "max_live_agents": 5,
+    "max_concurrent_llm": 5,
+    "task_repo": "",
+    "source_isolation": "shared-tree-serial",
+    "merge_policy": "runtime-judge-gated",
+    "build_gate": "official-sforge-submit",
+    "best_green_gate": "judge-valid && score>=best",
+    "snapshot_enabled": true,
+    "snapshot_paths": [
+      "run.py",
+      "main.py",
+      "config.json",
+      "config.yaml",
+      "nav_history.csv",
+      "signal_matrix.csv",
+      "positions.csv",
+      "trades.csv",
+      "risk_budget_allocation.csv",
+      "performance_report.md",
+      "performance_report.xlsx",
+      "stress_test_report.md",
+      "stress_test_results.xlsx",
+      "sensitivity_analysis_report.md",
+      "sensitivity_analysis.xlsx",
+      "diagnostics.json",
+      "outputs"
+    ],
+    "services": {
+      "verification_gate": {
+        "owner": "runtime",
+        "argv": [
+          "sforge-submit"
+        ],
+        "shell": false,
+        "timeout_seconds": 900,
+        "acceptance": "judge-valid-nondecreasing",
+        "score_direction": "maximize",
+        "always_run": true
+      }
+    },
+    "completion_checkpoint": "spawn-validator",
+    "nodes": [
+      {
+        "id": "producer-a",
+        "role": "Producer A",
+        "assignment": "趋势信号与仓位生成",
+        "guide": "只拥有当前工作流，在隔离环境中交付可验证结果。",
+        "spawn_parent": "root",
+        "depends_on": [],
+        "start_minute": 6,
+        "end_minute": 78,
+        "mode": "progress",
+        "progress_logic": "all",
+        "min_parent_turns": 2,
+        "min_parent_tool_calls": 3,
+        "min_parent_age_seconds": 90,
+        "read_only": false,
+        "allowed_paths": [
+          "*"
+        ],
+        "spawn_executor": "parent_agent",
+        "spawn_tool": "nanoma"
+      },
+      {
+        "id": "producer-b",
+        "role": "Producer B",
+        "assignment": "走样本回测与成本模型",
+        "guide": "只拥有当前工作流，在隔离环境中交付可验证结果。",
+        "spawn_parent": "root",
+        "depends_on": [],
+        "start_minute": 6,
+        "end_minute": 78,
+        "mode": "progress",
+        "progress_logic": "all",
+        "min_parent_turns": 2,
+        "min_parent_tool_calls": 3,
+        "min_parent_age_seconds": 90,
+        "read_only": false,
+        "allowed_paths": [
+          "*"
+        ],
+        "spawn_executor": "parent_agent",
+        "spawn_tool": "nanoma"
+      },
+      {
+        "id": "auditor",
+        "role": "Rubric Auditor",
+        "assignment": "风险预算、杠杆与约束",
+        "guide": "只拥有当前工作流，在隔离环境中交付可验证结果。",
+        "spawn_parent": "root",
+        "depends_on": [],
+        "start_minute": 6,
+        "end_minute": 104,
+        "mode": "progress",
+        "progress_logic": "all",
+        "min_parent_turns": 2,
+        "min_parent_tool_calls": 3,
+        "min_parent_age_seconds": 90,
+        "read_only": false,
+        "allowed_paths": [
+          "*"
+        ],
+        "spawn_executor": "parent_agent",
+        "spawn_tool": "nanoma"
+      },
+      {
+        "id": "validator",
+        "role": "Artifact Validator",
+        "assignment": "报告证据和数值一致性审计",
+        "guide": "只拥有当前工作流，在隔离环境中交付可验证结果。",
+        "spawn_parent": "root",
+        "depends_on": [
+          "spawn-producer-a",
+          "spawn-producer-b"
+        ],
+        "start_minute": 10,
+        "end_minute": 118,
+        "mode": "settled",
+        "progress_logic": "all",
+        "min_parent_turns": 2,
+        "min_parent_tool_calls": 3,
+        "min_parent_age_seconds": 90,
+        "read_only": false,
+        "allowed_paths": [
+          "*"
+        ],
+        "spawn_executor": "parent_agent",
+        "spawn_tool": "nanoma"
+      }
+    ],
+    "checkpoint_action": "steer_parent_spawn_tool",
+    "spawn_execution": "parent_agent_via_nanoma_tool",
+    "runtime_creates_agents": false
+  }
+}

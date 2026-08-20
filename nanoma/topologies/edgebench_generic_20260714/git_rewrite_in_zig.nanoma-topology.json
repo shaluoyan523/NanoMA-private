@@ -1,0 +1,190 @@
+{
+  "schema_version": 2,
+  "source": "edgebench_multiagent_topology_simulator.html",
+  "task": {
+    "id": "git_rewrite_in_zig",
+    "title": "Git Rewrite in Zig",
+    "category": "Systems & Software Engineering",
+    "plan": "P1",
+    "objective": "保留已验证的模块边界，把展开提前，并让 Root 专注命令层接口和逐 commit 集成。",
+    "streams": [
+      "Object store 与 object parsing",
+      "Repository、init 与 refs",
+      "Config 读取和写入",
+      "Command layer、API 集成与 Zig 全量测试"
+    ],
+    "gates": [
+      "每个模块 commit 可独立测试",
+      "Root 每次只集成一个 child commit",
+      "接口变更同步更新 all.zig 和调用方"
+    ],
+    "risk_flags": [
+      "M"
+    ],
+    "edgebench_cwd": "/home/workspace/zig-port",
+    "submit_paths": [
+      "."
+    ]
+  },
+  "runtime": {
+    "budget_minutes": 120,
+    "root_role": "Root / Integrator",
+    "root_source_writes": 0,
+    "max_live_agents": 7,
+    "max_concurrent_llm": 6,
+    "task_repo": "",
+    "source_isolation": "shared-tree-serial",
+    "merge_policy": "runtime-judge-gated",
+    "build_gate": "official-sforge-submit",
+    "best_green_gate": "judge-valid && score>=best",
+    "snapshot_enabled": true,
+    "snapshot_paths": [
+      "."
+    ],
+    "services": {
+      "verification_gate": {
+        "owner": "runtime",
+        "argv": [
+          "sforge-submit"
+        ],
+        "shell": false,
+        "timeout_seconds": 7380,
+        "acceptance": "judge-valid-nondecreasing",
+        "score_direction": "maximize",
+        "always_run": true
+      }
+    },
+    "completion_checkpoint": "spawn-verifier",
+    "nodes": [
+      {
+        "id": "scout",
+        "role": "Requirement Scout",
+        "assignment": "扫描并拆解：Object store 与 object parsing / Repository、init 与 refs / Config 读取和写入 / Command layer、API 集成与 Zig 全量测试",
+        "guide": "只读扫描任务、测试和依赖，尽早形成可执行验收矩阵。",
+        "spawn_parent": "root",
+        "depends_on": [],
+        "start_minute": 0,
+        "end_minute": 12,
+        "mode": "progress",
+        "progress_logic": "all",
+        "min_parent_turns": 0,
+        "min_parent_tool_calls": 0,
+        "min_parent_age_seconds": 0,
+        "read_only": true,
+        "allowed_paths": [],
+        "spawn_executor": "parent_agent",
+        "spawn_tool": "nanoma"
+      },
+      {
+        "id": "lead-a",
+        "role": "Module Lead A",
+        "assignment": "Object store 与 object parsing",
+        "guide": "只拥有当前工作流，在隔离环境中交付可验证结果。",
+        "spawn_parent": "root",
+        "depends_on": [],
+        "start_minute": 8,
+        "end_minute": 72,
+        "mode": "progress",
+        "progress_logic": "all",
+        "min_parent_turns": 2,
+        "min_parent_tool_calls": 3,
+        "min_parent_age_seconds": 90,
+        "read_only": false,
+        "allowed_paths": [
+          "*"
+        ],
+        "spawn_executor": "parent_agent",
+        "spawn_tool": "nanoma"
+      },
+      {
+        "id": "lead-b",
+        "role": "Module Lead B",
+        "assignment": "Repository、init 与 refs",
+        "guide": "只拥有当前工作流，在隔离环境中交付可验证结果。",
+        "spawn_parent": "root",
+        "depends_on": [],
+        "start_minute": 8,
+        "end_minute": 72,
+        "mode": "progress",
+        "progress_logic": "all",
+        "min_parent_turns": 2,
+        "min_parent_tool_calls": 3,
+        "min_parent_age_seconds": 90,
+        "read_only": false,
+        "allowed_paths": [
+          "*"
+        ],
+        "spawn_executor": "parent_agent",
+        "spawn_tool": "nanoma"
+      },
+      {
+        "id": "worker-a",
+        "role": "Worker A1",
+        "assignment": "Config 读取和写入",
+        "guide": "只拥有当前工作流，在隔离环境中交付可验证结果。",
+        "spawn_parent": "lead-a",
+        "depends_on": [
+          "spawn-lead-a"
+        ],
+        "start_minute": 20,
+        "end_minute": 58,
+        "mode": "progress",
+        "progress_logic": "all",
+        "min_parent_turns": 4,
+        "min_parent_tool_calls": 5,
+        "min_parent_age_seconds": 180,
+        "read_only": false,
+        "allowed_paths": [
+          "*"
+        ],
+        "spawn_executor": "parent_agent",
+        "spawn_tool": "nanoma"
+      },
+      {
+        "id": "worker-b",
+        "role": "Worker B1",
+        "assignment": "Command layer、API 集成与 Zig 全量测试",
+        "guide": "只拥有当前工作流，在隔离环境中交付可验证结果。",
+        "spawn_parent": "lead-b",
+        "depends_on": [
+          "spawn-lead-b"
+        ],
+        "start_minute": 20,
+        "end_minute": 58,
+        "mode": "progress",
+        "progress_logic": "all",
+        "min_parent_turns": 4,
+        "min_parent_tool_calls": 5,
+        "min_parent_age_seconds": 180,
+        "read_only": false,
+        "allowed_paths": [
+          "*"
+        ],
+        "spawn_executor": "parent_agent",
+        "spawn_tool": "nanoma"
+      },
+      {
+        "id": "verifier",
+        "role": "Regression Verifier",
+        "assignment": "每个模块 commit 可独立测试；Root 每次只集成一个 child commit；接口变更同步更新 all.zig 和调用方",
+        "guide": "独立检查构建、功能、必需产物和 best-green 回归。",
+        "spawn_parent": "root",
+        "depends_on": [],
+        "start_minute": 68,
+        "end_minute": 114,
+        "mode": "settled",
+        "progress_logic": "all",
+        "min_parent_turns": 2,
+        "min_parent_tool_calls": 3,
+        "min_parent_age_seconds": 90,
+        "read_only": true,
+        "allowed_paths": [],
+        "spawn_executor": "parent_agent",
+        "spawn_tool": "nanoma"
+      }
+    ],
+    "checkpoint_action": "steer_parent_spawn_tool",
+    "spawn_execution": "parent_agent_via_nanoma_tool",
+    "runtime_creates_agents": false
+  }
+}

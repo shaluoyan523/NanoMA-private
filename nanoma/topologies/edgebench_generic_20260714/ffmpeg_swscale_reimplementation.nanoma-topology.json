@@ -1,0 +1,192 @@
+{
+  "schema_version": 2,
+  "source": "edgebench_multiagent_topology_simulator.html",
+  "task": {
+    "id": "ffmpeg_swscale_reimplementation",
+    "title": "FFmpeg Swscale Reimplementation",
+    "category": "Systems & Software Engineering",
+    "plan": "P1",
+    "objective": "按像素格式、色彩转换和缩放核拆分，Verifier 同时看 pass state、画质和性能。",
+    "streams": [
+      "Pixel format 读写与边界",
+      "Color space 与 range 转换",
+      "Scaling kernels 和插值",
+      "格式矩阵、图像误差与性能回归"
+    ],
+    "gates": [
+      "支持矩阵逐项可执行",
+      "输出误差满足容差",
+      "最终 pass state 不得从 1/1 降为 0/1"
+    ],
+    "risk_flags": [
+      "A",
+      "V",
+      "M"
+    ],
+    "edgebench_cwd": "/home/workspace/swscale-impl",
+    "submit_paths": [
+      "."
+    ]
+  },
+  "runtime": {
+    "budget_minutes": 120,
+    "root_role": "Root / Integrator",
+    "root_source_writes": 0,
+    "max_live_agents": 7,
+    "max_concurrent_llm": 6,
+    "task_repo": "",
+    "source_isolation": "shared-tree-serial",
+    "merge_policy": "runtime-judge-gated",
+    "build_gate": "official-sforge-submit",
+    "best_green_gate": "judge-valid && score>=best",
+    "snapshot_enabled": true,
+    "snapshot_paths": [
+      "."
+    ],
+    "services": {
+      "verification_gate": {
+        "owner": "runtime",
+        "argv": [
+          "sforge-submit"
+        ],
+        "shell": false,
+        "timeout_seconds": 5580,
+        "acceptance": "judge-valid-nondecreasing",
+        "score_direction": "maximize",
+        "always_run": true
+      }
+    },
+    "completion_checkpoint": "spawn-verifier",
+    "nodes": [
+      {
+        "id": "scout",
+        "role": "Requirement Scout",
+        "assignment": "扫描并拆解：Pixel format 读写与边界 / Color space 与 range 转换 / Scaling kernels 和插值 / 格式矩阵、图像误差与性能回归",
+        "guide": "只读扫描任务、测试和依赖，尽早形成可执行验收矩阵。",
+        "spawn_parent": "root",
+        "depends_on": [],
+        "start_minute": 0,
+        "end_minute": 12,
+        "mode": "progress",
+        "progress_logic": "all",
+        "min_parent_turns": 0,
+        "min_parent_tool_calls": 0,
+        "min_parent_age_seconds": 0,
+        "read_only": true,
+        "allowed_paths": [],
+        "spawn_executor": "parent_agent",
+        "spawn_tool": "nanoma"
+      },
+      {
+        "id": "lead-a",
+        "role": "Module Lead A",
+        "assignment": "Pixel format 读写与边界",
+        "guide": "只拥有当前工作流，在隔离环境中交付可验证结果。",
+        "spawn_parent": "root",
+        "depends_on": [],
+        "start_minute": 8,
+        "end_minute": 72,
+        "mode": "progress",
+        "progress_logic": "all",
+        "min_parent_turns": 2,
+        "min_parent_tool_calls": 3,
+        "min_parent_age_seconds": 90,
+        "read_only": false,
+        "allowed_paths": [
+          "*"
+        ],
+        "spawn_executor": "parent_agent",
+        "spawn_tool": "nanoma"
+      },
+      {
+        "id": "lead-b",
+        "role": "Module Lead B",
+        "assignment": "Color space 与 range 转换",
+        "guide": "只拥有当前工作流，在隔离环境中交付可验证结果。",
+        "spawn_parent": "root",
+        "depends_on": [],
+        "start_minute": 8,
+        "end_minute": 72,
+        "mode": "progress",
+        "progress_logic": "all",
+        "min_parent_turns": 2,
+        "min_parent_tool_calls": 3,
+        "min_parent_age_seconds": 90,
+        "read_only": false,
+        "allowed_paths": [
+          "*"
+        ],
+        "spawn_executor": "parent_agent",
+        "spawn_tool": "nanoma"
+      },
+      {
+        "id": "worker-a",
+        "role": "Worker A1",
+        "assignment": "Scaling kernels 和插值",
+        "guide": "只拥有当前工作流，在隔离环境中交付可验证结果。",
+        "spawn_parent": "lead-a",
+        "depends_on": [
+          "spawn-lead-a"
+        ],
+        "start_minute": 20,
+        "end_minute": 58,
+        "mode": "progress",
+        "progress_logic": "all",
+        "min_parent_turns": 4,
+        "min_parent_tool_calls": 5,
+        "min_parent_age_seconds": 180,
+        "read_only": false,
+        "allowed_paths": [
+          "*"
+        ],
+        "spawn_executor": "parent_agent",
+        "spawn_tool": "nanoma"
+      },
+      {
+        "id": "worker-b",
+        "role": "Worker B1",
+        "assignment": "格式矩阵、图像误差与性能回归",
+        "guide": "只拥有当前工作流，在隔离环境中交付可验证结果。",
+        "spawn_parent": "lead-b",
+        "depends_on": [
+          "spawn-lead-b"
+        ],
+        "start_minute": 20,
+        "end_minute": 58,
+        "mode": "progress",
+        "progress_logic": "all",
+        "min_parent_turns": 4,
+        "min_parent_tool_calls": 5,
+        "min_parent_age_seconds": 180,
+        "read_only": false,
+        "allowed_paths": [
+          "*"
+        ],
+        "spawn_executor": "parent_agent",
+        "spawn_tool": "nanoma"
+      },
+      {
+        "id": "verifier",
+        "role": "Regression Verifier",
+        "assignment": "支持矩阵逐项可执行；输出误差满足容差；最终 pass state 不得从 1/1 降为 0/1",
+        "guide": "独立检查构建、功能、必需产物和 best-green 回归。",
+        "spawn_parent": "root",
+        "depends_on": [],
+        "start_minute": 68,
+        "end_minute": 114,
+        "mode": "settled",
+        "progress_logic": "all",
+        "min_parent_turns": 2,
+        "min_parent_tool_calls": 3,
+        "min_parent_age_seconds": 90,
+        "read_only": true,
+        "allowed_paths": [],
+        "spawn_executor": "parent_agent",
+        "spawn_tool": "nanoma"
+      }
+    ],
+    "checkpoint_action": "steer_parent_spawn_tool",
+    "spawn_execution": "parent_agent_via_nanoma_tool",
+    "runtime_creates_agents": false
+  }
+}
