@@ -190,7 +190,7 @@ async def _run_spawn_judge_tests() -> None:
     from nanoma.core import Runtime, RuntimeConfig
     from optimizations.todo_tools.todo_tools import meta_task_create
 
-    os.environ["NANOMA_SPAWN_TODOLIST_JUDGE"] = "1"
+    os.environ["NANOMA_NODE_AUTONOMOUS_PLANNING"] = "1"
     try:
         # --- spawn=true: judge splits into 2 subagents; todolist is SUPPRESSED ---
         rt = Runtime(RuntimeConfig(max_agents=4, max_depth=1, default_model="default-model"))
@@ -277,7 +277,7 @@ async def _run_spawn_judge_tests() -> None:
         _check(len(rt3.agents) == m0, "judge error -> graceful no-spawn")
         _check(res_b.get("task_id"), "judge error -> todolist still created")
     finally:
-        os.environ.pop("NANOMA_SPAWN_TODOLIST_JUDGE", None)
+        os.environ.pop("NANOMA_NODE_AUTONOMOUS_PLANNING", None)
 
 
 def main() -> int:

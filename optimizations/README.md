@@ -1,12 +1,13 @@
 # NanoMA Optimizations
 
-Add-on enhancements to NanoMA kept separate from the core `nanoma` package so
-they can be developed, reviewed, and toggled independently.
+Evaluation and experimental enhancements kept separate from the reusable
+`nanoma` package.
 
-## `todo_tools` — same-model planning nodes
+## `todo_tools` — compatibility path for core planning
 
-Adds three coordination meta tools that give an agent a lightweight, in-session
-task list (mirroring Claude Code's `TaskCreate` / `TaskUpdate` / `TaskList`):
+The implementation now lives in `nanoma/planning.py` and ships with the general
+agent. `optimizations.todo_tools` remains as a compatibility import for older
+experiments and trajectories.
 
 | Tool | Purpose |
 |------|---------|
@@ -68,21 +69,20 @@ export NANOMA_TODO_EMPTY_HINT_AFTER=4   # turns before one-time empty-list hint
 
 ### Integration
 
-Registered into NanoMA's tool library by a best-effort hook at the end of
-`nanoma/meta.py`:
+Registered directly into NanoMA's tool library at the end of `nanoma/meta.py`:
 
 ```python
-_register_optimization_tools()  # adds optimizations.todo_tools.TODO_TOOLS to META_TOOLS
+_register_optimization_tools()  # adds nanoma.planning.TODO_TOOLS to META_TOOLS
 ```
 
 Because it augments `META_TOOLS`, the tools flow through every `_all_tools()`
-merge site automatically and become available to all agents. If the
-`optimizations` package is missing, core is unaffected.
+merge site automatically and are present in installed packages without the
+`optimizations` directory.
 
 Alternatively, without touching core, inject them per-run:
 
 ```python
-from optimizations.todo_tools import TODO_TOOLS
+from nanoma.planning import TODO_TOOLS
 config.extra_tools.update(TODO_TOOLS)  # RuntimeConfig.extra_tools is merged in _all_tools()
 ```
 

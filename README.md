@@ -1,210 +1,195 @@
 # NanoMA
 
-[![Python](https://img.shields.io/badge/python-%3E%3D3.11-blue?logo=python&logoColor=white)](pyproject.toml)
-![Version](https://img.shields.io/badge/version-0.9.2-7c3aed)
-[![License: MIT](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
+NanoMA is a general-purpose agent runtime in which every node can plan its own
+work and dynamically create further multi-agent structure. It can be used for
+research, coding, analysis, and artifact-producing tasks without a benchmark
+harness.
 
-**A minimal multi-agent harness for research.** ~2000 lines of Python.
+The model that works on a node also makes that node's planning decision. There
+is no separate planner model and no model-specific routing rule.
 
-NanoMA provides the thinnest possible runtime for studying multi-agent LLM coordination.
-It is deliberately unopinionated — the framework supplies primitives (spawn, send, wait, kill, shared filesystem),
-and the orchestration pattern emerges entirely from the prompt you give the root agent.
+## How autonomous planning works
 
-## Design Principle: Orthogonal Minimalism
+1. A node works normally with shell, workspace, and coordination tools.
+2. At a meaningful planning point it calls `task_create`.
+3. NanoMA gives that node's current context to the same model and asks whether
+   the next phase should stay local or be split into parallel child tasks.
+4. If the work stays local, the task is added to the node's own task list.
+5. If it is delegated, the runtime creates the approved children internally.
+   Every child inherits the parent's model and can make the same kind of
+   planning decision later.
 
-> **Shell is the universal escape hatch. A dedicated tool exists only when it provides
-> an interaction model that shell cannot reliably replicate.**
+The model never receives `spawn`, `spawn_many`, or `task_spawn`. Child creation
+is a runtime operation resulting from node-level planning, rather than a second
+model-facing orchestration API.
 
-Every tool earns its place by satisfying one of three criteria:
-1. **Reliability** — shell can't do it without escaping gymnastics
-2. **Atomicity** — the operation needs multi-step transactional semantics
-3. **Coordination** — the operation requires access to runtime internals
-
-If `shell("one-liner")` produces equally usable output → the tool is redundant → it doesn't exist.
-
-See [DESIGN.md](DESIGN.md) for the full rationale.
-
-## Quick Start
+## Install
 
 ```bash
-pip install -e .
-export NANOMA_API_KEY="sk-..."
-export NANOMA_LLM_BASE_URL="https://openrouter.ai/api/v1"
-
-# Run with a preset orchestration pattern:
-nanoma "$(cat presets/01_orchestrator_workers.md | sed 's/{task}/Build a REST API/')" --budget 5.0
-
-# Or run raw — let the agent decide its own strategy:
-nanoma "Build a linked list in C with tests" --budget 5.0 --max-agents 20
+python -m pip install -e .
+export NANOMA_API_KEY="your-api-key"
+export NANOMA_LLM_BASE_URL="https://your-openai-compatible-endpoint/v1"
+export NANOMA_MODEL="your-model"
 ```
 
-## Architecture: 3 Layers, 22 Tools
+Python 3.11 or newer is required. NanoMA accepts OpenAI-compatible endpoints;
+the existing protocol settings in `nanoma.llm` remain available for other
+supported routes.
 
+## Run a general task
+
+```bash
+nanoma "Compare three database designs and recommend one" --budget 5
 ```
-Layer 3: META (12 tools) — coordination primitives on runtime internals
-Layer 2: WORKSPACE (9 tools) — structured ops where shell fails
-Layer 1: SHELL (1 tool) — universal primitive for everything else
+
+Work on an existing project:
+
+```bash
+nanoma --project . "Find and fix the failing tests, then explain the cause"
 ```
 
-### Meta Tools (Coordination)
+Read a longer task from a file or standard input:
 
-| Tool | What it does |
-|------|-------------|
-| `spawn(task)` | Create a new agent (runs in parallel immediately) |
-| `send(to, message)` | Send a message to any agent |
-| `wait(ids, mode)` | Block until agents finish (`mode="all"` or `"any"`) |
-| `query()` | Discover all agents and their status |
-| `kill(id)` | Terminate an agent |
-| `transfer(src, to)` | Copy files between workspaces |
-| `set_status("done")` | Finish and report result to parent |
-| `set_status("idle")` | Sleep until messaged |
-| `set_bio(bio)` | Advertise your role to others |
-| `rebirth(summary)` | Reset context to save memory |
-| `submit(path)` | Mark a file as deliverable |
-| `batch(path)` | Execute tool calls from a JSON file |
+```bash
+nanoma --task-file task.md
+printf '%s\n' "Audit this repository for unsafe file handling" | nanoma - --project .
+```
 
-### Workspace Tools (Structured I/O)
+The default internal state is written under `.nanoma/`:
 
-| Tool | Why shell can't | What it does |
-|------|----------------|-------------|
-| `ws_create_file` | Heredoc escaping | Create files with any content reliably |
-| `ws_append_file` | Same | Append to files without escaping issues |
-| `ws_read_file` | No structured pagination | Read with line numbers, offset, limit |
-| `ws_replace_string` | sed can't 4-tier match | Find-replace with cascading match strategies |
-| `ws_multi_replace` | No atomicity | Batch replace, all-or-nothing |
-| `ws_apply_patch` | No V4A format | Context-based multi-file patching |
-| `ws_grep` | No structured output | Search with file/line/content JSON results |
-| `ws_code_outline` | No CLI equivalent | Symbol tree with block boundaries |
-| `ws_read_symbol` | Needs outline knowledge | Extract a specific function/class by name |
+- `.nanoma/workspace/`: private node workspaces and shared deliverables
+- `.nanoma/logs/`: `events.jsonl` execution trace
 
-### Shell (Universal Primitive)
+These paths are independent from an optional `--project` target.
 
-| Tool | What it does |
-|------|-------------|
-| `shell(command)` | Execute any command (stdout, stderr, exit_code) |
+## Useful CLI options
 
-Agents use shell for everything else: `mkdir -p`, `rm -rf`, `mv`, `ls`, `find`, `tree`, `git`, `pip`, `curl`, etc.
+```text
+--model MODEL                 Working and planning model for the root node
+--project PATH                Existing target directory
+--budget USD                  Shared run budget
+--time-limit SECONDS          Whole-run time limit; 0 means unlimited
+--max-agents N                Maximum nodes created during the run
+--max-depth N                 Maximum child depth
+--max-concurrent-llm N        Concurrent model calls
+--max-turns N                 Turn limit per node
+--[no-]node-planning          Enable or disable node-level delegation
+--instructions TEXT           Extra instructions for all nodes
+--instructions-file PATH      Read extra instructions from a file
+--disable-tool NAME           Hide a tool; may be repeated
+--json                        Return result and run statistics as JSON
+--stats                       Print a compact run summary
+--quiet                       Suppress live events
+```
 
-## Design Principles
-
-- **Uniform infrastructure** — every agent has the same loop, same tools. Differentiation emerges from task prompts, not from code.
-- **Flat topology** — any agent can message any other. The framework imposes no hierarchy — but agents can self-organize into any pattern.
-- **Stigmergy** — agents coordinate through a shared/ filesystem and direct messages.
-- **Global budget** — one shared pool. When it runs out, everyone stops.
-- **Fresh context** — each spawned agent gets a clean context window.
-- **Orthogonal minimalism** — 22 tools total. If shell can do it, there's no dedicated tool.
-
-## Security Notice
-
-**NanoMA has NO sandboxing for shell commands.** Agents execute shell commands with the same privileges as the host process. File operations in workspace tools are sandboxed to the workspace root via path validation, but shell bypasses this.
-
-**Always run NanoMA in a disposable environment** (container, VM, or dedicated machine).
-
-## Presets (30 Orchestration Patterns)
-
-The `presets/` directory contains 30 prompt templates implementing known MA patterns.
-Each is a pure prompt — no code changes needed:
-
-| # | Pattern | Topology |
-|---|---------|----------|
-| 01 | Orchestrator-Workers | Star |
-| 02 | Evaluator-Optimizer | Loop |
-| 03 | Prompt Chaining | Chain |
-| 04 | Router | Fan-out |
-| 05 | Parallelization | Fan-out/in |
-| 06 | Debate | Star+Judge |
-| 07 | Plan-and-Execute | Planner↔Executor |
-| 08 | Map-Reduce | N→1 |
-| 09 | Hierarchical Delegation | Tree |
-| 10 | Swarm | Mesh |
-| 11–30 | ... | See `presets/` |
-
-Usage: `nanoma "$(cat presets/06_debate.md | sed 's/{task}/your question/')" --budget 2.0`
+`--no-node-planning` keeps `task_create` as a local checklist tool but prevents
+it from creating children.
 
 ## Programmatic API
+
+For most applications, use `run_agent`:
 
 ```python
 import asyncio
 from pathlib import Path
-from nanoma import Runtime, RuntimeConfig
+
+from nanoma import RuntimeConfig, run_agent
+
 
 async def main():
     config = RuntimeConfig(
+        default_model="your-model",
         budget=5.0,
-        max_agents=20,
-        max_turns=50,
-        default_model="deepseek/deepseek-v4-flash",
-        workspace_root=Path("./workspace"),
-        log_dir=Path("./logs"),
+        max_agents=12,
+        max_depth=4,
+        max_concurrent_llm=4,
+        workspace_root=Path(".nanoma/workspace"),
+        log_dir=Path(".nanoma/logs"),
+        node_autonomous_planning=True,
     )
-    rt = Runtime(config=config)
-    result = await rt.run("Your task here")
-    print(result)
-    print(rt.stats())
+    run = await run_agent(
+        "Improve the parser and add regression tests",
+        config=config,
+        project_dir=Path("."),
+    )
+    print(run.result)
+    print(run.stats["agents"])
+
 
 asyncio.run(main())
 ```
 
-## Trace Viewer
+`run_agent` returns an `AgentRun` containing the result, statistics, artifact
+paths, and the underlying `Runtime` for deeper inspection. Advanced users can
+still instantiate `Runtime` directly.
 
-Every run produces a trace in `logs/events.jsonl`. View it in real-time:
+## Model-facing tools
+
+### Planning and coordination
+
+| Tool | Purpose |
+| --- | --- |
+| `task_create` | Declare a new planning step; may become local work or an internal child split |
+| `task_update` | Update the node's local task status |
+| `task_list` | Inspect the node's local plan |
+| `send` | Send a message to another node |
+| `query` | Discover nodes, status, and available context |
+| `wait` | Wait for selected children or peers |
+| `kill` | Stop a node that is no longer useful |
+| `deliver_to_parent` | Return a child's answer and evidence |
+| `transfer` | Copy an artifact between node workspaces |
+
+### Work and lifecycle
+
+| Tool family | Purpose |
+| --- | --- |
+| `shell` | General system, development, and network commands |
+| `ws_*` | Structured file reading, creation, editing, search, and code inspection |
+| `submit` | Copy a completed artifact into NanoMA's shared directory |
+| `set_status` | Finish or idle a node |
+| `get_cost` | Inspect identity, resource use, and remaining budget |
+| `set_bio` | Publish a node's role |
+| `rebirth` | Restart a node with a compact carried-forward summary |
+
+Optional benchmark adapters may add tools such as an official evaluator. Those
+are not required by the general agent and are not part of its default task
+contract.
+
+## Architecture boundary
+
+The reusable agent lives in:
+
+- `nanoma/agent.py`: benchmark-independent API
+- `nanoma/main.py`: general CLI
+- `nanoma/planning.py`: per-node task planning and delegation trigger
+- `nanoma/core.py`: runtime, node lifecycle, communication, and internal child creation
+
+`benchmarks/` contains adapters only. In particular, the EdgeBench runner may
+add SForge prompts, official submission tools, time guards, and merge policies;
+none of those assumptions are present in `run_agent` or the default `nanoma`
+command.
+
+## Trace viewer
 
 ```bash
-python nanoma/viewer.py ./logs 8900
-# Open http://localhost:8900
+python nanoma/viewer.py .nanoma/logs 8900
 ```
 
-## Configuration
+Then open `http://localhost:8900`.
 
-```python
-RuntimeConfig(
-    budget=10.0,              # global budget in USD
-    max_agents=1000,          # max total agents
-    max_depth=100,            # max spawn depth
-    max_concurrent_llm=50,    # parallel LLM calls
-    time_limit=0,             # seconds, 0 = unlimited
-    max_turns=200,            # per agent
-    default_model="deepseek-v4-flash",
-    # Truncation (0 = unlimited for any of these)
-    shell_max_output=10000,
-    file_read_max_chars=50000,
-    file_list_max_entries=500,
-    grep_max_results=100,
-    # Context compression
-    compress_keep_recent=6,
-    compress_max_messages=40,
-    compress_max_chars=300,    # 0 = keep full content
-)
-```
+## Security
 
-## Changelog
+NanoMA's shell tool runs with the same permissions as the host process. Use a
+container, virtual machine, or dedicated account for untrusted tasks. Structured
+workspace tools validate paths, but shell commands are not a security boundary.
 
-### v0.9.2
+## Benchmark adapters
 
-- **Redesign: Orthogonal Minimalism** — reduced from 37 tools to 22 by eliminating shell-redundant tools
-- **Core principle**: a tool exists only when shell cannot reliably replicate its interaction model
-- `ws_grep` now uses subprocess (ripgrep → grep → Python fallback) for 10-100x performance
-- `find_block_end` correctly skips braces inside string literals and comments
-- Added Rust and Go symbol patterns to code outline
-- Fixed `batch` meta tool to include workspace tools (was missing `WORKSPACE_TOOLS`)
-- Shell output files use UUID naming (no more hash collisions)
-- `ws_multi_replace` error messages explicitly state file is unchanged on failure
-- Removed: `ws_file_search`, `ws_list_dir`, `ws_project_structure`, `ws_create_directory`, `ws_delete_file`, `ws_rename_file`, `ws_search_symbols`, `ws_list_usages`, `ws_tool_search`, `ws_call_from_file`, skills system (5 tools)
-- Removed: `file_read`, `file_write`, `file_list`, `grep` from basic WORK_TOOLS (superseded by ws_* or shell)
+The GAIA, Draco, and EdgeBench runners remain under `benchmarks/` for
+reproducibility and evaluation. They build on the same runtime but may inject
+benchmark-specific prompts and tools. They are examples of adapters, not the
+primary NanoMA interface.
 
-### v0.9.1
+## License
 
-- Initial release: core runtime, meta tools, 30 presets, trace viewer
-
-## Citation
-
-If you use NanoMA in your research, please cite:
-
-```bibtex
-@software{he2026nanoma,
-  author = {Jiyan He},
-  title = {NanoMA: A Minimal Multi-Agent Harness for Research},
-  year = {2026},
-  url = {https://github.com/volltin/NanoMA}
-}
-```
+MIT. See `LICENSE`.

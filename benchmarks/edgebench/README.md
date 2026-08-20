@@ -1,9 +1,10 @@
-# EdgeBench same-model spawn fork
+# EdgeBench adapter provenance
 
-This branch derives from the NanoMA source and runner used by the most recent
-completed DeepSeek EdgeBench trajectory batches. The three launch scripts stay
-byte-for-byte exact; the runtime and runner are deliberately narrowed so the
-working model's planning decision is the only remaining model-facing spawn path.
+This directory preserves the NanoMA runner used by the most recent completed
+DeepSeek EdgeBench trajectory batches. It is an evaluation adapter, not the
+default NanoMA entry point. Use the repository-level `nanoma` command or
+`nanoma.run_agent` for general tasks. The three launch scripts remain
+byte-for-byte exact for provenance.
 
 ## Provenance
 
@@ -65,8 +66,9 @@ ef19e6f302ee366709f8436c6c32c1d578dc0b8cdc1a2c506af6f6df05a3ebb0  launch_snapsho
 For provenance, the deterministic digest of the unmodified 103-file source
 snapshot in the parent commit is
 `c75e819e90f1b3da55857d9594b1ae3f274af8a13eb627038f6c8bca9e794dd4`.
-The current branch intentionally differs only to isolate same-model spawn
-behavior.
+The recovered runtime was subsequently organized into the general agent API;
+the adapter and immutable launcher snapshots remain here so those benchmark
+results can still be reproduced and audited.
 
 ## Experimental settings captured by the launchers
 

@@ -94,12 +94,12 @@ def _verify(rt, agent, command=SIZE_CHECK, **kw):
 
 def _enable():
     os.environ["NANOMA_MERGE_SUBMIT_PATH"] = "1"
-    os.environ["NANOMA_SPAWN_TODOLIST_JUDGE"] = "1"
+    os.environ["NANOMA_NODE_AUTONOMOUS_PLANNING"] = "1"
 
 
 def _disable():
     os.environ.pop("NANOMA_MERGE_SUBMIT_PATH", None)
-    os.environ.pop("NANOMA_SPAWN_TODOLIST_JUDGE", None)
+    os.environ.pop("NANOMA_NODE_AUTONOMOUS_PLANNING", None)
 
 
 def _fan_out(rt, submit_path, n=2):
@@ -465,11 +465,11 @@ def test_a_slow_judge_cannot_stall_the_ending():
     print("ok: an unresponsive judge is abandoned instead of stalling the run")
 
 
-def test_disabled_by_default():
+def test_can_be_explicitly_disabled():
     os.environ["NANOMA_MERGE_SUBMIT_PATH"] = "1"
-    os.environ.pop("NANOMA_SPAWN_TODOLIST_JUDGE", None)
     with tempfile.TemporaryDirectory() as d:
         rt, submit_path, seen = _mk_runtime(Path(d))
+        rt.config.node_autonomous_planning = False
         (submit_path / "sol.txt").write_text("base\n")
         parent, (a, _) = _fan_out(rt, submit_path)
         (Path(a._merge_copy) / "sol.txt").write_text("from-a\n")
@@ -477,7 +477,7 @@ def test_disabled_by_default():
         assert _run(rt._spawn_judge_at_delivery(a, delivery)) is False
         assert "user" not in seen
     _disable()
-    print("ok: no delivery judging unless the judge is switched on")
+    print("ok: delivery planning can be explicitly switched off")
 
 
 def main():
@@ -497,7 +497,7 @@ def main():
         test_an_agent_finishing_is_told_who_is_still_in_flight,
         test_delivery_survives_the_kill_that_follows_it,
         test_a_slow_judge_cannot_stall_the_ending,
-        test_disabled_by_default,
+        test_can_be_explicitly_disabled,
     ]
     for t in tests:
         t()

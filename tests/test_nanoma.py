@@ -1012,7 +1012,7 @@ async def test_openai_call_passes_top_p(monkeypatch):
 @pytest.mark.asyncio
 async def test_same_model_judge_spawn_and_wait(tmp_workspace, monkeypatch):
     """Planning judge spawns a child; parent waits and receives its result."""
-    monkeypatch.setenv("NANOMA_SPAWN_TODOLIST_JUDGE", "1")
+    monkeypatch.setenv("NANOMA_NODE_AUTONOMOUS_PLANNING", "1")
     turn_count = {"parent": 0, "child": 0}
 
     async def mock_llm(messages, model, tools=None, **kwargs):

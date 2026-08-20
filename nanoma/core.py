@@ -1003,13 +1003,24 @@ class RuntimeConfig:
     disabled_tools: set[str] = field(default_factory=set)
     extra_tools: dict[str, dict[str, Any]] = field(default_factory=dict)
     context_compress_ratio: float = 0.8
-    default_model: str = "deepseek-v4-flash"
+    default_model: str = field(
+        default_factory=lambda: os.environ.get("NANOMA_MODEL", "deepseek-v4-flash")
+    )
     log_dir: Path | None = field(default_factory=lambda: Path("./logs"))
     workspace_root: Path = field(default_factory=lambda: Path("./workspace"))
     workspace_extra_roots: list[Path] = field(default_factory=list)
     shared_dir: str = "shared"
     system_extra_instructions: str = field(
         default_factory=lambda: os.environ.get("NANOMA_SYSTEM_EXTRA_INSTRUCTIONS", "")
+    )
+    node_autonomous_planning: bool = field(
+        default_factory=lambda: _runtime_env_bool(
+            "NANOMA_NODE_AUTONOMOUS_PLANNING",
+            True,
+        )
+    )
+    benchmark_merge_submit_enabled: bool = field(
+        default_factory=lambda: _runtime_env_bool("NANOMA_MERGE_SUBMIT_PATH", False)
     )
     retry: RetryConfig = field(default_factory=RetryConfig)
     # Runtime tool policy: state variables narrow tool availability without
@@ -1424,7 +1435,7 @@ class Runtime:
         self._fixed_last_green_write_seq = 0
         self._fixed_source_writes_in_flight = 0
         self._fixed_source_writes_frozen = False
-        # ── merge-submit-path orchestration (opt-in via NANOMA_MERGE_SUBMIT_PATH) ──
+        # ── benchmark merge-submit orchestration (explicit opt-in) ──
         # When enabled, every spawned child works on a private copy of the shared
         # submit path (workspace_extra_roots[0]); on completion the runtime folds
         # its diff back under a lock and keeps it only if a re-run of the agents'
@@ -4500,18 +4511,8 @@ class Runtime:
     # ─── ReAct loop ──────────────────────────────────────────────────────
 
     async def _agent_loop(self, agent: Agent):
-        from nanoma.meta import META_TOOLS
         # Tool set: shell (universal primitive) + workspace (structured I/O) + meta (coordination)
-        all_tools = {
-            name: tool
-            for name, tool in {
-                **WORK_TOOLS,
-                **WORKSPACE_TOOLS,
-                **META_TOOLS,
-                **self.config.extra_tools,
-            }.items()
-            if name not in self.config.disabled_tools
-        }
+        all_tools = self._all_tools()
         all_tools = self._merge_wrap_submit(agent, all_tools)
 
         try:
@@ -10125,8 +10126,7 @@ class Runtime:
         about cost/budget and to lean toward spawning (speed matters). Returns True
         iff children were spawned. Best-effort: any failure degrades to "no spawn".
         """
-        import os
-        if os.environ.get("NANOMA_SPAWN_TODOLIST_JUDGE") != "1":
+        if not self.config.node_autonomous_planning:
             return False
         remaining_slots = max(0, self.config.max_agents - len(self.agents))
         if remaining_slots <= 0:
@@ -10321,7 +10321,7 @@ class Runtime:
         becomes something the runtime can re-run rather than prose in a message.
         Best-effort: any failure degrades to no spawn.
         """
-        if os.environ.get("NANOMA_SPAWN_TODOLIST_JUDGE") != "1":
+        if not self.config.node_autonomous_planning:
             return False
         if not self._merge_active():
             return False
@@ -10494,8 +10494,7 @@ class Runtime:
     # OOM (copy everything) or unrunnable 12KB stubs (copy only the scope).
 
     def _merge_active(self) -> bool:
-        import os
-        if os.environ.get("NANOMA_MERGE_SUBMIT_PATH") != "1":
+        if not self.config.benchmark_merge_submit_enabled:
             return False
         if self._merge_disabled_reason:
             return False
@@ -13256,14 +13255,14 @@ class Runtime:
         The reminders (Claude-Code-style state re-injection + staleness nudge)
         are transient: appended only to the per-call message list, never to the
         persisted history, so they always reflect current state and do not
-        accumulate in context. Best-effort — if the optimizations package is
-        absent or the tools are disabled, returns agent.history unchanged.
+        accumulate in context. If the planning tools are disabled, returns
+        agent.history unchanged.
         """
         extras: list[str] = []
         tools = self._all_tools()
         if "task_create" in tools:
             try:
-                from optimizations.todo_tools import render_todo_reminder
+                from nanoma.planning import render_todo_reminder
                 reminder = render_todo_reminder(agent, self)
             except Exception:
                 reminder = None
@@ -13286,6 +13285,7 @@ class Runtime:
 
     def _all_tools(self) -> dict[str, dict[str, Any]]:
         from nanoma.meta import META_TOOLS
+        benchmark_only = {"deliveries", "experiments", "verify"}
         return {
             name: tool
             for name, tool in {
@@ -13295,6 +13295,7 @@ class Runtime:
                 **self.config.extra_tools,
             }.items()
             if name not in self.config.disabled_tools
+            and (self.config.benchmark_merge_submit_enabled or name not in benchmark_only)
         }
 
     def _execute_rebirth(self, agent: Agent):
@@ -14321,10 +14322,23 @@ class Runtime:
 {web_search_line}
 """
 
-        coordination_tools = {"spawn", "send", "deliver_to_parent", "wait", "query", "kill", "transfer", "set_bio"}
+        coordination_tools = {
+            "task_create", "send", "deliver_to_parent", "wait", "query", "kill",
+            "transfer", "set_bio",
+        }
         has_coordination_tools = bool(coordination_tools - self.config.disabled_tools)
         if has_coordination_tools:
-            meta_line = "- meta tools: coordination (spawn, send, deliver_to_parent, wait, query, kill, transfer, etc.)"
+            planning = (
+                "task_create (dynamic same-model delegation), "
+                if self.config.node_autonomous_planning and "task_create" not in self.config.disabled_tools
+                else "task_create (local planning only), "
+            )
+            meta_line = (
+                "- meta tools: per-node planning and coordination ("
+                + planning
+                + "send, deliver_to_parent, wait, query, kill, transfer, etc.). "
+                "Child creation is an internal runtime action; do not invent direct spawn calls."
+            )
         else:
             meta_line = "- meta tools: single-agent lifecycle and deliverables (get_cost, set_status, rebirth, submit, batch)"
 
@@ -14500,6 +14514,12 @@ When available, tools are organized in 3 layers:
                 "total_tokens_with_supervisor": total_tokens + self._supervisor_tokens,
                 "total_cost_usd_with_supervisor": round(cost + self._supervisor_cost, 4),
                 "tokens_per_dollar": int(tokens_per_dollar),
+            },
+            "planning": {
+                "node_autonomous_planning": self.config.node_autonomous_planning,
+                "model_route": "same_as_working_node",
+                "direct_spawn_tools_exposed": False,
+                "benchmark_merge_submit_enabled": self.config.benchmark_merge_submit_enabled,
             },
             "supervisor": {
                 "enabled": self.config.supervisor_enabled,

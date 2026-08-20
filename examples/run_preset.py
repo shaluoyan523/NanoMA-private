@@ -45,6 +45,13 @@ async def main():
         past_header = True
         prompt_lines.append(line)
     prompt = "\n".join(prompt_lines).strip().replace("{task}", args.task)
+    prompt = (
+        "[Compatibility note] This topology description may use the legacy word "
+        "'spawn'. Direct spawn tools are not model-facing in this NanoMA version. "
+        "Translate each requested delegation point into a task_create planning step; "
+        "the runtime and your current model decide the actual child split.\n\n"
+        + prompt
+    )
 
     # Setup workspace
     workspace = Path("./workspace")

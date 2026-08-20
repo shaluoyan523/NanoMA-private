@@ -1,8 +1,9 @@
 """
-Example: 3-Layer Hierarchical Architecture
+Example: an autonomously formed hierarchy
 
-Demonstrates a fixed topology: 1 architect → 3 managers → 5 workers each = 19 agents.
-This shows how NanoMA can implement rigid organizational structures via prompt alone.
+Every node can reach a planning point and create another level through the
+runtime's same-model planning decision. The final topology is observed rather
+than prescribed by direct spawn calls.
 
 Usage:
     python examples/hierarchical.py
@@ -18,35 +19,14 @@ import shutil
 sys.path.insert(0, str(Path(__file__).parent.parent))
 from nanoma.core import Runtime, RuntimeConfig
 
-TASK = """You are the TOP-LEVEL ARCHITECT. Build a Shopping Mall E-Commerce app.
+TASK = """Build a small Shopping Mall E-Commerce application with frontend,
+backend, infrastructure, tests, and an architecture document.
 
-You manage exactly 3 SUB-MANAGERS. Each sub-manager manages exactly 5 WORKERS.
-
-1. spawn() FRONTEND MANAGER: "You are the FRONTEND MANAGER. Spawn 5 workers:
-   W1: product listing page (shared/frontend/products.py)
-   W2: shopping cart (shared/frontend/cart.py)
-   W3: auth pages (shared/frontend/auth.py)
-   W4: checkout flow (shared/frontend/checkout.py)
-   W5: order history (shared/frontend/orders.py)
-   wait() for all, write shared/frontend/README.md, set_status('done')."
-
-2. spawn() BACKEND MANAGER: "You are the BACKEND MANAGER. Spawn 5 workers:
-   W1: product API (shared/backend/api_products.py)
-   W2: cart API (shared/backend/api_cart.py)
-   W3: order API (shared/backend/api_orders.py)
-   W4: auth API (shared/backend/api_auth.py)
-   W5: payment module (shared/backend/payment.py)
-   wait() for all, write shared/backend/README.md, set_status('done')."
-
-3. spawn() INFRA MANAGER: "You are the INFRA MANAGER. Spawn 5 workers:
-   W1: database models (shared/infra/models.py)
-   W2: Dockerfile + docker-compose (shared/infra/Dockerfile, shared/infra/docker-compose.yml)
-   W3: CI/CD pipeline (shared/infra/ci.yml)
-   W4: nginx config (shared/infra/nginx.conf)
-   W5: env config (shared/infra/config.py)
-   wait() for all, write shared/infra/README.md, set_status('done')."
-
-Process: spawn all 3 managers → wait() → read READMEs → write shared/ARCHITECTURE.md → submit → done.
+At each genuinely multi-step phase, use task_create to make the next planning
+decision. Parallelize independent implementation and verification work when it
+helps. Any child may further decompose its own assignment. Coordinate results,
+run the relevant tests, write the final architecture document, submit the main
+artifact, and finish with a concise result.
 """
 
 
@@ -91,7 +71,7 @@ async def main():
     rt = Runtime(config=config, on_event=on_event)
 
     print("=" * 60)
-    print("  3-Layer Hierarchy: 1 + 3 + 15 = 19 agents")
+    print("  Autonomous hierarchy: topology formed by per-node planning")
     print("=" * 60)
     result = await rt.run(TASK)
     print("=" * 60)

@@ -14,7 +14,7 @@
    (e.g., `ws_replace_string` — 4-tier matching cascade is impossible in sed)
 
 3. **Coordination** — The operation requires access to runtime internals (other agents, budgets, queues).
-   (e.g., `spawn`, `send`, `wait` — these operate on the runtime graph, not the filesystem)
+   (e.g., `task_create`, `send`, `wait` — these operate on runtime state, not the filesystem)
 
 ### Elimination Criterion
 
@@ -32,9 +32,12 @@ Fewer tools → less deliberation overhead → faster, cheaper, more reliable de
 ## Tool Architecture (3 Layers)
 
 ```
-Layer 3: META (12 tools)
-  Coordination primitives operating on runtime internals.
-  spawn, kill, send, query, wait, transfer, set_bio, get_cost, set_status, rebirth, submit, batch
+Layer 3: META (15 model-facing core tools)
+  Per-node planning, coordination, lifecycle, and artifacts.
+  task_create, task_update, task_list, kill, send, deliver_to_parent, query,
+  wait, transfer, set_bio, get_cost, set_status, rebirth, submit, batch
+
+  Child creation is internal. The model does not receive spawn/spawn_many.
 
 Layer 2: WORKSPACE (9 tools)
   Structured operations where shell fails at reliability/atomicity.
@@ -76,22 +79,25 @@ tree -L 3                 # was: ws_project_structure
 
 ## Multi-Agent Coordination Design
 
-The 12 meta tools implement **uniform infrastructure** — every agent has identical capabilities.
-The orchestration pattern emerges entirely from the task prompt.
+The meta tools implement **uniform node infrastructure** — every node has the
+same planning and coordination capabilities. The topology emerges from planning
+decisions made at the nodes, not from a benchmark script or a central planner.
 
 ### Composability Examples
 
 | Pattern | Composition |
 |---------|-------------|
-| Orchestrator-Workers | `spawn` × N → `wait(mode="all")` → aggregate |
-| Map-Reduce | `spawn` × N → `wait(mode="all")` → `transfer` → reduce |
-| Streaming Pipeline | `spawn` → `send(mode="steer")` chain |
-| Debate/Tournament | `spawn` × N → `query(messages=N)` → judge → `kill` losers |
+| Orchestrator-Workers | planning split → children → `wait(mode="all")` → aggregate |
+| Map-Reduce | planning split → parallel map nodes → `wait` → reduce |
+| Streaming Pipeline | successive planning nodes → `send(mode="steer")` chain |
+| Debate/Tournament | method-portfolio split → `query(messages=N)` → compare → `kill` losers |
 | Event-Driven Service | `set_status("idle")` → `send` wakes → process → `set_status("idle")` |
-| Hierarchical Delegation | `spawn(delegate=True)` cascading |
-| Iterative Refinement | `spawn` → `wait` → evaluate → `send` feedback → repeat |
+| Hierarchical Delegation | a child reaches `task_create` and makes another split |
+| Iterative Refinement | planning split → `wait` → evaluate → `send` feedback → repeat |
 
 ### Key Insight
 
-12 primitives × free composition = unbounded topologies.
-No framework code needed — the prompt IS the orchestration logic.
+One recursively available planning unit plus coordination primitives can form
+many dynamic topologies. The prompt supplies the task intent; each node decides
+how its next phase should be structured, while the runtime enforces the actual
+child-creation boundary.

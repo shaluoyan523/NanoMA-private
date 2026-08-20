@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Experiment: "spawn decided by the worker model at the todolist node".
-#   - NANOMA_SPAWN_TODOLIST_JUDGE=1: raw spawn AND task_spawn are removed from the
+#   - NANOMA_NODE_AUTONOMOUS_PLANNING=1: raw spawn AND task_spawn are removed from the
 #     worker. When the worker creates pending tasks (the planning node), the
 #     runtime makes ONE call with that same model to decide whether
 #     to parallelize and how to split subagent tasks, then spawns children itself.
@@ -19,7 +19,7 @@ if [[ -f .env ]]; then
   set +a
 fi
 
-export NANOMA_SPAWN_TODOLIST_JUDGE=1
+export NANOMA_NODE_AUTONOMOUS_PLANNING=1
 
 RUN_ID="${1:-gaia10_spawn_judge_$(date +%Y%m%d-%H%M%S)}"
 BASE_DIR="$ROOT/runs/$RUN_ID"

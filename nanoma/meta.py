@@ -1201,13 +1201,11 @@ META_TOOLS: dict[str, dict[str, Any]] = {
 }
 
 
-# ─── Optional add-on tools (optimizations/) ──────────────────────────────────
-# TODO-list / task tracking tools live in the top-level `optimizations` package
-# so they can be developed and reviewed separately from core. They register the
-# same way as built-in meta tools (is_meta handlers) and therefore flow through
-# every `_all_tools()` merge site automatically. Registration is best-effort:
-# if the optimizations package is absent (e.g. a trimmed install), core is
-# unaffected. Disable via RuntimeConfig.disabled_tools = {"task_create", ...}.
+# ─── Planning and optional add-on tools ──────────────────────────────────────
+# Per-node planning is a built-in NanoMA capability and is always available in
+# installed packages. Evaluation-oriented verification and delivery helpers
+# remain optional add-ons. Any of them can be disabled with
+# RuntimeConfig.disabled_tools.
 
 def _register_optimization_tools() -> None:
     import os
@@ -1216,8 +1214,12 @@ def _register_optimization_tools() -> None:
     repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     if repo_root not in sys.path:
         sys.path.insert(0, repo_root)
+    from nanoma.planning import TODO_TOOLS
+
+    for name, tool in TODO_TOOLS.items():
+        META_TOOLS.setdefault(name, tool)
+
     for module, attribute in (
-        ("optimizations.todo_tools", "TODO_TOOLS"),
         ("optimizations.verify_tool", "VERIFY_TOOLS"),
         ("optimizations.experiment_ledger", "LEDGER_TOOLS"),
         ("optimizations.merge_submit", "DELIVERY_TOOLS"),
