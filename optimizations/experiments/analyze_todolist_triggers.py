@@ -43,7 +43,7 @@ def analyze_task(events_path: Path) -> dict:
     turn = 0
     first_create_turn = None
     first_spawn_turn = None
-    counts = {"task_create": 0, "task_update": 0, "task_list": 0, "task_spawn": 0}
+    counts = {"task_create": 0, "task_update": 0, "task_list": 0}
     reminders = 0
     children = 0
     create_turns: list[int] = []
@@ -60,16 +60,15 @@ def analyze_task(events_path: Path) -> dict:
                         create_turns.append(turn)
                         if first_create_turn is None:
                             first_create_turn = turn
-                    elif call == "task_spawn":
-                        spawn_turns.append(turn)
-                        if first_spawn_turn is None:
-                            first_spawn_turn = turn
         elif name == "todo_reminder_injected":
             reminders += 1
-        elif name in ("spawn", "spawn_many"):
-            # actual child creations (task_spawn also emits its own event; count
-            # the inner spawn only, to avoid double counting delegations)
+        elif name == "spawn":
+            # DeepSeek judge decisions create children through internal
+            # meta_spawn, which emits the durable topology event.
             children += 1
+            spawn_turns.append(turn)
+            if first_spawn_turn is None:
+                first_spawn_turn = turn
         elif name in ("done", "failed"):
             status = (ev.get("data", {}) or {}).get("status", name)
     return {
@@ -109,11 +108,11 @@ def main() -> int:
                 pass
 
     header = (f"{'task_id':38} {'turns':>5} {'1stTC':>5} {'1stSP':>5} "
-              f"{'TC':>3} {'TU':>3} {'SP':>3} {'kids':>4} {'remind':>6} {'pass':>4}")
+              f"{'TC':>3} {'TU':>3} {'kids':>4} {'remind':>6} {'pass':>4}")
     print(header)
     print("-" * len(header))
     agg = {"turns": 0, "task_create": 0, "task_update": 0, "task_list": 0,
-           "task_spawn": 0, "children": 0, "reminders": 0}
+           "children": 0, "reminders": 0}
     used_todolist = 0
     used_spawn = 0
     passed = 0
@@ -128,24 +127,24 @@ def main() -> int:
         first = a["first_create_turn"] if a["first_create_turn"] is not None else "-"
         firstsp = a["first_spawn_turn"] if a["first_spawn_turn"] is not None else "-"
         print(f"{tid:38} {a['turns']:>5} {str(first):>5} {str(firstsp):>5} {a['task_create']:>3} "
-              f"{a['task_update']:>3} {a['task_spawn']:>3} {a['children']:>4} {a['reminders']:>6} {ptxt:>4}")
+              f"{a['task_update']:>3} {a['children']:>4} {a['reminders']:>6} {ptxt:>4}")
         for k in agg:
             agg[k] += a[k]
         if a["task_create"] > 0:
             used_todolist += 1
-        if a["task_spawn"] > 0:
+        if a["children"] > 0:
             used_spawn += 1
 
     n = len(task_dirs)
     print("-" * len(header))
     print(f"tasks={n} | used_todolist={used_todolist} ({100*used_todolist/n:.0f}%) | "
-          f"used_task_spawn={used_spawn} ({100*used_spawn/n:.0f}%) | passed={passed}")
+          f"used_judge_spawn={used_spawn} ({100*used_spawn/n:.0f}%) | passed={passed}")
     print(f"totals: turns={agg['turns']} task_create={agg['task_create']} "
-          f"task_update={agg['task_update']} task_spawn={agg['task_spawn']} "
+          f"task_update={agg['task_update']} "
           f"children={agg['children']} reminders={agg['reminders']}")
     if agg["turns"]:
         print(f"task_create per 100 turns = {100*agg['task_create']/agg['turns']:.1f} | "
-              f"task_spawn per 100 turns = {100*agg['task_spawn']/agg['turns']:.1f}")
+              f"judge-created children per 100 turns = {100*agg['children']/agg['turns']:.1f}")
     return 0
 
 

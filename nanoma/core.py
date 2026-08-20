@@ -83,7 +83,7 @@ ToolPolicyMode = Literal["off", "adaptive", "enforce"]
 ShellCapability = Literal["web", "python", "fs", "process", "package", "system", "unknown"]
 
 _CREATE_TOOLS = {"spawn", "spawn_many"}
-_COORDINATION_TOOLS = {"send", "deliver_to_parent", "wait", "query", "kill", "transfer", "set_bio", "task_spawn"}
+_COORDINATION_TOOLS = {"send", "deliver_to_parent", "wait", "query", "kill", "transfer", "set_bio"}
 # Above this size a merge diff compares size+mtime instead of hashing contents.
 _MERGE_HASH_MAX_BYTES = 8 * 1024 * 1024
 # At or above this size a file is hardlinked into a child's working copy instead
@@ -10069,6 +10069,22 @@ class Runtime:
             "subagents": clean_subs,
         }
 
+    def _deepseek_spawn_judge_model(self, agent_id: str) -> str | None:
+        """Resolve the judge route and reject non-DeepSeek spawn decisions."""
+        model = str(
+            os.environ.get("NANOMA_SPAWN_JUDGE_MODEL")
+            or self.config.default_model
+            or ""
+        ).strip()
+        if "deepseek" in model.lower():
+            return model
+        self._emit(agent_id, "spawn_judge_error", {
+            "stage": "model_validation",
+            "model": model,
+            "detail": "DeepSeek spawn-only branch requires a DeepSeek judge model",
+        })
+        return None
+
     def _render_history_for_judge(self, agent: "Agent", max_chars: int = 48000) -> str:
         """Serialize the parent agent's working context (exactly what IT sees).
 
@@ -10110,7 +10126,7 @@ class Runtime:
         return text
 
     async def _spawn_judge_at_plan(self, agent: Agent, plan_hint: str = "") -> bool:
-        """At a fresh planning moment, let an Opus judge decide whether to spawn.
+        """At a fresh planning moment, let DeepSeek decide whether to spawn.
 
         Called from `meta_task_create` BEFORE any todolist is materialized, so the
         list is only ever created on the no-spawn path (decide first, plan second).
@@ -10148,7 +10164,9 @@ class Runtime:
         ]
         if active_children:
             return False
-        judge_model = os.environ.get("NANOMA_SPAWN_JUDGE_MODEL", "claude-opus-4-8")
+        judge_model = self._deepseek_spawn_judge_model(agent.id)
+        if not judge_model:
+            return False
 
         context_text = self._render_history_for_judge(agent)
         sys_msg = (
@@ -10235,7 +10253,10 @@ class Runtime:
                 f"for the last N). Pull what you need instead of restating."
             )
             try:
-                result = await self._invoke_meta_spawn({"task": child_task}, agent)
+                result = await self._invoke_meta_spawn(
+                    {"task": child_task, "model": judge_model},
+                    agent,
+                )
             except Exception as exc:
                 self._emit(agent.id, "spawn_judge_error", {"stage": "spawn", "detail": str(exc)[:300]})
                 break
@@ -10340,7 +10361,9 @@ class Runtime:
             })
             return False
 
-        judge_model = os.environ.get("NANOMA_SPAWN_JUDGE_MODEL", "claude-opus-4-8")
+        judge_model = self._deepseek_spawn_judge_model(delivered.id)
+        if not judge_model:
+            return False
         report = self._delivery_orchestration_report(parent, delivered)
         sys_msg = (
             "You are the orchestration judge for a multi-agent engineering system. A "
@@ -10426,7 +10449,10 @@ class Runtime:
                 "you — getting it to run reliably is worth more than a verdict in prose."
             )
             try:
-                result = await self._invoke_meta_spawn({"task": task}, parent)
+                result = await self._invoke_meta_spawn(
+                    {"task": task, "model": judge_model},
+                    parent,
+                )
             except Exception as exc:
                 self._emit(delivered.id, "spawn_judge_error", {
                     "stage": "delivery_spawn", "detail": str(exc)[:300],
@@ -12020,7 +12046,7 @@ class Runtime:
         except Exception as exc:
             self._emit(agent.id, "merge_promote_error", {"detail": str(exc)[:300]})
         if agent.status == "killed" or self._delivery_judging_closed:
-            # The judge costs an Opus round-trip and can only pay off while there
+            # The judge costs a DeepSeek round-trip and can only pay off while there
             # is still time to act on it.
             return
         try:
@@ -13158,57 +13184,30 @@ class Runtime:
         return out
 
     def _apply_spawn_todolist_gate(self, agent, turn_tools, tool_policy):
-        """Fold spawn into the todolist timing.
+        """Keep the DeepSeek judge as the only model-facing spawn path.
 
-        Modes (env, opt-in; no-op otherwise):
-          * NANOMA_SPAWN_TODOLIST_GATE=1  -> raw `spawn`/`spawn_many` removed; the
-            agent may delegate via `task_spawn`, but ONLY while it has a pending
-            task (the "planning node"). Outside that window task_spawn is removed.
-          * NANOMA_SPAWN_TODOLIST_JUDGE=1 -> raw spawn AND `task_spawn` are removed
-            from the agent entirely. The decision of whether to spawn and how to
-            split subagent tasks is made by an out-of-band Opus judge call
-            (`_spawn_judge_at_plan`, invoked from `meta_task_create` before the
-            todolist is materialized) and applied by the runtime; the agent
-            itself never issues a spawn.
+        Direct `spawn`, `spawn_many`, and `task_spawn` calls belong to the Luna
+        path and are never offered by this branch. At a `task_create` planning
+        node the out-of-band DeepSeek judge may call the internal `meta_spawn`
+        execution primitive through `_spawn_judge_at_plan`.
 
         Only ever removes tools (never adds), so it is safe to run after the
-        state-based scoping passes. Best-effort.
+        state-based scoping passes.
         """
-        import os
-
-        judge = os.environ.get("NANOMA_SPAWN_TODOLIST_JUDGE") == "1"
-        gate = os.environ.get("NANOMA_SPAWN_TODOLIST_GATE") == "1"
-        if not (gate or judge):
-            return turn_tools, tool_policy
-
         removed: list[str] = []
         gated = dict(turn_tools)
-        for raw in ("spawn", "spawn_many"):
+        for raw in ("spawn", "spawn_many", "task_spawn"):
             if raw in gated:
                 gated.pop(raw, None)
                 removed.append(raw)
-
-        if "task_spawn" in gated:
-            if judge:
-                # The runtime (via the Opus judge) owns spawning in judge mode.
-                gated.pop("task_spawn", None)
-                removed.append("task_spawn")
-            else:
-                try:
-                    from optimizations.todo_tools import spawn_window_open
-                    window_open = spawn_window_open(agent)
-                except Exception:
-                    window_open = True  # fail open: keep task_spawn available
-                if not window_open:
-                    gated.pop("task_spawn", None)
-                    removed.append("task_spawn")
 
         if removed:
             try:
                 existing = list(getattr(tool_policy, "removed_tools", []) or [])
                 tool_policy.removed_tools = sorted(set(existing) | set(removed))
                 base = getattr(tool_policy, "reason", "") or ""
-                tool_policy.reason = f"{base},spawn_todolist_gate" if base else "spawn_todolist_gate"
+                reason = "deepseek_spawn_judge_only"
+                tool_policy.reason = f"{base},{reason}" if base else reason
                 tool_policy.scoped_tools = list(gated)
             except Exception:
                 pass

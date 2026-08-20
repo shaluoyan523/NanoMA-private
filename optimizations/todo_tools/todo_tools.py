@@ -1,11 +1,9 @@
-"""Claude-Code-style TODO-list meta tools for NanoMA.
+"""DeepSeek planning-list meta tools for NanoMA.
 
-NanoMA historically has no in-session task list: work is decomposed by spawning
-real child agents (`spawn`) and tracked on the agent graph. Some benchmarks
-(and some models) benefit from the lighter-weight Claude-Code "Tasks API"
-pattern — a per-agent structured checklist the model maintains itself to plan
-multi-step work and demonstrate progress, *without* paying the cost of spawning
-a full agent per step.
+The DeepSeek spawn path does not expose direct spawn tools to the worker model.
+Instead, the worker maintains a per-agent task list. At a fresh planning node,
+`task_create` asks an out-of-band DeepSeek judge whether the next phase should
+fan out; the runtime creates children only when that judge approves.
 
 This module adds three coordination meta tools that mirror Claude Code's
 `TaskCreate` / `TaskUpdate` / `TaskList`, adapted to NanoMA conventions:
@@ -16,7 +14,7 @@ This module adds three coordination meta tools that mirror Claude Code's
 
 Design notes
 ------------
-* Naming: NanoMA tools are snake_case (`spawn`, `set_bio`, `ws_read_file`), so
+* Naming: NanoMA tools are snake_case (`task_create`, `set_bio`, `ws_read_file`), so
   these use `task_create` etc. rather than CamelCase `TaskCreate`. The tool
   *descriptions* keep Claude's "When to Use / When NOT to Use" policy text,
   because our log analysis showed that description text — not any runtime
@@ -24,10 +22,9 @@ Design notes
 * State: the list lives on the Agent instance as `agent._todos` (a list of
   dicts) plus `agent._todo_seq` (an int counter). Agent is a plain dataclass
   without __slots__, so attaching these lazily needs no core edit. State is
-  per-agent, matching Claude's per-session semantics; child agents spawned via
-  `spawn` start with an empty list.
+  per-agent; judge-created children start with an empty list.
 * These are `is_meta` tools: handlers receive (args, agent, runtime) and may
-  emit viewer events via `runtime._emit`, exactly like `send`/`spawn`.
+  emit viewer events via `runtime._emit`, exactly like `send`.
 """
 
 from __future__ import annotations
@@ -68,18 +65,6 @@ def _next_id(agent: "Agent") -> int:
 def _mark_mutated(agent: "Agent") -> None:
     """Record the agent turn at which the task list last changed (for staleness)."""
     setattr(agent, "_todo_last_mutation_turn", int(getattr(agent, "_turns", 0) or 0))
-
-
-def spawn_window_open(agent: "Agent") -> bool:
-    """True iff there is at least one pending (unassigned) task to delegate.
-
-    This is the ONLY condition under which spawn / task_spawn should be offered:
-    delegation is a per-task decision made right after planning. Outside this
-    window (no pending tasks) spawn is not considered at all — which is exactly
-    the "spawn folded into the todolist timing" contract. Used by the runtime
-    gate (`Runtime._apply_spawn_todolist_gate`).
-    """
-    return any(t.get("status") == "pending" for t in _todos(agent))
 
 
 def _find(agent: "Agent", task_id: Any) -> dict[str, Any] | None:
@@ -125,10 +110,10 @@ async def meta_task_create(
     if not subject:
         return {"error": "'subject' required (a brief, actionable title in imperative form)"}
 
-    # Spawn-judge hook (JUDGE mode only): at a fresh planning moment, decide
+    # DeepSeek spawn-judge hook: at a fresh planning moment, decide
     # whether to fan this next phase out to parallel children BEFORE materializing
     # the todolist — so the list is only ever created on the no-spawn path
-    # (decide first, plan second). The judge (Opus) sees the parent's full context
+    # (decide first, plan second). The DeepSeek judge sees the parent's full context
     # and owns the split; on spawn we suppress local task creation entirely.
     import os
     if os.environ.get("NANOMA_SPAWN_TODOLIST_JUDGE") == "1":
@@ -249,74 +234,6 @@ async def meta_task_update(
     }
 
 
-async def meta_task_spawn(
-    args: dict[str, Any], agent: "Agent", runtime: "Runtime"
-) -> dict[str, Any]:
-    """Delegate one pending task to a child agent (spawn folded into the list).
-
-    Reuses the core `spawn` handler for all resource/policy checks, then binds
-    the resulting child to the task: the task goes to `in_progress` and records
-    its `child_id`. The task is auto-marked `completed` when the child finishes
-    (reflected read-only in the per-turn reminder; task lists are never shared
-    between agents).
-    """
-    if "task_id" not in args and "id" not in args:
-        return {"error": "'task_id' required (the pending task to delegate)"}
-    task_id = args.get("task_id", args.get("id"))
-    todo = _find(agent, task_id)
-    if todo is None:
-        return {"error": f"task_id {task_id!r} not found", "task_list": _render(agent)}
-    if todo["status"] != "pending":
-        return {
-            "error": f"task {todo['id']} is '{todo['status']}'; only 'pending' tasks can be delegated",
-            "task": {"id": todo["id"], "status": todo["status"], "subject": todo["subject"]},
-        }
-
-    # Seed the child from the task itself — no need to restate context.
-    subject = todo.get("subject", "")
-    description = todo.get("description", "")
-    child_task = subject if not description else f"{subject}\n\n{description}"
-
-    try:
-        from nanoma.meta import meta_spawn
-    except Exception as exc:  # pragma: no cover - core always present at runtime
-        return {"error": f"spawn unavailable: {exc}"}
-
-    spawn_args: dict[str, Any] = {"task": child_task}
-    model = args.get("model")
-    if model:
-        spawn_args["model"] = model
-
-    result = await meta_spawn(spawn_args, agent, runtime)
-    if not isinstance(result, dict) or result.get("error"):
-        return result if isinstance(result, dict) else {"error": "spawn failed"}
-
-    child_id = result.get("agent_id")
-    todo["status"] = "in_progress"
-    todo["child_id"] = child_id
-    todo["delegated"] = True
-    _mark_mutated(agent)
-
-    try:
-        runtime._emit(agent.id, "task_spawn", {
-            "task_id": todo["id"],
-            "subject": subject,
-            "child": child_id,
-            "model": result.get("model"),
-            "counts": _counts(agent),
-        })
-    except Exception:
-        pass
-
-    return {
-        "task_id": todo["id"],
-        "delegated_to": child_id,
-        "model": result.get("model"),
-        "status": "in_progress",
-        "counts": _counts(agent),
-    }
-
-
 async def meta_task_list(
     args: dict[str, Any], agent: "Agent", runtime: "Runtime"
 ) -> dict[str, Any]:
@@ -424,20 +341,6 @@ def render_todo_reminder(agent: "Agent", runtime: "Runtime | None" = None) -> st
         + f"\nProgress: {done} completed / {len(todos)} total."
     )
 
-    # When spawn is folded into the todolist (choice mode), remind the model that
-    # each pending task can be either self-executed or delegated — but only now.
-    # In judge mode the runtime/Opus owns delegation, so no such hint is shown.
-    import os
-    has_pending = any(t["status"] == "pending" for t in todos)
-    judge_on = os.environ.get("NANOMA_SPAWN_TODOLIST_JUDGE") == "1"
-    gate_on = os.environ.get("NANOMA_SPAWN_TODOLIST_GATE") == "1"
-    if has_pending and gate_on and not judge_on:
-        body += (
-            "\nFor each pending task, either start it yourself (task_update -> "
-            "in_progress) or delegate it with task_spawn(task_id) to run it as a "
-            "parallel child agent. task_spawn is available only while tasks are pending."
-        )
-
     last_mut = int(getattr(agent, "_todo_last_mutation_turn", 0) or 0)
     idle_turns = current_turn - last_mut
     if last_mut and idle_turns >= stale_after:
@@ -470,8 +373,9 @@ _TASK_CREATE_DESC = (
     "- A single, straightforward task, or work completable in <3 trivial steps.\n"
     "- Purely conversational or informational requests.\n"
     "In those cases just do the work directly instead of tracking it.\n\n"
-    "Note: this task list is a lightweight self-checklist for THIS agent. To run "
-    "independent work units in parallel or delegate, use `spawn` instead."
+    "Note: this task list is a lightweight self-checklist for THIS agent. At a "
+    "fresh task_create planning node, the DeepSeek spawn judge decides whether "
+    "independent work should be delegated to parallel children."
 )
 
 _TASK_UPDATE_DESC = (
@@ -485,29 +389,6 @@ _TASK_LIST_DESC = (
     "Optionally filter by `status`. Check this before creating tasks to avoid "
     "duplicates and to decide what to work on next."
 )
-
-# The first sentence below is Claude/NanoMA's original `spawn` tool description,
-# kept verbatim so the delegation mental model is preserved even though the raw
-# `spawn` tool is (temporarily) removed. The rest binds it to the task list.
-_TASK_SPAWN_DESC = (
-    "Delegate one PENDING task from your task list to a child agent. "
-    "Create a new agent that starts immediately and runs in parallel. The child "
-    "agent gets its own workspace, fresh context, and the same tools. It cannot "
-    "see your conversation history — the task's subject and description are passed "
-    "as its complete assignment, so make sure the task text is self-contained. "
-    "You become its parent and receive a notification when it finishes; the task "
-    "is set to in_progress and auto-marked completed when the child is done.\n\n"
-    "## When to Use\n"
-    "- A pending task is independent, parallelizable, or heavy enough to warrant "
-    "its own agent.\n"
-    "- You are at a planning moment (you just created tasks and want to fan some out).\n\n"
-    "## When NOT to Use\n"
-    "- Sequential or dependent steps you should just do yourself — keep those on "
-    "your own list and execute them.\n"
-    "Availability: this tool is offered ONLY while you have pending tasks. Outside "
-    "that window, do the work yourself."
-)
-
 
 # ─── Registry ────────────────────────────────────────────────────────────────
 
@@ -538,13 +419,5 @@ TODO_TOOLS: dict[str, dict[str, Any]] = {
         "parameters": {"type": "object", "properties": {
             "status": {"type": "string", "enum": list(VALID_STATUSES), "description": "Optional: only return tasks with this status."},
         }},
-    }}},
-    "task_spawn": {"handler": meta_task_spawn, "is_meta": True, "schema": {"type": "function", "function": {
-        "name": "task_spawn",
-        "description": _TASK_SPAWN_DESC,
-        "parameters": {"type": "object", "properties": {
-            "task_id": {"type": "integer", "description": "The id of the PENDING task to delegate (from task_create/task_list)."},
-            "model": {"type": "string", "description": "LLM model override for the child (omit to use default)."},
-        }, "required": ["task_id"]},
     }}},
 }

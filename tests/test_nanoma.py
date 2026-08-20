@@ -123,8 +123,8 @@ async def test_zero_max_turns_disables_turn_limit(tmp_workspace):
 
 
 @pytest.mark.asyncio
-async def test_state_tool_policy_keeps_spawn_available_for_neutral_root(tmp_workspace):
-    """A neutral root agent can still create subagents."""
+async def test_deepseek_worker_does_not_receive_direct_spawn(tmp_workspace):
+    """DeepSeek delegates only through the out-of-band planning judge."""
     captured = {}
 
     async def mock_llm(messages, model, tools=None, **kwargs):
@@ -138,7 +138,10 @@ async def test_state_tool_policy_keeps_spawn_available_for_neutral_root(tmp_work
     rt = Runtime(config=config, llm_call=mock_llm)
     result = await rt.run("Solve a generic task")
     assert result == "finished"
-    assert "spawn" in captured["tools"]
+    assert "spawn" not in captured["tools"]
+    assert "spawn_many" not in captured["tools"]
+    assert "task_spawn" not in captured["tools"]
+    assert "task_create" in captured["tools"]
 
 
 @pytest.mark.asyncio
@@ -1007,11 +1010,21 @@ async def test_openai_call_passes_top_p(monkeypatch):
 # ─── Test: Full integration (spawn + message + wait) ─────────────────────────
 
 @pytest.mark.asyncio
-async def test_spawn_and_wait(tmp_workspace):
-    """Parent spawns child, child finishes, parent gets result."""
+async def test_deepseek_judge_spawn_and_wait(tmp_workspace, monkeypatch):
+    """Planning judge spawns a child; parent waits and receives its result."""
+    monkeypatch.setenv("NANOMA_SPAWN_TODOLIST_JUDGE", "1")
     turn_count = {"parent": 0, "child": 0}
 
     async def mock_llm(messages, model, tools=None, **kwargs):
+        if tools is None:
+            return LLMResponse(
+                content=(
+                    '{"spawn":true,"reasoning":"parallel child useful",'
+                    '"subagents":[{"subject":"child task","role":"worker",'
+                    '"task":"child task"}]}'
+                ),
+                usage=UsageRecord(input_tokens=50, output_tokens=30, model=model),
+            )
         # Detect if this is a child (task contains "child")
         system = messages[0]["content"] if messages else ""
         if "child task" in system:
@@ -1024,7 +1037,11 @@ async def test_spawn_and_wait(tmp_workspace):
             turn_count["parent"] += 1
             if turn_count["parent"] == 1:
                 return LLMResponse(
-                    tool_calls=[ToolCall(id="p1", name="spawn", arguments={"task": "child task"})],
+                    tool_calls=[ToolCall(
+                        id="p1",
+                        name="task_create",
+                        arguments={"subject": "child task"},
+                    )],
                     usage=UsageRecord(input_tokens=100, output_tokens=50, model=model),
                 )
             elif turn_count["parent"] == 2:

@@ -1,4 +1,4 @@
-"""Claude-Code-style TODO-list meta tools for NanoMA.
+"""DeepSeek planning-list meta tools for NanoMA.
 
 Exports ``TODO_TOOLS`` — a tool-registry dict (same shape as ``META_TOOLS``)
 that can be merged into NanoMA's tool library or injected via
@@ -13,9 +13,7 @@ from optimizations.todo_tools.todo_tools import (
     meta_task_create,
     meta_task_update,
     meta_task_list,
-    meta_task_spawn,
     render_todo_reminder,
-    spawn_window_open,
 )
 
 __all__ = [
@@ -24,7 +22,5 @@ __all__ = [
     "meta_task_create",
     "meta_task_update",
     "meta_task_list",
-    "meta_task_spawn",
     "render_todo_reminder",
-    "spawn_window_open",
 ]

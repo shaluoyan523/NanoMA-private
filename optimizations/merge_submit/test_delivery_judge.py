@@ -48,7 +48,8 @@ def _mk_runtime(tmp: Path, judge_reply: str = SPAWN_YES):
     submit_path.mkdir(parents=True, exist_ok=True)
     workspace_root.mkdir(parents=True, exist_ok=True)
     config = RuntimeConfig(
-        max_agents=16, max_depth=3, default_model="m", allowed_models=["m"],
+        max_agents=16, max_depth=3, default_model="deepseek-v4-pro",
+        allowed_models=["deepseek-v4-pro"],
         workspace_root=workspace_root, workspace_extra_roots=[submit_path],
     )
     rt = Runtime(config=config)
@@ -134,7 +135,7 @@ def test_overlap_is_put_in_front_of_the_judge():
             "a file only one agent touched is not reported as an overlap"
         assert f"- {b.id} [working]" in user, "siblings still in flight are listed"
         assert "OVERLAP" in seen["system"], "the criteria are stated"
-        assert seen["model"] == "claude-opus-4-8"
+        assert seen["model"] == "deepseek-v4-pro"
     _disable()
     print("ok: the judge is told which files several agents changed, and who is in flight")
 

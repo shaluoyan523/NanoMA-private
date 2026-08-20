@@ -17,10 +17,8 @@ from optimizations.todo_tools import (
     TODO_TOOLS,
     meta_task_create,
     meta_task_list,
-    meta_task_spawn,
     meta_task_update,
     render_todo_reminder,
-    spawn_window_open,
 )
 
 
@@ -160,78 +158,34 @@ def _run_registration_test() -> None:
     _check(len(agent.history) == 1, "persisted history NOT mutated")
 
 
-async def _run_task_spawn_tests() -> None:
-    print("[4] task_spawn: spawn folded into the todolist")
+def _run_spawn_visibility_test() -> None:
+    print("[4] DeepSeek judge is the only model-facing spawn path")
     from nanoma.core import Runtime, RuntimeConfig
 
-    rt = Runtime(RuntimeConfig(max_agents=4, max_depth=1, default_model="m", allowed_models=["m"]))
-    rt.start_agent = lambda child: None  # don't actually run children in the test
-    root = rt.create_agent(task="root", model="m", parent=None, depth=0)
-    root._turns = 1
+    rt = Runtime(RuntimeConfig(default_model="deepseek-v4-pro", log_dir=None))
+    tools = rt._all_tools()
+    for name in ("spawn", "spawn_many", "task_spawn"):
+        _check(name not in tools, f"{name} is not registered for the worker model")
 
-    await meta_task_create({"subject": "Independent subtask A", "description": "do A fully"}, root, rt)
-    _check(spawn_window_open(root) is True, "pending task -> spawn window open")
+    class _P:
+        removed_tools: list = []
+        reason = ""
+        scoped_tools: list = []
 
-    res = await meta_task_spawn({"task_id": 1}, root, rt)
-    _check(res.get("delegated_to") and res.get("status") == "in_progress", "task_spawn delegates + sets in_progress")
-    task = root._todos[0]
-    _check(task["status"] == "in_progress" and task.get("child_id"), "task bound to child_id")
-    _check(task["child_id"] in rt.agents, "child agent registered in runtime")
-    _check(spawn_window_open(root) is False, "no more pending tasks -> window closes")
+    injected = {name: {} for name in ("spawn", "spawn_many", "task_spawn", "shell")}
+    gated, policy = rt._apply_spawn_todolist_gate(None, injected, _P())
+    _check(set(gated) == {"shell"}, "defensive gate removes injected direct-spawn tools")
+    _check("deepseek_spawn_judge_only" in policy.reason, "gate records DeepSeek-only reason")
 
-    err = await meta_task_spawn({"task_id": 1}, root, rt)
-    _check("error" in err, "cannot re-delegate a non-pending task")
-
-    # reflection: child finishing auto-completes the delegated task
-    rt.agents[task["child_id"]].status = "done"
-    root._turns = 2
-    rem = render_todo_reminder(root, rt)
-    _check(root._todos[0]["status"] == "completed", "delegated task auto-completed when child done")
-    _check(rem is None, "reminder goes quiet once all tasks resolved")
-
-
-def _run_gate_test() -> None:
-    print("[5] runtime spawn/todolist gate")
-    import os
-    from nanoma.core import Runtime, RuntimeConfig
-
-    os.environ["NANOMA_SPAWN_TODOLIST_GATE"] = "1"
-    try:
-        rt = Runtime(RuntimeConfig(max_agents=4, max_depth=1, default_model="m", allowed_models=["m"]))
-        root = rt.create_agent(task="root", model="m", parent=None, depth=0)
-        all_tools = rt._all_tools()
-        subset = {k: all_tools[k] for k in ("spawn", "spawn_many", "task_spawn", "task_create", "shell") if k in all_tools}
-
-        class _P:
-            removed_tools: list = []
-            reason = ""
-            scoped_tools: list = []
-
-        gated, _ = rt._apply_spawn_todolist_gate(root, dict(subset), _P())
-        _check("spawn" not in gated and "spawn_many" not in gated, "raw spawn/spawn_many removed under gate")
-        _check("task_spawn" not in gated, "task_spawn hidden when no pending tasks")
-
-        root._todos = [{"id": 1, "subject": "X", "description": "", "activeForm": "", "status": "pending"}]
-        gated2, _ = rt._apply_spawn_todolist_gate(root, dict(subset), _P())
-        _check("task_spawn" in gated2, "task_spawn offered when a pending task exists")
-        _check("spawn" not in gated2, "raw spawn still removed even in the window")
-
-        # judge mode: the agent never gets any spawn tool (runtime/Opus decides)
-        os.environ.pop("NANOMA_SPAWN_TODOLIST_GATE", None)
-        os.environ["NANOMA_SPAWN_TODOLIST_JUDGE"] = "1"
-        root._todos = [{"id": 1, "subject": "X", "description": "", "activeForm": "", "status": "pending"}]
-        judged, _ = rt._apply_spawn_todolist_gate(root, dict(subset), _P())
-        _check("spawn" not in judged and "spawn_many" not in judged, "judge: raw spawn removed")
-        _check("task_spawn" not in judged, "judge: task_spawn removed even with a pending task")
-        _check("shell" in judged and "task_create" in judged, "judge: normal work tools untouched")
-        os.environ.pop("NANOMA_SPAWN_TODOLIST_JUDGE", None)
-    finally:
-        os.environ.pop("NANOMA_SPAWN_TODOLIST_GATE", None)
-        os.environ.pop("NANOMA_SPAWN_TODOLIST_JUDGE", None)
+    luna = Runtime(RuntimeConfig(default_model="gpt-5.6-luna", log_dir=None))
+    _check(
+        luna._deepseek_spawn_judge_model("root") is None,
+        "non-DeepSeek route cannot make spawn decisions",
+    )
 
 
 async def _run_spawn_judge_tests() -> None:
-    print("[6] Opus-judged spawn at the planning moment (decide-before-create)")
+    print("[5] DeepSeek-judged spawn at the planning moment (decide-before-create)")
     import os
     from nanoma.core import Runtime, RuntimeConfig
     from optimizations.todo_tools.todo_tools import meta_task_create
@@ -239,7 +193,7 @@ async def _run_spawn_judge_tests() -> None:
     os.environ["NANOMA_SPAWN_TODOLIST_JUDGE"] = "1"
     try:
         # --- spawn=true: judge splits into 2 subagents; todolist is SUPPRESSED ---
-        rt = Runtime(RuntimeConfig(max_agents=4, max_depth=1, default_model="m", allowed_models=["m"]))
+        rt = Runtime(RuntimeConfig(max_agents=4, max_depth=1, default_model="deepseek-v4-pro"))
         rt.start_agent = lambda child: None
         plan = ('{"spawn": true, "reasoning": "cross-check", "subagents": ['
                 '{"subject": "A", "role": "solver", "task": "solve fully"},'
@@ -254,7 +208,7 @@ async def _run_spawn_judge_tests() -> None:
             return _Resp()
 
         rt.llm_call = _fake_llm
-        root = rt.create_agent(task="root task", model="m", parent=None, depth=0)
+        root = rt.create_agent(task="root task", model="deepseek-v4-pro", parent=None, depth=0)
         # Parent working context that must be forwarded to the judge (not a checklist).
         root.history = [
             {"role": "user", "content": "root task"},
@@ -266,7 +220,7 @@ async def _run_spawn_judge_tests() -> None:
         _check(res.get("delegated") is True, "spawn=true -> task_create returns delegated (todolist suppressed)")
         _check(len(getattr(root, "_todos", [])) == 0, "no local todo created on spawn (decide-before-create)")
         _check(len(rt.agents) - before == 2, "judge spawn=true -> 2 children created")
-        _check(getattr(_Resp, "seen_model", None) == "claude-opus-4-8", "judge used the Opus model by default (hyphen slug)")
+        _check(getattr(_Resp, "seen_model", None) == "deepseek-v4-pro", "judge used the DeepSeek worker model by default")
         _check("explored the codebase" in getattr(_Resp, "seen_user", ""),
                "judge is fed the parent's full working context (not just a checklist)")
         parsed = rt._parse_spawn_judge(plan)
@@ -288,7 +242,7 @@ async def _run_spawn_judge_tests() -> None:
                "children active -> judge declines -> todolist IS created")
 
         # --- spawn=false: judge declines, todolist IS created ---
-        rt2 = Runtime(RuntimeConfig(max_agents=4, max_depth=1, default_model="m", allowed_models=["m"]))
+        rt2 = Runtime(RuntimeConfig(max_agents=4, max_depth=1, default_model="deepseek-v4-pro"))
         rt2.start_agent = lambda child: None
 
         class _Resp2:
@@ -298,7 +252,7 @@ async def _run_spawn_judge_tests() -> None:
             return _Resp2()
 
         rt2.llm_call = _fake_llm2
-        root2 = rt2.create_agent(task="seq task", model="m", parent=None, depth=0)
+        root2 = rt2.create_agent(task="seq task", model="deepseek-v4-pro", parent=None, depth=0)
         root2.history = [{"role": "user", "content": "seq task"}]
         n = len(rt2.agents)
         res_f = await meta_task_create({"subject": "step 1"}, root2, rt2)
@@ -307,14 +261,14 @@ async def _run_spawn_judge_tests() -> None:
                "declined -> todolist created, task pending (self-execute)")
 
         # --- judge failure degrades to no-spawn + todolist still created ---
-        rt3 = Runtime(RuntimeConfig(max_agents=4, max_depth=1, default_model="m", allowed_models=["m"]))
+        rt3 = Runtime(RuntimeConfig(max_agents=4, max_depth=1, default_model="deepseek-v4-pro"))
         rt3.start_agent = lambda child: None
 
         async def _boom(messages, model, tools=None, **kw):
-            raise RuntimeError("opus unreachable")
+            raise RuntimeError("deepseek route unreachable")
 
         rt3.llm_call = _boom
-        root3 = rt3.create_agent(task="t", model="m", parent=None, depth=0)
+        root3 = rt3.create_agent(task="t", model="deepseek-v4-pro", parent=None, depth=0)
         root3.history = [{"role": "user", "content": "t"}]
         m0 = len(rt3.agents)
         res_b = await meta_task_create({"subject": "s"}, root3, rt3)  # must not raise
@@ -328,10 +282,9 @@ def main() -> int:
     try:
         asyncio.run(_run_handler_tests())
         asyncio.run(_run_reminder_tests())
-        asyncio.run(_run_task_spawn_tests())
-        asyncio.run(_run_spawn_judge_tests())
-        _run_gate_test()
         _run_registration_test()
+        _run_spawn_visibility_test()
+        asyncio.run(_run_spawn_judge_tests())
     except AssertionError as e:
         print(f"\nFAILED: {e}")
         return 1

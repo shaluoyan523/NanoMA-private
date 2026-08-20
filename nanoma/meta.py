@@ -278,109 +278,6 @@ async def meta_spawn(args: dict[str, Any], agent: "Agent", runtime: "Runtime") -
     return {"agent_id": child.id, "model": model, "requested_model": requested_model}
 
 
-async def meta_spawn_many(args: dict[str, Any], agent: "Agent", runtime: "Runtime") -> dict[str, Any]:
-    """Create multiple child agents in one topology action."""
-    items = args.get("agents") or args.get("tasks") or args.get("assignments") or []
-    if not isinstance(items, list) or not items:
-        return {"error": "agents must be a non-empty array of {task, model?} objects"}
-    items = list(items)
-    if agent.depth + 1 > runtime.config.max_depth:
-        return {"error": f"Max depth ({runtime.config.max_depth}) exceeded"}
-    if len(runtime.agents) >= runtime.config.max_agents:
-        return {"error": f"Max agents ({runtime.config.max_agents}) reached"}
-    violation = runtime.spawn_policy_violation(agent)
-    if violation:
-        event = {
-            "tool": "spawn_many",
-            "reason": violation,
-        }
-        if runtime.config.tool_policy_log_events:
-            event["policy"] = runtime.current_tool_policy(agent)
-        runtime._emit(agent.id, "tool_policy_block", event)
-        return {"error": f"spawn_many blocked by tool policy: {violation}"}
-
-    remaining_slots = max(0, runtime.config.max_agents - len(runtime.agents))
-    if (
-        runtime.config.force_spawn_many
-        and agent.parent is None
-        and not agent.children
-        and len(items) == 1
-        and remaining_slots >= 2
-    ):
-        first = items[0]
-        if isinstance(first, dict):
-            base_task = _spawn_task_from_args(first)
-            model = first.get("model")
-        else:
-            base_task = str(first).strip()
-            model = None
-        if base_task:
-            inherited = str(runtime.config.system_extra_instructions or "")
-            route_directive = ""
-            if (
-                re.search(
-                    r"\bRoute\s+A(?:\s*:|\s+is\b|\s+must\b)",
-                    inherited,
-                    flags=re.IGNORECASE,
-                )
-                and re.search(
-                    r"\bRoute\s+B(?:\s*:|\s+is\b|\s+must\b)",
-                    inherited,
-                    flags=re.IGNORECASE,
-                )
-            ):
-                route_directive = (
-                    "Use Route B from the inherited supervisor protocol as your primary method. "
-                    "Do not repeat Route A unless Route B has produced no viable candidate and you "
-                    "state that failure explicitly. "
-                )
-            verifier_task = (
-                "Independent verifier assignment. Solve the same task below using a materially different "
-                "method. "
-                + route_directive
-                + "Do not repeat the first solver's search engine/query pattern. Seek direct source "
-                "evidence or an independent calculation, then call deliver_to_parent with an answer-only "
-                "candidate and decisive evidence.\n\n"
-                + base_task
-            )
-            verifier: dict[str, Any] = {"task": verifier_task}
-            if model:
-                verifier["model"] = model
-            items.append(verifier)
-            runtime._emit(agent.id, "spawn_many_auto_completed", {
-                "requested_count": 1,
-                "effective_count": 2,
-                "reason": "force_spawn_many verifier minimum",
-            })
-
-    created: list[dict[str, Any]] = []
-    errors: list[dict[str, Any]] = []
-    for index, item in enumerate(items):
-        if isinstance(item, str):
-            spawn_args = {"task": item}
-        elif isinstance(item, dict):
-            spawn_args = {
-                "task": _spawn_task_from_args(item),
-                "model": item.get("model"),
-            }
-        else:
-            errors.append({"index": index, "error": "entry must be a string or object"})
-            continue
-        if not str(spawn_args.get("task") or "").strip():
-            errors.append({"index": index, "error": "task is required"})
-            continue
-        if len(runtime.agents) >= runtime.config.max_agents:
-            errors.append({"index": index, "error": f"Max agents ({runtime.config.max_agents}) reached"})
-            break
-        result = await meta_spawn(spawn_args, agent, runtime)
-        if "error" in result:
-            errors.append({"index": index, "error": result["error"]})
-            break
-        created.append({"index": index, **result})
-
-    return {"created": created, "errors": errors, "count": len(created)}
-
-
 # ─── kill ────────────────────────────────────────────────────────────────────
 
 async def meta_kill(args: dict[str, Any], agent: "Agent", runtime: "Runtime") -> dict[str, Any]:
@@ -1190,25 +1087,6 @@ def _is_descendant(target_id: str, ancestor_id: str, runtime: "Runtime") -> bool
 # ─── Registry ────────────────────────────────────────────────────────────────
 
 META_TOOLS: dict[str, dict[str, Any]] = {
-    "spawn": {"handler": meta_spawn, "is_meta": True, "schema": {"type": "function", "function": {
-        "name": "spawn",
-        "description": "Create a new agent that starts immediately and runs in parallel. The child agent gets its own workspace, fresh context, and the same tools. It cannot see your conversation history — include all necessary context in the task description. You become its parent and receive a notification when it finishes.",
-        "parameters": {"type": "object", "properties": {
-            "task": {"type": "string", "description": "Complete task description for the new agent. Include all context it needs — it cannot see your history."},
-            "model": {"type": "string", "description": "LLM model override (omit to use default)"},
-            "delegate": {"type": "boolean", "description": "If true, you terminate immediately and the child inherits your role", "default": False},
-        }, "required": ["task"]},
-    }}},
-    "spawn_many": {"handler": meta_spawn_many, "is_meta": True, "schema": {"type": "function", "function": {
-        "name": "spawn_many",
-        "description": "Create multiple child agents in one topology action. Use when independent work units or competing candidate paths should run in parallel. Each child starts immediately and receives only its task description.",
-        "parameters": {"type": "object", "properties": {
-            "agents": {"type": "array", "items": {"type": "object", "properties": {
-                "task": {"type": "string", "description": "Complete task description for this child agent. Include all context it needs."},
-                "model": {"type": "string", "description": "LLM model override (omit to use default)"},
-            }, "required": ["task"]}, "description": "Child agents to create."},
-        }, "required": ["agents"]},
-    }}},
     "kill": {"handler": meta_kill, "is_meta": True, "schema": {"type": "function", "function": {
         "name": "kill",
         "description": "Terminate an agent. A descendant with material evidence receives a delivery grace turn before termination.",

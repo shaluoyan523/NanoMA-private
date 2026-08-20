@@ -3,7 +3,7 @@
 Add-on enhancements to NanoMA kept separate from the core `nanoma` package so
 they can be developed, reviewed, and toggled independently.
 
-## `todo_tools` — Claude-Code-style Tasks / TODO list
+## `todo_tools` — DeepSeek planning nodes
 
 Adds three coordination meta tools that give an agent a lightweight, in-session
 task list (mirroring Claude Code's `TaskCreate` / `TaskUpdate` / `TaskList`):
@@ -16,14 +16,10 @@ task list (mirroring Claude Code's `TaskCreate` / `TaskUpdate` / `TaskList`):
 
 ### Why
 
-NanoMA's native decomposition primitive is `spawn` (real child agents on the
-agent graph). That is heavyweight for simple "plan-and-track my own steps"
-needs. These tools add a per-agent checklist so a single agent can plan
-multi-step work and expose progress without spawning an agent per step.
-
-`spawn` vs `task_create`:
-- Use **`spawn`** to run independent work units in parallel or to delegate.
-- Use **`task_create`** to track your own sequential steps inside one agent.
+DeepSeek workers do not receive direct spawn tools. They use `task_create` to
+declare a fresh planning node. Before the task is materialized, the runtime
+asks the same DeepSeek model route whether parallel children are useful and
+what each child should do. A declined decision becomes an ordinary local task.
 
 ### Per-turn state re-injection + nudges
 
@@ -56,7 +52,7 @@ export NANOMA_TODO_EMPTY_HINT_AFTER=4   # turns before one-time empty-list hint
 
 ### Design
 
-- **Naming**: snake_case to match NanoMA conventions (`spawn`, `set_bio`,
+- **Naming**: snake_case to match NanoMA conventions (`task_create`, `set_bio`,
   `ws_read_file`). The tool *descriptions* keep Claude's "When to Use / When
   NOT to Use" policy text — proxy-log analysis of the DeepSeek CC-workflow runs
   showed that description text (not any runtime event) is what actually gates
@@ -64,10 +60,11 @@ export NANOMA_TODO_EMPTY_HINT_AFTER=4   # turns before one-time empty-list hint
 - **State**: stored per-agent on the `Agent` instance as `agent._todos`
   (list) + `agent._todo_seq` (counter), attached lazily. `Agent` is a plain
   dataclass without `__slots__`, so no core dataclass edit is required. State
-  is per-agent (like Claude's per-session list); children created via `spawn`
+  is per-agent (like Claude's per-session list); judge-created children
   start empty.
 - **Events**: `task_create` / `task_update` emit viewer events through
-  `runtime._emit`, like `send` / `spawn`.
+  `runtime._emit`, like `send`; judge-created children still emit the internal
+  `spawn` event used for topology accounting.
 
 ### Integration
 
