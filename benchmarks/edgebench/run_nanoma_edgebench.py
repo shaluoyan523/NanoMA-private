@@ -37,9 +37,9 @@ Important protocol:
 - Work in the SForge task directory unless you intentionally need private scratch space.
 - Submit progress when you have a meaningful candidate. In NanoMA, the `submit` tool is wired to the official SForge `sforge-submit`; shell `cd {task_cwd} && sforge-submit` is also valid.
 - Do not inspect judge internals, hidden tests, reward files, or solution files.
-- Use task_create when you reach a fresh planning node. The DeepSeek spawn judge
-  decides whether that phase should fan out and creates children through the
-  runtime; direct spawn tools are intentionally not exposed to you.
+- Use task_create when you reach a fresh planning node. The runtime asks this
+  same model whether that phase should fan out and creates children through its
+  internal executor; direct spawn tools are intentionally not exposed to you.
 {lifecycle}
 
 Official EdgeBench/SForge prompt:

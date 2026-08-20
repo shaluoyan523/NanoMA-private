@@ -3,7 +3,7 @@
 Add-on enhancements to NanoMA kept separate from the core `nanoma` package so
 they can be developed, reviewed, and toggled independently.
 
-## `todo_tools` — DeepSeek planning nodes
+## `todo_tools` — same-model planning nodes
 
 Adds three coordination meta tools that give an agent a lightweight, in-session
 task list (mirroring Claude Code's `TaskCreate` / `TaskUpdate` / `TaskList`):
@@ -16,9 +16,9 @@ task list (mirroring Claude Code's `TaskCreate` / `TaskUpdate` / `TaskList`):
 
 ### Why
 
-DeepSeek workers do not receive direct spawn tools. They use `task_create` to
+Workers do not receive direct spawn tools. They use `task_create` to
 declare a fresh planning node. Before the task is materialized, the runtime
-asks the same DeepSeek model route whether parallel children are useful and
+asks that worker's own model whether parallel children are useful and
 what each child should do. A declined decision becomes an ordinary local task.
 
 ### Per-turn state re-injection + nudges
@@ -54,7 +54,7 @@ export NANOMA_TODO_EMPTY_HINT_AFTER=4   # turns before one-time empty-list hint
 
 - **Naming**: snake_case to match NanoMA conventions (`task_create`, `set_bio`,
   `ws_read_file`). The tool *descriptions* keep Claude's "When to Use / When
-  NOT to Use" policy text — proxy-log analysis of the DeepSeek CC-workflow runs
+  NOT to Use" policy text — proxy-log analysis of the planning-workflow runs
   showed that description text (not any runtime event) is what actually gates
   when a model emits these calls.
 - **State**: stored per-agent on the `Agent` instance as `agent._todos`

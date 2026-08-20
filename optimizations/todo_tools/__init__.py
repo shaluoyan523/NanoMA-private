@@ -1,4 +1,4 @@
-"""DeepSeek planning-list meta tools for NanoMA.
+"""Same-model planning-list meta tools for NanoMA.
 
 Exports ``TODO_TOOLS`` — a tool-registry dict (same shape as ``META_TOOLS``)
 that can be merged into NanoMA's tool library or injected via

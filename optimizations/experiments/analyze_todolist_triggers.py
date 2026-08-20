@@ -63,7 +63,7 @@ def analyze_task(events_path: Path) -> dict:
         elif name == "todo_reminder_injected":
             reminders += 1
         elif name == "spawn":
-            # DeepSeek judge decisions create children through internal
+            # Same-model judge decisions create children through internal
             # meta_spawn, which emits the durable topology event.
             children += 1
             spawn_turns.append(turn)

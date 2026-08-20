@@ -48,8 +48,8 @@ def _mk_runtime(tmp: Path, judge_reply: str = SPAWN_YES):
     submit_path.mkdir(parents=True, exist_ok=True)
     workspace_root.mkdir(parents=True, exist_ok=True)
     config = RuntimeConfig(
-        max_agents=16, max_depth=3, default_model="deepseek-v4-pro",
-        allowed_models=["deepseek-v4-pro"],
+        max_agents=16, max_depth=3, default_model="default-model",
+        allowed_models=["default-model", "worker-model"],
         workspace_root=workspace_root, workspace_extra_roots=[submit_path],
     )
     rt = Runtime(config=config)
@@ -103,10 +103,14 @@ def _disable():
 
 
 def _fan_out(rt, submit_path, n=2):
-    parent = rt.create_agent(task="make the benchmark faster", parent=None, depth=0)
+    parent = rt.create_agent(
+        task="make the benchmark faster", model="worker-model", parent=None, depth=0
+    )
     _verify(rt, parent, command=SIZE_CHECK)
     children = [
-        rt.create_agent(task=f"approach {i}", parent=parent.id, depth=1)
+        rt.create_agent(
+            task=f"approach {i}", model="worker-model", parent=parent.id, depth=1
+        )
         for i in range(n)
     ]
     return parent, children
@@ -135,7 +139,7 @@ def test_overlap_is_put_in_front_of_the_judge():
             "a file only one agent touched is not reported as an overlap"
         assert f"- {b.id} [working]" in user, "siblings still in flight are listed"
         assert "OVERLAP" in seen["system"], "the criteria are stated"
-        assert seen["model"] == "deepseek-v4-pro"
+        assert seen["model"] == "worker-model"
     _disable()
     print("ok: the judge is told which files several agents changed, and who is in flight")
 
@@ -154,6 +158,7 @@ def test_spawned_agent_owes_a_registered_check():
         assert len(new) == 1
         verifier = new[0]
         assert verifier.parent == parent.id, "it is a sibling, not a grandchild"
+        assert verifier.model == parent.model == "worker-model"
         assert getattr(verifier, "_spawned_at_delivery", False) is True
         assert "verify tool" in verifier.task, "its deliverable is a registered check"
         assert '{"ok": true, "metric":' in verifier.task, "with the verdict contract"

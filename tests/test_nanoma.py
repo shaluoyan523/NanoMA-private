@@ -123,8 +123,8 @@ async def test_zero_max_turns_disables_turn_limit(tmp_workspace):
 
 
 @pytest.mark.asyncio
-async def test_deepseek_worker_does_not_receive_direct_spawn(tmp_workspace):
-    """DeepSeek delegates only through the out-of-band planning judge."""
+async def test_worker_does_not_receive_direct_spawn(tmp_workspace):
+    """Workers delegate only through the same-model planning decision."""
     captured = {}
 
     async def mock_llm(messages, model, tools=None, **kwargs):
@@ -1010,7 +1010,7 @@ async def test_openai_call_passes_top_p(monkeypatch):
 # ─── Test: Full integration (spawn + message + wait) ─────────────────────────
 
 @pytest.mark.asyncio
-async def test_deepseek_judge_spawn_and_wait(tmp_workspace, monkeypatch):
+async def test_same_model_judge_spawn_and_wait(tmp_workspace, monkeypatch):
     """Planning judge spawns a child; parent waits and receives its result."""
     monkeypatch.setenv("NANOMA_SPAWN_TODOLIST_JUDGE", "1")
     turn_count = {"parent": 0, "child": 0}

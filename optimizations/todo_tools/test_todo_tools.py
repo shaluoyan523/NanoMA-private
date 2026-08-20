@@ -159,10 +159,10 @@ def _run_registration_test() -> None:
 
 
 def _run_spawn_visibility_test() -> None:
-    print("[4] DeepSeek judge is the only model-facing spawn path")
+    print("[4] Same-model judge is the only model-facing spawn path")
     from nanoma.core import Runtime, RuntimeConfig
 
-    rt = Runtime(RuntimeConfig(default_model="deepseek-v4-pro", log_dir=None))
+    rt = Runtime(RuntimeConfig(default_model="default-model", log_dir=None))
     tools = rt._all_tools()
     for name in ("spawn", "spawn_many", "task_spawn"):
         _check(name not in tools, f"{name} is not registered for the worker model")
@@ -175,17 +175,17 @@ def _run_spawn_visibility_test() -> None:
     injected = {name: {} for name in ("spawn", "spawn_many", "task_spawn", "shell")}
     gated, policy = rt._apply_spawn_todolist_gate(None, injected, _P())
     _check(set(gated) == {"shell"}, "defensive gate removes injected direct-spawn tools")
-    _check("deepseek_spawn_judge_only" in policy.reason, "gate records DeepSeek-only reason")
+    _check("same_model_spawn_judge_only" in policy.reason, "gate records same-model reason")
 
-    luna = Runtime(RuntimeConfig(default_model="gpt-5.6-luna", log_dir=None))
+    root = rt.create_agent(task="root", model="worker-model", parent=None, depth=0)
     _check(
-        luna._deepseek_spawn_judge_model("root") is None,
-        "non-DeepSeek route cannot make spawn decisions",
+        rt._spawn_judge_model(root) == "worker-model",
+        "planning judge uses the working agent's model",
     )
 
 
 async def _run_spawn_judge_tests() -> None:
-    print("[5] DeepSeek-judged spawn at the planning moment (decide-before-create)")
+    print("[5] Same-model spawn at the planning moment (decide-before-create)")
     import os
     from nanoma.core import Runtime, RuntimeConfig
     from optimizations.todo_tools.todo_tools import meta_task_create
@@ -193,7 +193,7 @@ async def _run_spawn_judge_tests() -> None:
     os.environ["NANOMA_SPAWN_TODOLIST_JUDGE"] = "1"
     try:
         # --- spawn=true: judge splits into 2 subagents; todolist is SUPPRESSED ---
-        rt = Runtime(RuntimeConfig(max_agents=4, max_depth=1, default_model="deepseek-v4-pro"))
+        rt = Runtime(RuntimeConfig(max_agents=4, max_depth=1, default_model="default-model"))
         rt.start_agent = lambda child: None
         plan = ('{"spawn": true, "reasoning": "cross-check", "subagents": ['
                 '{"subject": "A", "role": "solver", "task": "solve fully"},'
@@ -208,7 +208,7 @@ async def _run_spawn_judge_tests() -> None:
             return _Resp()
 
         rt.llm_call = _fake_llm
-        root = rt.create_agent(task="root task", model="deepseek-v4-pro", parent=None, depth=0)
+        root = rt.create_agent(task="root task", model="worker-model", parent=None, depth=0)
         # Parent working context that must be forwarded to the judge (not a checklist).
         root.history = [
             {"role": "user", "content": "root task"},
@@ -220,7 +220,9 @@ async def _run_spawn_judge_tests() -> None:
         _check(res.get("delegated") is True, "spawn=true -> task_create returns delegated (todolist suppressed)")
         _check(len(getattr(root, "_todos", [])) == 0, "no local todo created on spawn (decide-before-create)")
         _check(len(rt.agents) - before == 2, "judge spawn=true -> 2 children created")
-        _check(getattr(_Resp, "seen_model", None) == "deepseek-v4-pro", "judge used the DeepSeek worker model by default")
+        _check(getattr(_Resp, "seen_model", None) == "worker-model", "judge used the worker model")
+        child_models = {a.model for a in rt.agents.values() if a.parent == root.id}
+        _check(child_models == {"worker-model"}, "children use the same model as their parent")
         _check("explored the codebase" in getattr(_Resp, "seen_user", ""),
                "judge is fed the parent's full working context (not just a checklist)")
         parsed = rt._parse_spawn_judge(plan)
@@ -242,7 +244,7 @@ async def _run_spawn_judge_tests() -> None:
                "children active -> judge declines -> todolist IS created")
 
         # --- spawn=false: judge declines, todolist IS created ---
-        rt2 = Runtime(RuntimeConfig(max_agents=4, max_depth=1, default_model="deepseek-v4-pro"))
+        rt2 = Runtime(RuntimeConfig(max_agents=4, max_depth=1, default_model="worker-model"))
         rt2.start_agent = lambda child: None
 
         class _Resp2:
@@ -252,7 +254,7 @@ async def _run_spawn_judge_tests() -> None:
             return _Resp2()
 
         rt2.llm_call = _fake_llm2
-        root2 = rt2.create_agent(task="seq task", model="deepseek-v4-pro", parent=None, depth=0)
+        root2 = rt2.create_agent(task="seq task", model="worker-model", parent=None, depth=0)
         root2.history = [{"role": "user", "content": "seq task"}]
         n = len(rt2.agents)
         res_f = await meta_task_create({"subject": "step 1"}, root2, rt2)
@@ -261,14 +263,14 @@ async def _run_spawn_judge_tests() -> None:
                "declined -> todolist created, task pending (self-execute)")
 
         # --- judge failure degrades to no-spawn + todolist still created ---
-        rt3 = Runtime(RuntimeConfig(max_agents=4, max_depth=1, default_model="deepseek-v4-pro"))
+        rt3 = Runtime(RuntimeConfig(max_agents=4, max_depth=1, default_model="worker-model"))
         rt3.start_agent = lambda child: None
 
         async def _boom(messages, model, tools=None, **kw):
-            raise RuntimeError("deepseek route unreachable")
+            raise RuntimeError("model route unreachable")
 
         rt3.llm_call = _boom
-        root3 = rt3.create_agent(task="t", model="deepseek-v4-pro", parent=None, depth=0)
+        root3 = rt3.create_agent(task="t", model="worker-model", parent=None, depth=0)
         root3.history = [{"role": "user", "content": "t"}]
         m0 = len(rt3.agents)
         res_b = await meta_task_create({"subject": "s"}, root3, rt3)  # must not raise

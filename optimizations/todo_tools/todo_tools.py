@@ -1,9 +1,9 @@
-"""DeepSeek planning-list meta tools for NanoMA.
+"""Same-model planning-list meta tools for NanoMA.
 
-The DeepSeek spawn path does not expose direct spawn tools to the worker model.
+The planning path does not expose direct spawn tools to the worker model.
 Instead, the worker maintains a per-agent task list. At a fresh planning node,
-`task_create` asks an out-of-band DeepSeek judge whether the next phase should
-fan out; the runtime creates children only when that judge approves.
+`task_create` asks that worker's model whether the next phase should fan out;
+the runtime creates children with the same model only when it approves.
 
 This module adds three coordination meta tools that mirror Claude Code's
 `TaskCreate` / `TaskUpdate` / `TaskList`, adapted to NanoMA conventions:
@@ -110,10 +110,10 @@ async def meta_task_create(
     if not subject:
         return {"error": "'subject' required (a brief, actionable title in imperative form)"}
 
-    # DeepSeek spawn-judge hook: at a fresh planning moment, decide
+    # Same-model spawn-judge hook: at a fresh planning moment, decide
     # whether to fan this next phase out to parallel children BEFORE materializing
     # the todolist — so the list is only ever created on the no-spawn path
-    # (decide first, plan second). The DeepSeek judge sees the parent's full context
+    # (decide first, plan second). The same model sees the parent's full context
     # and owns the split; on spawn we suppress local task creation entirely.
     import os
     if os.environ.get("NANOMA_SPAWN_TODOLIST_JUDGE") == "1":
@@ -358,7 +358,7 @@ def render_todo_reminder(agent: "Agent", runtime: "Runtime | None" = None) -> st
 # The "When to Use / When NOT to Use" text below is adapted from Claude Code's
 # TaskCreate description because that policy text is what actually drives when a
 # model chooses to build a task list (confirmed via proxy-log analysis of the
-# DeepSeek CC-workflow runs).
+# observed planning-workflow runs).
 
 _TASK_CREATE_DESC = (
     "Create a structured task in your current session's task list. This helps you "
@@ -374,7 +374,7 @@ _TASK_CREATE_DESC = (
     "- Purely conversational or informational requests.\n"
     "In those cases just do the work directly instead of tracking it.\n\n"
     "Note: this task list is a lightweight self-checklist for THIS agent. At a "
-    "fresh task_create planning node, the DeepSeek spawn judge decides whether "
+    "fresh task_create planning node, the same model decides whether "
     "independent work should be delegated to parallel children."
 )
 

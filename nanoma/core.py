@@ -10069,21 +10069,9 @@ class Runtime:
             "subagents": clean_subs,
         }
 
-    def _deepseek_spawn_judge_model(self, agent_id: str) -> str | None:
-        """Resolve the judge route and reject non-DeepSeek spawn decisions."""
-        model = str(
-            os.environ.get("NANOMA_SPAWN_JUDGE_MODEL")
-            or self.config.default_model
-            or ""
-        ).strip()
-        if "deepseek" in model.lower():
-            return model
-        self._emit(agent_id, "spawn_judge_error", {
-            "stage": "model_validation",
-            "model": model,
-            "detail": "DeepSeek spawn-only branch requires a DeepSeek judge model",
-        })
-        return None
+    def _spawn_judge_model(self, agent: "Agent") -> str:
+        """Use the working agent's model for its topology decision."""
+        return str(getattr(agent, "model", "") or self.config.default_model or "").strip()
 
     def _render_history_for_judge(self, agent: "Agent", max_chars: int = 48000) -> str:
         """Serialize the parent agent's working context (exactly what IT sees).
@@ -10126,7 +10114,7 @@ class Runtime:
         return text
 
     async def _spawn_judge_at_plan(self, agent: Agent, plan_hint: str = "") -> bool:
-        """At a fresh planning moment, let DeepSeek decide whether to spawn.
+        """At a fresh planning moment, let the working model decide whether to spawn.
 
         Called from `meta_task_create` BEFORE any todolist is materialized, so the
         list is only ever created on the no-spawn path (decide first, plan second).
@@ -10164,7 +10152,7 @@ class Runtime:
         ]
         if active_children:
             return False
-        judge_model = self._deepseek_spawn_judge_model(agent.id)
+        judge_model = self._spawn_judge_model(agent)
         if not judge_model:
             return False
 
@@ -10361,7 +10349,7 @@ class Runtime:
             })
             return False
 
-        judge_model = self._deepseek_spawn_judge_model(delivered.id)
+        judge_model = self._spawn_judge_model(parent)
         if not judge_model:
             return False
         report = self._delivery_orchestration_report(parent, delivered)
@@ -12046,7 +12034,7 @@ class Runtime:
         except Exception as exc:
             self._emit(agent.id, "merge_promote_error", {"detail": str(exc)[:300]})
         if agent.status == "killed" or self._delivery_judging_closed:
-            # The judge costs a DeepSeek round-trip and can only pay off while there
+            # The judge costs an extra model round-trip and can only pay off while there
             # is still time to act on it.
             return
         try:
@@ -13184,12 +13172,12 @@ class Runtime:
         return out
 
     def _apply_spawn_todolist_gate(self, agent, turn_tools, tool_policy):
-        """Keep the DeepSeek judge as the only model-facing spawn path.
+        """Keep same-model planning as the only model-facing spawn path.
 
-        Direct `spawn`, `spawn_many`, and `task_spawn` calls belong to the Luna
-        path and are never offered by this branch. At a `task_create` planning
-        node the out-of-band DeepSeek judge may call the internal `meta_spawn`
-        execution primitive through `_spawn_judge_at_plan`.
+        Direct `spawn`, `spawn_many`, and `task_spawn` calls are never offered
+        by this branch. At a `task_create` planning node the worker's own model
+        may approve the internal `meta_spawn` execution primitive through
+        `_spawn_judge_at_plan`.
 
         Only ever removes tools (never adds), so it is safe to run after the
         state-based scoping passes.
@@ -13206,7 +13194,7 @@ class Runtime:
                 existing = list(getattr(tool_policy, "removed_tools", []) or [])
                 tool_policy.removed_tools = sorted(set(existing) | set(removed))
                 base = getattr(tool_policy, "reason", "") or ""
-                reason = "deepseek_spawn_judge_only"
+                reason = "same_model_spawn_judge_only"
                 tool_policy.reason = f"{base},{reason}" if base else reason
                 tool_policy.scoped_tools = list(gated)
             except Exception:
