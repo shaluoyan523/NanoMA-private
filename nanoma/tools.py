@@ -27,6 +27,51 @@ WEB_BLOCK_OUTPUT_PATTERNS = [
 ]
 
 
+_PKILL_COMMAND_RE = re.compile(
+    r"(?P<exe>(?<![\w.-])(?:sudo\s+)?(?:(?:/usr)?/bin/)?pkill)"
+    r"(?P<args>[^;&|\n]*)",
+    flags=re.IGNORECASE,
+)
+
+
+def _guard_process_control_command(cmd: str) -> tuple[str, str | None]:
+    """Keep task cleanup commands from terminating the NanoMA runtime.
+
+    `pkill -f` matches full command lines.  EdgeBench task paths are present in
+    the NanoMA runner's own argv, so cleanup such as `pkill -f dcss` can kill the
+    runner and its parent before either one records an exit.  procps' `-A`
+    option excludes every ancestor of pkill while preserving its intended task
+    cleanup behavior.
+
+    Direct `kill` is guarded at execution time in `sandbox.shell_exec`, where the
+    actual ancestor PIDs are known.  Bypasses that cannot be wrapped safely are
+    rejected here.
+    """
+
+    bypass = re.search(
+        r"(?<![\w.-])(?:sudo\s+)(?:(?:/usr)?/bin/)?kill(?!all)\b"
+        r"|(?<![\w.-])(?:(?:/usr)?/bin/)kill(?:all)?\b"
+        r"|(?<![\w.-])(?:sudo\s+)?(?:(?:/usr)?/bin/)?killall\b",
+        cmd,
+        flags=re.IGNORECASE,
+    )
+    if bypass:
+        return cmd, (
+            "Broad or privileged process termination is blocked because it can "
+            "kill the NanoMA runtime. Use plain `kill <explicit child pid>` or "
+            "`pkill -f <task-specific pattern>`; those forms protect runtime "
+            "ancestor processes automatically."
+        )
+
+    def protect(match: re.Match[str]) -> str:
+        args = match.group("args")
+        if re.search(r"(?:^|\s)--ignore-ancestors(?:\s|$)|(?:^|\s)-[^\s]*A", args):
+            return match.group(0)
+        return f"{match.group('exe')} --ignore-ancestors{args}"
+
+    return _PKILL_COMMAND_RE.sub(protect, cmd), None
+
+
 def _command_access_is_limited_to_runtime_workspace(cmd: str, workspace: Path, shared_dir: Path) -> bool:
     """Allow benchmark run paths only when they are this task's own workspace."""
     workspace = workspace.resolve()
@@ -101,6 +146,18 @@ async def tool_shell(args: dict[str, Any], workspace: Path, ctx: "ToolContext") 
     if not cmd or not cmd.strip():
         return {"error": "command is required"}
     cmd = _clean_shell_command(cmd, workspace=workspace, shared_dir=ctx.shared_dir)
+    original_cmd = cmd
+    cmd, process_control_block = _guard_process_control_command(cmd)
+    if process_control_block:
+        return {
+            "exit_code": -1,
+            "stdout": "",
+            "stderr": process_control_block,
+            "blocked": True,
+            "blocked_capability": "process_control",
+            "instruction": process_control_block,
+        }
+    process_guard_applied = cmd != original_cmd
 
     try:
         requested_timeout = int(timeout) if timeout is not None else int(getattr(ctx, "shell_max_timeout", 30) or 30)
@@ -185,6 +242,8 @@ async def tool_shell(args: dict[str, Any], workspace: Path, ctx: "ToolContext") 
         await memory.release(cmd, ticket, result.get("peak_rss_bytes"))
     if ticket.get("waited", 0) >= 1.0:
         result["memory_waited_seconds"] = round(ticket["waited"], 1)
+    if process_guard_applied:
+        result["process_guard_applied"] = True
 
     if timeout < requested_timeout:
         # Silently clamping taught agents the wrong lesson. One asked for 620s,

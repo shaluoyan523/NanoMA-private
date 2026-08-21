@@ -149,6 +149,10 @@ def _log_http_error(model: str, body: dict[str, Any], resp: httpx.Response, elap
 
 
 _NON_RETRYABLE_PROVIDER_ERROR_CODES = {
+    "authentication_error",
+    "incorrect_api_key",
+    "invalid_api_key",
+    "invalid_authentication",
     "invalid_model",
     "model_not_found",
     "model_not_supported",
@@ -175,7 +179,14 @@ def _is_non_retryable_provider_error(resp: httpx.Response) -> bool:
     if code in _NON_RETRYABLE_PROVIDER_ERROR_CODES:
         return True
     text = resp.text[:1000].lower()
-    return "model_not_found" in text or "no available channel for model" in text
+    permanent_markers = (
+        "model_not_found",
+        "no available channel for model",
+        "invalid api key",
+        "incorrect api key",
+        "authentication failed",
+    )
+    return any(marker in text for marker in permanent_markers)
 
 
 def _retry_sleep_seconds(attempt: int, rc: RetryConfig, resp: httpx.Response | None = None) -> float:
@@ -192,7 +203,11 @@ def _retry_sleep_seconds(attempt: int, rc: RetryConfig, resp: httpx.Response | N
 
 # --- Main call ---
 
-_RETRYABLE = {429, 500, 502, 503, 504}
+# The EdgeBench provider gateway has returned short-lived 401/403 responses and
+# then accepted the same credential again without any configuration change.  A
+# bare auth status is therefore retryable; an explicit invalid-key error is
+# still rejected immediately by `_is_non_retryable_provider_error` above.
+_RETRYABLE = {401, 403, 429, 500, 502, 503, 504}
 _shared_client: httpx.AsyncClient | None = None
 _shared_clients: dict[float, httpx.AsyncClient] = {}
 

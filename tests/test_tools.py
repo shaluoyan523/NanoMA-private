@@ -15,7 +15,7 @@ from pathlib import Path
 from unittest.mock import patch, AsyncMock
 
 from nanoma.core import ToolContext
-from nanoma.tools import tool_shell, WORK_TOOLS
+from nanoma.tools import _guard_process_control_command, tool_shell, WORK_TOOLS
 from nanoma.plugins.workspace_tools import (
     WORKSPACE_TOOLS, get_tool_schemas,
     tool_create_file, tool_append_file, tool_read_file_advanced,
@@ -90,6 +90,33 @@ class TestRegistry:
 # ═══════════════════════════════════════════════════════════════════════════════
 
 class TestShell:
+    def test_pkill_protects_runtime_ancestors(self):
+        command, blocked = _guard_process_control_command(
+            "pkill -9 -f run_synthetic.py; sudo pkill -f dcss"
+        )
+        assert blocked is None
+        assert "pkill --ignore-ancestors -9 -f run_synthetic.py" in command
+        assert "sudo pkill --ignore-ancestors -f dcss" in command
+
+    def test_pkill_does_not_duplicate_existing_guard(self):
+        command, blocked = _guard_process_control_command(
+            "pkill --ignore-ancestors -f worker"
+        )
+        assert blocked is None
+        assert command.count("--ignore-ancestors") == 1
+
+    @pytest.mark.asyncio
+    async def test_privileged_kill_is_blocked(self, ws, ctx):
+        result = await tool_shell({"command": "sudo kill -9 123"}, ws, ctx)
+        assert result["blocked"] is True
+        assert result["blocked_capability"] == "process_control"
+
+    @pytest.mark.asyncio
+    async def test_plain_kill_cannot_target_runtime_parent(self, ws, ctx):
+        result = await tool_shell({"command": "kill $PPID"}, ws, ctx)
+        assert result["exit_code"] == 126
+        assert "protected NanoMA runtime pid" in result["stderr"]
+
     @pytest.mark.asyncio
     async def test_basic_execution(self, ws, ctx):
         r = await tool_shell({"command": "echo hello"}, ws, ctx)

@@ -11,6 +11,7 @@ from nanoma.core import Agent, Envelope, ResourceQuota, Runtime, RuntimeConfig, 
 from nanoma.cost import CostLedger, UsageRecord
 from nanoma.llm import (
     LLMResponse,
+    RetryConfig,
     ToolCall,
     openai_compatible_call,
     _openai_messages_to_anthropic,
@@ -1005,6 +1006,80 @@ async def test_openai_call_passes_top_p(monkeypatch):
     assert captured["body"]["temperature"] == 0.2
     assert captured["body"]["top_p"] == 1.0
     assert captured["body"]["max_tokens"] == 8192
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("transient_status", [401, 403])
+async def test_openai_call_retries_transient_gateway_auth(monkeypatch, transient_status):
+    import httpx
+
+    calls = {"count": 0}
+
+    class FakeResponse:
+        headers = {}
+        text = "Unauthorized" if transient_status == 401 else "Forbidden"
+
+        def __init__(self, status_code):
+            self.status_code = status_code
+
+        def json(self):
+            if self.status_code >= 400:
+                return {"error": {"message": self.text}}
+            return {
+                "choices": [{"message": {"content": "recovered"}}],
+                "usage": {"prompt_tokens": 1, "completion_tokens": 1},
+            }
+
+        def raise_for_status(self):
+            if self.status_code >= 400:
+                request = httpx.Request("POST", "https://example.invalid/v1/chat/completions")
+                response = httpx.Response(self.status_code, request=request)
+                raise httpx.HTTPStatusError(self.text, request=request, response=response)
+
+    class FakeClient:
+        async def post(self, url, headers=None, json=None):
+            calls["count"] += 1
+            return FakeResponse(transient_status if calls["count"] == 1 else 200)
+
+    monkeypatch.setattr("nanoma.llm._get_client", lambda timeout=180.0: FakeClient())
+    monkeypatch.setattr("nanoma.llm.asyncio.sleep", AsyncMock())
+    response = await openai_compatible_call(
+        [{"role": "user", "content": "hello"}],
+        "test-model",
+        base_url="https://example.invalid/v1",
+        api_key="test",
+        retry_config=RetryConfig(max_retries=2, base_delay=0.1, max_delay=0.1),
+    )
+    assert response.content == "recovered"
+    assert calls["count"] == 2
+
+
+@pytest.mark.asyncio
+async def test_openai_call_does_not_retry_explicit_invalid_key(monkeypatch):
+    import httpx
+
+    calls = {"count": 0}
+
+    class FakeClient:
+        async def post(self, url, headers=None, json=None):
+            calls["count"] += 1
+            request = httpx.Request("POST", url)
+            return httpx.Response(
+                401,
+                request=request,
+                json={"error": {"code": "invalid_api_key"}},
+            )
+
+    monkeypatch.setattr("nanoma.llm._get_client", lambda timeout=180.0: FakeClient())
+    with pytest.raises(httpx.HTTPStatusError):
+        await openai_compatible_call(
+            [{"role": "user", "content": "hello"}],
+            "test-model",
+            base_url="https://example.invalid/v1",
+            api_key="test",
+            retry_config=RetryConfig(max_retries=2, base_delay=0.1, max_delay=0.1),
+        )
+    assert calls["count"] == 1
 
 
 # ─── Test: Full integration (spawn + message + wait) ─────────────────────────

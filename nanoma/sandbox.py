@@ -39,6 +39,44 @@ async def _drain(stream: asyncio.StreamReader | None, sink: bytearray) -> None:
 _RSS_SAMPLE_SECONDS = 1.0
 
 
+def _ancestor_pids(pid: int | None = None) -> set[int]:
+    """Return this process and its ancestors from procfs."""
+    current = int(pid or os.getpid())
+    ancestors: set[int] = set()
+    while current > 1 and current not in ancestors:
+        ancestors.add(current)
+        try:
+            raw = Path(f"/proc/{current}/stat").read_bytes()
+            cut = raw.rfind(b")")
+            fields = raw[cut + 2:].split() if cut >= 0 else []
+            parent = int(fields[1]) if len(fields) >= 2 else 0
+        except (OSError, ValueError):
+            break
+        current = parent
+    if current == 1:
+        ancestors.add(1)
+    return ancestors
+
+
+def _kill_guard_prelude(protected_pids: set[int]) -> str:
+    """Define a shell `kill` wrapper that refuses to target runtime ancestors."""
+    protected = "|".join(str(pid) for pid in sorted(protected_pids)) or "0"
+    return f"""
+kill() {{
+  for _nanoma_target in "$@"; do
+    case "$_nanoma_target" in
+      {protected})
+        printf '%s\\n' "Blocked kill of protected NanoMA runtime pid $_nanoma_target" >&2
+        return 126
+        ;;
+    esac
+  done
+  command kill "$@"
+}}
+export -f kill
+""".strip()
+
+
 def process_group_rss_bytes(pgid: int) -> int:
     """Resident bytes held right now by every process in one group.
 
@@ -110,7 +148,14 @@ async def shell_exec(
     its best result. Half the shell time in that run's first iteration, and 80% of
     the second's, went into calls that came back empty.
     """
-    env = {**os.environ, "WORKSPACE": str(workspace), "SHARED": str(shared_dir)}
+    protected_pids = _ancestor_pids()
+    env = {
+        **os.environ,
+        "WORKSPACE": str(workspace),
+        "SHARED": str(shared_dir),
+        "NANOMA_PROTECTED_PIDS": " ".join(str(pid) for pid in sorted(protected_pids)),
+    }
+    guarded_cmd = f"{_kill_guard_prelude(protected_pids)}\n{cmd}"
     proc: asyncio.subprocess.Process | None = None
     out, err = bytearray(), bytearray()
     readers: list[asyncio.Task] = []
@@ -139,12 +184,13 @@ async def shell_exec(
 
     try:
         proc = await asyncio.create_subprocess_shell(
-            cmd,
+            guarded_cmd,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
             cwd=str(workspace),
             env=env,
             start_new_session=True,
+            executable="/bin/bash",
         )
         sampler = asyncio.create_task(_sample_peak_rss(proc.pid, observed))
         readers = [
