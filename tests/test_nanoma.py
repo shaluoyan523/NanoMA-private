@@ -1085,24 +1085,31 @@ async def test_openai_call_does_not_retry_explicit_invalid_key(monkeypatch):
 # ─── Test: Full integration (spawn + message + wait) ─────────────────────────
 
 @pytest.mark.asyncio
-async def test_same_model_judge_spawn_and_wait(tmp_workspace, monkeypatch):
-    """Planning judge spawns a child; parent waits and receives its result."""
+async def test_same_model_judge_spawns_parallel_algorithm_hypotheses(tmp_workspace, monkeypatch):
+    """Planning judge can fan distinct algorithm hypotheses out in parallel."""
     monkeypatch.setenv("NANOMA_NODE_AUTONOMOUS_PLANNING", "1")
     turn_count = {"parent": 0, "child": 0}
 
     async def mock_llm(messages, model, tools=None, **kwargs):
         if tools is None:
+            prompt = messages[0]["content"]
+            assert "multiple plausible algorithmic hypotheses" in prompt
+            assert "same success criterion" in prompt
             return LLMResponse(
                 content=(
-                    '{"spawn":true,"reasoning":"parallel child useful",'
-                    '"subagents":[{"subject":"child task","role":"worker",'
-                    '"task":"child task"}]}'
+                    '{"spawn":true,"reasoning":"compare independent hypotheses",'
+                    '"subagents":['
+                    '{"subject":"hypothesis one","role":"explorer",'
+                    '"task":"test hypothesis one using the shared success criterion"},'
+                    '{"subject":"hypothesis two","role":"explorer",'
+                    '"task":"test hypothesis two using the shared success criterion"}'
+                    ']}'
                 ),
                 usage=UsageRecord(input_tokens=50, output_tokens=30, model=model),
             )
-        # Detect if this is a child (task contains "child")
+        # Detect either hypothesis child.
         system = messages[0]["content"] if messages else ""
-        if "child task" in system:
+        if "test hypothesis" in system:
             turn_count["child"] += 1
             return LLMResponse(
                 tool_calls=[ToolCall(id="c1", name="set_status", arguments={"status": "done", "result": "child done"})],
@@ -1134,7 +1141,7 @@ async def test_same_model_judge_spawn_and_wait(tmp_workspace, monkeypatch):
     rt = Runtime(config=config, llm_call=mock_llm)
     result = await rt.run("parent task")
     assert result == "parent done"
-    assert len(rt.agents) == 2
+    assert len(rt.agents) == 3
 
 
 @pytest.mark.asyncio

@@ -10173,8 +10173,9 @@ class Runtime:
             "Spawn a solver plus verifier(s) that use a materially different method/source.\n"
             "3) CONTEXT ISOLATION: a part will generate a large volume of intermediate "
             "material; offload it to a child that returns only a distilled result.\n"
-            "4) METHOD PORTFOLIO / EXPLORATION: the best approach is uncertain; spawn one "
-            "explorer per materially different approach and keep the best.\n"
+            "4) ALGORITHM HYPOTHESES: if multiple plausible algorithmic hypotheses remain, "
+            "spawn one child per hypothesis to test them independently against the same "
+            "success criterion.\n"
             "Every child already receives its OWN private copy of the task directory and the "
             "runtime folds each child's changes back safely, so children never collide — you "
             "do not need to tell them to copy files or avoid each other.\n"
@@ -10197,7 +10198,8 @@ class Runtime:
             '"subagents": [{"subject": "<short label>", "role": "solver|verifier|explorer|worker", '
             '"task": "<objective + what to query from the parent>"}]}\n'
             "For a verification split give the verifier(s) a DIFFERENT method/source from "
-            "the solver; for an exploration split give each explorer a DIFFERENT approach. "
+            "the solver; for exploration assign each explorer a distinct algorithmic "
+            "hypothesis and the same success criterion. "
             "If spawn is false, return an empty subagents list."
         )
 
