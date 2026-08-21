@@ -512,7 +512,8 @@ def test_pending_children_are_folded_in_at_run_end():
         b = rt.create_agent(task="b", parent=parent.id, depth=1)
         _write(Path(a._merge_copy), "from_a.txt", "a\n")
         _write(Path(b._merge_copy), "from_b.txt", "b\n")
-        _run(rt._merge_promote_pending())
+        out = _run(rt._merge_promote_pending())
+        assert out["kept"] is True and out["verified"] is True, out
         assert _read(submit_path, "from_a.txt") == "a\n", "cancelled child's work landed"
         assert _read(submit_path, "from_b.txt") == "b\n", "and its sibling's too"
         assert rt._merge_best_metric == 6, "the union was verified as one artifact"
@@ -532,10 +533,13 @@ def test_broken_end_of_run_union_is_rewound():
         b = rt.create_agent(task="b", parent=parent.id, depth=1)
         _write(Path(a._merge_copy), "a.txt", "aaaa\n")
         _write(Path(b._merge_copy), "b.txt", "bbbb\n")   # union busts the budget
-        _run(rt._merge_promote_pending())
-        rt._merge_restore_best()
+        out = _run(rt._merge_promote_pending())
+        assert out["kept"] is False and out["rolled_back"] is True, out
         assert _read(submit_path, "a.txt") is None and _read(submit_path, "b.txt") is None
-        assert _read(submit_path, "sol.txt") == "base\n", "rewound to the verified state"
+        assert _read(submit_path, "sol.txt") == "base\n", \
+            "the transaction restored the pre-union state immediately"
+        assert _run(rt._merge_promote_pending()) is None, \
+            "the same failed union is not repeatedly applied at each submit/shutdown hook"
     _disable()
     print("ok: an end-of-run union that fails its check is rewound")
 

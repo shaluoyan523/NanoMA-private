@@ -108,6 +108,43 @@ def test_exit_code_overrides_a_cheerful_verdict():
     print("ok: a non-zero exit outranks a self-declared pass")
 
 
+def test_pipefail_preserves_a_failed_build_through_tee():
+    """Regression for the Carleson merge: lake failed, tee returned zero, and
+    the check registered the broken project as a passing metric of one."""
+    with tempfile.TemporaryDirectory() as d:
+        rt, _ = _mk_runtime(Path(d))
+        agent = rt.create_agent(task="root", parent=None, depth=0)
+        log = Path(d) / "build.log"
+        command = (
+            "python3 -c \"import sys; print('error: build failed'); sys.exit(7)\" "
+            f"2>&1 | tee {log}; RC=$?; "
+            "if [ $RC -eq 0 ]; then "
+            "echo '{\"ok\": true, \"metric\": 1.0}'; "
+            "else echo '{\"ok\": false, \"metric\": 0.0}'; fi"
+        )
+        out = _run(meta_verify({"command": command}, agent, rt))
+        assert out["ok"] is False and out["metric"] == 0.0, out
+        assert "error: build failed" in log.read_text()
+        assert getattr(agent, "_verify_spec", None) is None
+    print("ok: a failed build cannot pass merely because its output was piped to tee")
+
+
+def test_constant_verdict_is_rejected():
+    with tempfile.TemporaryDirectory() as d:
+        rt, submit_path = _mk_runtime(Path(d))
+        agent = rt.create_agent(task="root", parent=None, depth=0)
+        out = _run(meta_verify({
+            "command": f"cd {submit_path} && echo '{{\"ok\": true, \"metric\": 1.0}}'",
+        }, agent, rt))
+        assert out["ok"] is False and out["registered"] is False, out
+        assert "fixed verdict" in out["note"]
+        assert getattr(agent, "_verify_spec", None) is None
+
+        real = _run(meta_verify({"command": OK_CHECK}, agent, rt))
+        assert real["registered"] is True, "a command that runs a real check remains valid"
+    print("ok: setup plus a constant verdict cannot become the authoritative check")
+
+
 def test_nudge_fires_once_and_stops_after_registration():
     with tempfile.TemporaryDirectory() as d:
         os.environ["NANOMA_MERGE_SUBMIT_PATH"] = "1"
@@ -249,6 +286,8 @@ def main():
         test_command_is_stored_portably,
         test_timeout_and_crash_are_failures,
         test_exit_code_overrides_a_cheerful_verdict,
+        test_pipefail_preserves_a_failed_build_through_tee,
+        test_constant_verdict_is_rejected,
         test_nudge_fires_once_and_stops_after_registration,
         test_workspace_paths_survive_the_rewrite,
         test_failed_attempt_earns_another_reminder,

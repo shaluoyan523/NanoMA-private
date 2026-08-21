@@ -40,6 +40,10 @@ verdict in your copy and nothing at all there. Such a check is refused: it would
 make the gate reject every merge for the rest of the run, which is exactly how
 one run threw away its best result.
 
+The command must actually execute the build, tests or benchmark. Do not register
+a constant `echo`/`printf` verdict. Pipelines run with `pipefail`, so do not mask
+a failing build with `|| true` or otherwise replace its exit status.
+
 A registered check is what makes your result evidence rather than a claim. A
 number you only state in a message is not verifiable by anyone else, and results
 that nobody else can reproduce have already cost this system a whole run."""
@@ -49,6 +53,28 @@ async def meta_verify(args: dict, agent: Any, runtime: Any) -> dict:
     command = str((args or {}).get("command") or "").strip()
     if not command:
         return {"error": "command is required: the shell command that checks your work"}
+    if runtime._verification_command_is_constant(command):
+        reason = (
+            "it only prints a fixed verdict and does not execute a build, test, "
+            "or benchmark."
+        )
+        agent._verify_failures = getattr(agent, "_verify_failures", 0) + 1
+        agent._verify_last_failure = reason
+        runtime._emit(agent.id, "verify_rejected", {
+            "reason": "constant_verdict",
+            "command": command[:300],
+        })
+        return {
+            "ok": False,
+            "metric": None,
+            "measured": "none",
+            "seconds": 0.0,
+            "exit_code": None,
+            "timed_out": False,
+            "registered": False,
+            "note": f"Not registered: {reason}",
+            "output": "",
+        }
     timeout = float((args or {}).get("timeout") or 900)
     higher_is_better = bool((args or {}).get("higher_is_better", True))
     label = str((args or {}).get("name") or "").strip()

@@ -7,8 +7,8 @@ directory, 12KB submission):
     every submission scores 0
 
 The fix keeps two notions apart, which is what these tests pin down:
-  * working copy: the COMPLETE tree, large files hardlinked, small files
-    duplicated so a child's edits stay private
+  * working copy: the COMPLETE tree; submitted files are always private while
+    large out-of-scope payloads may be hardlinked
   * merge scope: only submission subpaths are snapshotted, diffed and applied
   * the budget guard measures duplicated bytes, not tree size
   * large files are compared without hashing
@@ -118,6 +118,30 @@ def test_child_copy_is_complete_and_cheap():
     print("ok: child copy is complete + runnable, bulk hardlinked, edits isolated")
 
 
+def test_large_submitted_file_is_never_hardlinked():
+    """An in-place write through a hardlink bypasses diff, gate and rollback."""
+    _clear_env()
+    os.environ["NANOMA_MERGE_SUBMIT_PATH"] = "1"
+    with tempfile.TemporaryDirectory() as d:
+        tmp = Path(d)
+        rt, submit_path = _mk_runtime(tmp)
+        original = "A" * (2 * 1024 * 1024)
+        _write(submit_path, "solution.bin", original)
+        parent = rt.create_agent(task="root", parent=None, depth=0)
+        child = rt.create_agent(task="c", parent=parent.id, depth=1)
+        private = Path(child._merge_copy) / "solution.bin"
+        shared = submit_path / "solution.bin"
+        assert private.stat().st_ino != shared.stat().st_ino, \
+            "a large file in the whole-tree submission scope must be duplicated"
+        with private.open("r+b") as handle:
+            handle.write(b"child")
+        assert shared.read_text() == original, \
+            "an in-place child edit must not leak into the live submission"
+    _clear_env()
+    os.environ.pop("NANOMA_MERGE_SUBMIT_PATH", None)
+    print("ok: large submitted files are private even when edited in place")
+
+
 def test_child_local_dirs_do_not_collide():
     """Directories are real, so per-child build/benchmark output stays local."""
     _clear_env()
@@ -218,6 +242,7 @@ def test_budget_guard_counts_duplicated_bytes_only():
     _clear_env()
     os.environ["NANOMA_MERGE_SUBMIT_PATH"] = "1"
     os.environ["NANOMA_MERGE_MAX_MB"] = "0.05"  # 50KB of duplication allowed
+    os.environ["SFORGE_SUBMIT_PATHS"] = "src/"
     with tempfile.TemporaryDirectory() as d:
         tmp = Path(d)
         rt, submit_path = _mk_runtime(tmp)
@@ -403,6 +428,7 @@ def main():
     tests = [
         test_scope_roots_parsing,
         test_child_copy_is_complete_and_cheap,
+        test_large_submitted_file_is_never_hardlinked,
         test_child_local_dirs_do_not_collide,
         test_scoped_promote_still_works,
         test_rollback_never_wipes_the_task_directory,

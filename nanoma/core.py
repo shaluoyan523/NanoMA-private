@@ -86,9 +86,10 @@ _CREATE_TOOLS = {"spawn", "spawn_many"}
 _COORDINATION_TOOLS = {"send", "deliver_to_parent", "wait", "query", "kill", "transfer", "set_bio"}
 # Above this size a merge diff compares size+mtime instead of hashing contents.
 _MERGE_HASH_MAX_BYTES = 8 * 1024 * 1024
-# At or above this size a file is hardlinked into a child's working copy instead
-# of being duplicated: bulk payloads (datasets, archives, model weights) are read,
-# never edited in place, so linking them keeps the copy complete but nearly free.
+# At or above this size an OUT-OF-SCOPE file may be hardlinked into a child's
+# working copy. Submitted files are always private, regardless of size: agents
+# routinely edit them in place, and a hardlink would mutate the live submission
+# before the merge gate had a chance to verify or roll it back.
 _MERGE_HARDLINK_MIN_BYTES = 1024 * 1024
 _LIFECYCLE_TOOLS = {"get_cost", "set_status", "rebirth", "submit"}
 _SHELL_TOOLS = {"shell", "tb_shell"}
@@ -10527,6 +10528,13 @@ class Runtime:
             roots.append(Path(posix))
         return tuple(roots)
 
+    def _merge_path_is_scoped(self, relative: Path) -> bool:
+        """Whether a path belongs to the editable/submitted merge surface."""
+        scopes = self._merge_scope_roots()
+        if not scopes:
+            return True
+        return any(relative == scope or scope in relative.parents for scope in scopes)
+
     def _merge_scope_stats(self, root: Path) -> tuple[int, int]:
         """(total_bytes, file_count) of the merge scope under `root`."""
         total = 0
@@ -10544,10 +10552,10 @@ class Runtime:
     def _merge_clone_cost(self, source: Path) -> tuple[int, int]:
         """(bytes actually duplicated, file count) for one complete working copy.
 
-        Only files below the hardlink threshold are duplicated; larger ones are
-        linked, so they cost nothing. Explicit read-only dependency/cache roots
-        are represented by one symlink and pruned from the walk. Stat-only walk,
-        no reads.
+        Submitted files and files below the hardlink threshold are duplicated;
+        only large files outside the submission scope are linked. Explicit
+        read-only dependency/cache roots are represented by one symlink and
+        pruned from the walk. Stat-only walk, no reads.
         """
         duplicated = 0
         count = 0
@@ -10571,7 +10579,11 @@ class Runtime:
                 except OSError:
                     continue
                 count += 1
-                if size < _MERGE_HARDLINK_MIN_BYTES:
+                relative_file = relative_dir / name
+                if (
+                    size < _MERGE_HARDLINK_MIN_BYTES
+                    or self._merge_path_is_scoped(relative_file)
+                ):
                     duplicated += size
         return duplicated, count
 
@@ -10757,11 +10769,11 @@ class Runtime:
         """Clone the COMPLETE task directory as a child's working copy.
 
         Directories are always real, so files the child creates or removes stay
-        local (build output, logs, benchmark results). Small files are duplicated
-        so every edit a child could plausibly make is isolated; files at or above
-        _MERGE_HARDLINK_MIN_BYTES are hardlinked, which keeps the tree complete
-        and runnable at nearly zero cost. Explicit immutable cache/dependency
-        roots are symlinked back to the common task tree. Returns
+        local (build output, logs, benchmark results). Submitted files and small
+        files are duplicated so every edit stays isolated; only large files
+        outside the submission scope are hardlinked, which keeps bulk datasets
+        cheap. Explicit immutable cache/dependency roots are symlinked back to
+        the common task tree. Returns
         (duplicated_bytes, private_files).
         """
         try:
@@ -10817,7 +10829,11 @@ class Runtime:
                         files += 1
                         continue
                     size = src.stat().st_size
-                    if size >= _MERGE_HARDLINK_MIN_BYTES:
+                    relative_file = relative / name
+                    if (
+                        size >= _MERGE_HARDLINK_MIN_BYTES
+                        and not self._merge_path_is_scoped(relative_file)
+                    ):
                         try:
                             os.link(src, dst)
                         except OSError:
@@ -11002,6 +11018,34 @@ class Runtime:
         return out
 
     @staticmethod
+    def _verification_command_is_constant(command: str) -> bool:
+        """Reject a verdict that does not execute any check at all.
+
+        This is deliberately narrow rather than pretending to parse shell. It
+        catches the harmful form seen in a live benchmark (optional setup plus
+        an ``echo``/``printf`` of a fixed JSON verdict) without rejecting normal
+        build scripts that print their verdict after doing real work.
+        """
+        import re
+        segments = [
+            segment.strip()
+            for segment in re.split(r"(?:&&|;|\n)", command or "")
+            if segment.strip()
+        ]
+        meaningful: list[str] = []
+        for segment in segments:
+            if re.match(r"^(?:cd|export)\b", segment):
+                continue
+            if re.match(r"^(?:echo|printf)\b", segment) and (
+                '"ok"' in segment or "'ok'" in segment or "VERIFY:" in segment
+            ):
+                continue
+            if segment in {":", "true"}:
+                continue
+            meaningful.append(segment)
+        return bool(segments) and not meaningful
+
+    @staticmethod
     def _parse_verification_output(text: str) -> tuple[bool | None, float | None]:
         """(ok, metric) from the last machine-readable line of a check's output.
 
@@ -11049,20 +11093,25 @@ class Runtime:
         """Execute a verification command against `workdir` and read its verdict."""
         resolved = command.replace(self.VERIFY_WORKDIR_TOKEN, str(workdir))
         started = time.time()
-        # Same launcher and environment as the shell tool, so a check behaves
-        # identically to the command the agent ran by hand.
+        # Run through bash with pipefail. Without it, `build | tee log` exits
+        # with tee's zero status even when the build failed — exactly how a Lean
+        # project containing compiler errors was registered as a passing gate.
         env = {
             **os.environ,
             "WORKSPACE": str(workdir),
             "SHARED": str(self.config.workspace_root / "shared"),
         }
         try:
+            executable = "/bin/bash" if Path("/bin/bash").is_file() else None
+            launch = f"set -o pipefail\n{resolved}" if executable else resolved
+            shell_options = {"executable": executable} if executable else {}
             proc = await asyncio.create_subprocess_shell(
-                resolved,
+                launch,
                 cwd=str(workdir),
                 env=env,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.STDOUT,
+                **shell_options,
             )
             try:
                 stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=timeout)
@@ -12601,7 +12650,7 @@ class Runtime:
             "deleted": len(deleted),
         })
 
-    async def _merge_promote_pending(self) -> None:
+    async def _merge_promote_pending(self) -> dict | None:
         """Fold in children that still hold unpromoted work, verified once.
 
         A child promotes from its own agent task, which shutdown cancels, so
@@ -12609,7 +12658,8 @@ class Runtime:
         — it only used to survive because children wrote the shared directory
         directly. Applied as a single union and verified once: the union is a
         combination nobody has ever run, which is precisely the artifact that
-        needs checking, and if it fails the keep-best restore rewinds it.
+        needs checking. The union is transactional: a failed check is restored
+        immediately, before preflight or submission can observe the bad tree.
         """
         if not self._merge_active():
             return
@@ -12620,6 +12670,7 @@ class Runtime:
         union_changed: dict[str, Path] = {}
         union_deleted: set[str] = set()
         contributors: list[str] = []
+        signatures: dict[str, tuple] = {}
         for agent in sorted(self.agents.values(), key=lambda a: a.id):
             copy_dir = getattr(agent, "_merge_copy", None)
             if not copy_dir or not Path(copy_dir).is_dir():
@@ -12629,13 +12680,13 @@ class Runtime:
             )
             if not changed and not deleted:
                 continue
-            if self._merge_change_signature(changed, deleted) == getattr(
-                agent, "_merge_promoted_sig", None
-            ):
+            signature = self._merge_change_signature(changed, deleted)
+            if signature == getattr(agent, "_merge_promoted_sig", None):
                 continue
             union_changed.update(changed)
             union_deleted |= deleted
             contributors.append(agent.id)
+            signatures[agent.id] = signature
         if not contributors:
             return
         union_deleted -= set(union_changed)
@@ -12643,23 +12694,72 @@ class Runtime:
         actor = root or self.agents[contributors[0]]
         spec = self._verification_spec_for(actor)
         async with self._merge_get_lock():
+            prev = self._merge_root_dir() / "pending-prev"
+            have_prev = self._merge_copy_tree(target, prev)
+            if spec is not None and not have_prev:
+                result = {
+                    "contributors": contributors,
+                    "changed": len(union_changed),
+                    "deleted": len(union_deleted),
+                    "verified": False,
+                    "metric": None,
+                    "kept": False,
+                    "rolled_back": False,
+                    "reason": "snapshot_failed",
+                }
+                self._emit("root", "merge_promote_pending", result)
+                return result
             self._merge_apply(union_changed, union_deleted, target)
             verification = None
+            rank = None
             if spec is not None:
                 verification = await self._verify_submission_path(actor, spec)
                 rank = self._verify_rank(
                     verification["ok"], verification["metric"],
                     bool(spec.get("higher_is_better", True)),
                 )
-                if rank is not None:
-                    self._record_verified_best(verification["metric"], rank)
-        self._emit("root", "merge_promote_pending", {
+            best_rank = self._merge_best_rank
+            proven = self._verify_metric_is_proven(spec) if spec else False
+            keep = True
+            if verification is not None:
+                if not verification["ok"]:
+                    keep = False
+                elif best_rank is not None and proven and rank is not None and rank < best_rank:
+                    best_state = self._ledger_digest(self._merge_best_signature)
+                    worse = self._metric_is_worse(
+                        [verification["metric"]]
+                        if verification["metric"] is not None else [],
+                        self._ledger_state_metrics(best_state, "verify")
+                        or (
+                            [self._merge_best_metric]
+                            if self._merge_best_metric is not None else []
+                        ),
+                        "verify",
+                    )
+                    keep = worse is False
+            rolled_back = False
+            if keep and rank is not None and verification and verification["ok"]:
+                self._record_verified_best(verification["metric"], rank)
+            elif not keep and have_prev:
+                self._merge_restore_snapshot(prev, target)
+                rolled_back = True
+            for agent_id, signature in signatures.items():
+                self.agents[agent_id]._merge_promoted_sig = signature
+                self._merge_last_child_metric[agent_id] = (
+                    verification or {}
+                ).get("metric")
+        result = {
             "contributors": contributors,
             "changed": len(union_changed),
             "deleted": len(union_deleted),
             "verified": bool(verification and verification["ok"]),
             "metric": (verification or {}).get("metric"),
-        })
+            "kept": keep,
+            "rolled_back": rolled_back,
+            "metric_proven": proven,
+        }
+        self._emit("root", "merge_promote_pending", result)
+        return result
 
     def preserve_final_branches(self, output_dir: Path | str | None = None) -> dict[str, Any]:
         """Freeze the selected submission and every private child worktree.
