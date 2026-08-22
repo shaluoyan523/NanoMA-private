@@ -93,7 +93,10 @@ _MERGE_HASH_MAX_BYTES = 8 * 1024 * 1024
 _MERGE_HARDLINK_MIN_BYTES = 1024 * 1024
 _LIFECYCLE_TOOLS = {"get_cost", "set_status", "rebirth", "submit"}
 _SHELL_TOOLS = {"shell", "tb_shell"}
-_DELIVERY_READ_TOOLS = {"ws_read_file", "ws_grep", "ws_code_outline", "ws_read_symbol", "tb_read_file"}
+_DELIVERY_READ_TOOLS = {
+    "ws_read_file", "ws_grep", "ws_code_outline", "ws_read_symbol",
+    "tb_read_file", "get_task_context",
+}
 _DELIVERY_WRITE_TOOLS = {
     "ws_create_file", "ws_append_file", "ws_replace_string",
     "ws_multi_replace", "ws_apply_patch", "tb_write_file",
@@ -1028,7 +1031,7 @@ class RuntimeConfig:
     tool_policy_prune_pressure_end: float = 0.95
     tool_policy_prune_preserve_tools: set[str] = field(default_factory=lambda: {
         "shell", "tb_shell", "get_cost", "set_status", "submit", "deliver_to_parent",
-        "ws_read_file", "tb_read_file", "ws_create_file", "ws_append_file", "tb_write_file",
+        "get_task_context", "ws_read_file", "tb_read_file", "ws_create_file", "ws_append_file", "tb_write_file",
     })
     tool_policy_prune_shell_capabilities: bool = False
     tool_policy_shell_capability_pressure_start: float = 0.55
@@ -1102,6 +1105,13 @@ class RuntimeConfig:
     force_spawn_many: bool = False
     force_spawn_auto_recover_no_tool: bool = True
     force_spawn_auto_recover_output_token_threshold: int = 2000
+    # Children receive a bounded, runtime-owned task capsule instead of a copy
+    # of the complete root prompt.  The full source remains available in small
+    # on-demand chunks through get_task_context.
+    task_capsule_enabled: bool = True
+    task_capsule_max_tokens: int = 900
+    task_capsule_inline_root_max_tokens: int = 650
+    task_context_chunk_max_tokens: int = 1200
     candidate_delivery_ledger_enabled: bool = True
     candidate_convergence_enabled: bool = False
     candidate_convergence_time_fraction: float = 0.75
@@ -1140,6 +1150,13 @@ class RuntimeConfig:
     child_action_delivery_override_after_output_limits: int = 2
     child_evidence_checkpoint_enabled: bool = True
     child_kill_delivery_grace_enabled: bool = True
+    # A root's first completion attempt becomes the concrete candidate that an
+    # ordinary child must inspect.  Revised candidates may be reviewed again,
+    # up to this bounded number of rounds; the root can explicitly override a
+    # disputed review with a reason instead of being trapped in a loop.
+    final_candidate_review_enabled: bool = True
+    final_candidate_review_max_rounds: int = 2
+    final_candidate_review_fail_open: bool = True
     web_search_failover_after_low_signal: bool = False
     fixed_orchestration_profile: str = field(
         default_factory=lambda: os.environ.get("NANOMA_FIXED_ORCHESTRATION_PROFILE", "")
@@ -1384,6 +1401,7 @@ class Runtime:
         self._candidate_delivery_seq = 0
         self._candidate_delivery_events: dict[str, asyncio.Event] = {}
         self._delivery_contract_history: list[dict[str, Any]] = []
+        self._final_candidate_reviews: dict[str, dict[str, Any]] = {}
         self._candidate_convergence_turn_by_root: dict[str, int] = {}
         self._candidate_convergence_notice_by_root: dict[str, tuple[int, bool]] = {}
         self._candidate_root_parked: set[str] = set()
@@ -2961,6 +2979,320 @@ class Runtime:
         except asyncio.CancelledError:
             return
 
+    def _root_agent_for(self, agent: Agent) -> Agent:
+        """Return the root without copying ancestor histories into a child."""
+        current = agent
+        seen: set[str] = set()
+        while current.parent and current.parent in self.agents and current.id not in seen:
+            seen.add(current.id)
+            current = self.agents[current.parent]
+        return current
+
+    @staticmethod
+    def _slice_text_by_tokens(text: str, offset: int, max_tokens: int) -> str:
+        """Take an exact character window whose estimated size fits the budget."""
+        source = str(text or "")
+        start = max(0, min(len(source), int(offset or 0)))
+        remaining = source[start:]
+        if not remaining or estimate_tokens(remaining) <= max_tokens:
+            return remaining
+        low, high = 0, len(remaining)
+        while low < high:
+            mid = (low + high + 1) // 2
+            if estimate_tokens(remaining[:mid]) <= max_tokens:
+                low = mid
+            else:
+                high = mid - 1
+        return remaining[:max(1, low)]
+
+    def _task_contract_excerpt(self, task: str) -> str:
+        """Extract interface/constraint lines while preserving their exact wording.
+
+        This is deliberately deterministic rather than an LLM summary: the capsule
+        cannot silently rewrite a signature, unit, index convention, or return shape.
+        Omitted prose remains retrievable through ``get_task_context``.
+        """
+        source = str(task or "").strip()
+        if not source:
+            return "(root task is empty)"
+        inline_limit = max(64, int(self.config.task_capsule_inline_root_max_tokens))
+        if estimate_tokens(source) <= inline_limit:
+            return source
+
+        lines = source.splitlines()
+        nonempty = [i for i, line in enumerate(lines) if line.strip()]
+        signal_selected: set[int] = set()
+        signal = re.compile(
+            r"(?:^\s*(?:async\s+def|def|class)\s+|->\s*[^:]+:?\s*$|"
+            r"\b(?:args?|arguments?|parameters?|returns?|output|signature|interface|"
+            r"shape|dtype|index(?:ing)?|units?|constant|constraints?|requirements?|"
+            r"must|required|exactly|do not|allowed|forbidden|previous|prior)\b)",
+            flags=re.IGNORECASE,
+        )
+        for index, line in enumerate(lines):
+            if signal.search(line):
+                signal_selected.update(
+                    range(max(0, index - 1), min(len(lines), index + 2))
+                )
+
+        boundary_selected = set(nonempty[:4]) | set(nonempty[-10:])
+        excerpt_lines: list[str] = ["[Interface and constraint lines]"]
+        excerpt_lines.extend(lines[index] for index in sorted(signal_selected))
+        remaining_boundaries = sorted(boundary_selected - signal_selected)
+        if remaining_boundaries:
+            excerpt_lines.append("[Task opening/closing lines]")
+            excerpt_lines.extend(lines[index] for index in remaining_boundaries)
+        excerpt_lines.append("[… fetch omitted source with get_task_context …]")
+        excerpt = "\n".join(excerpt_lines).strip()
+        return self._slice_text_by_tokens(excerpt, 0, inline_limit)
+
+    def _build_child_task_capsule(self, parent: Agent) -> str:
+        if not self.config.task_capsule_enabled:
+            return ""
+        root = self._root_agent_for(parent)
+        root_task = str(root.task or "")
+        digest = hashlib.sha256(root_task.encode("utf-8")).hexdigest()[:16]
+        paths = _extract_expected_output_paths(root_task)
+        retrieval_limit = max(64, int(self.config.task_context_chunk_max_tokens))
+        header = (
+            "[Runtime compact task capsule]\n"
+            f"Root agent: {root.id}; source SHA-256: {digest}; source chars: {len(root_task)}.\n"
+            "Your Task line above is the child-specific assignment. The exact root task is not "
+            "duplicated into every child context. If omitted scientific/background details matter, "
+            f"call get_task_context(section=\"root\", offset=0); each call is capped at "
+            f"{retrieval_limit} tokens and returns next_offset/has_more.\n"
+            + (
+                "Explicit output paths: " + ", ".join(paths) + ".\n"
+                if paths else ""
+            )
+            + "Exact contract excerpt (verbatim):\n"
+        )
+        capsule = header + self._task_contract_excerpt(root_task)
+        budget = max(128, int(self.config.task_capsule_max_tokens))
+        return self._slice_text_by_tokens(capsule, 0, budget)
+
+    def task_context(
+        self,
+        agent: Agent,
+        *,
+        section: str = "root",
+        offset: int = 0,
+        max_tokens: int | None = None,
+    ) -> dict[str, Any]:
+        """Return bounded, auditable task context without copying whole histories."""
+        section = str(section or "root").strip().lower()
+        root = self._root_agent_for(agent)
+        if section == "root":
+            source = str(root.task or "")
+        elif section == "parent":
+            parent = self.agents.get(agent.parent or "")
+            source = str(parent.task or "") if parent is not None else str(root.task or "")
+        elif section == "assignment":
+            source = str(agent.task or "")
+        elif section == "contract":
+            source = self._task_contract_excerpt(str(root.task or ""))
+        elif section == "final_candidate":
+            review = self._final_candidate_reviews.get(root.id) or {}
+            if agent.id not in {root.id, review.get("reviewer_id")}:
+                return {"error": "final_candidate is visible only to the root and its active final reviewer"}
+            source = str(review.get("candidate") or "")
+            if not source:
+                return {"error": "no final candidate is pending review"}
+        else:
+            return {
+                "error": "unknown section",
+                "available_sections": ["root", "parent", "assignment", "contract", "final_candidate"],
+            }
+
+        try:
+            start = max(0, min(len(source), int(offset or 0)))
+        except (TypeError, ValueError):
+            return {"error": "offset must be a non-negative integer"}
+        configured_limit = max(64, int(self.config.task_context_chunk_max_tokens))
+        try:
+            requested_limit = int(max_tokens) if max_tokens is not None else configured_limit
+        except (TypeError, ValueError):
+            return {"error": "max_tokens must be an integer"}
+        effective_limit = max(64, min(configured_limit, requested_limit))
+        content = self._slice_text_by_tokens(source, start, effective_limit)
+        next_offset = min(len(source), start + len(content))
+        return {
+            "section": section,
+            "content": content,
+            "offset": start,
+            "next_offset": next_offset,
+            "has_more": next_offset < len(source),
+            "total_chars": len(source),
+            "chunk_tokens": estimate_tokens(content),
+            "max_tokens": effective_limit,
+            "sha256": hashlib.sha256(source.encode("utf-8")).hexdigest(),
+        }
+
+    def _final_review_delivery(self, root_id: str, reviewer_id: str) -> dict[str, Any] | None:
+        for record in reversed(self._candidate_deliveries):
+            if (
+                record.get("parent_id") == root_id
+                and record.get("agent_id") == reviewer_id
+                and str(record.get("source") or "") == "deliver_to_parent"
+            ):
+                return record
+        return None
+
+    async def ensure_final_candidate_review(
+        self,
+        agent: Agent,
+        candidate: str,
+        *,
+        override_reason: str = "",
+    ) -> dict[str, Any]:
+        """Gate root completion on a review of the concrete submitted candidate."""
+        if not self.config.final_candidate_review_enabled or agent.parent is not None:
+            return {"ready": True, "reason": "disabled_or_not_root"}
+        if not agent.children:
+            return {"ready": True, "reason": "single_agent_path"}
+
+        candidate = str(candidate or agent.result or "").strip()
+        if not candidate:
+            return {"ready": True, "reason": "no_text_candidate"}
+        digest = hashlib.sha256(candidate.encode("utf-8")).hexdigest()
+        override_reason = str(override_reason or "").strip()
+        if override_reason:
+            self._emit(agent.id, "final_candidate_review_overridden", {
+                "candidate_sha256": digest,
+                "reason": override_reason[:500],
+            })
+            return {"ready": True, "reason": "explicit_override", "candidate_sha256": digest}
+
+        state = self._final_candidate_reviews.get(agent.id)
+        if state and state.get("candidate_sha256") == digest:
+            reviewer_id = str(state.get("reviewer_id") or "")
+            reviewer = self.agents.get(reviewer_id)
+            delivery = self._final_review_delivery(agent.id, reviewer_id)
+            if delivery is not None:
+                answer = str(delivery.get("answer") or "").strip()
+                verdict = answer.split(None, 1)[0].upper().rstrip(":") if answer else ""
+                state.update({"verdict": verdict, "review_seq": delivery.get("seq")})
+                if verdict == "ACCEPT":
+                    self._emit(agent.id, "final_candidate_review_accepted", {
+                        "reviewer": reviewer_id,
+                        "round": state.get("round"),
+                        "candidate_sha256": digest,
+                    })
+                    return {
+                        "ready": True,
+                        "reason": "accepted",
+                        "reviewer_id": reviewer_id,
+                        "round": state.get("round"),
+                        "candidate_sha256": digest,
+                    }
+                return {
+                    "ready": False,
+                    "reason": "revision_requested" if verdict == "REVISE" else "unclear_verdict",
+                    "reviewer_id": reviewer_id,
+                    "round": state.get("round"),
+                    "verdict": answer[:200],
+                    "evidence": str(delivery.get("evidence") or "")[:2000],
+                    "instruction": (
+                        "Revise the concrete result and call set_status(done, result=<revised candidate>) "
+                        "again. If the reviewer is wrong, supply review_override_reason with a concise rationale."
+                    ),
+                }
+            if reviewer is not None and reviewer.status not in {"done", "failed", "killed"}:
+                return {
+                    "ready": False,
+                    "reason": "review_in_progress",
+                    "reviewer_id": reviewer_id,
+                    "round": state.get("round"),
+                    "instruction": "Wait for the final reviewer to deliver its verdict, then retry set_status(done).",
+                }
+            if self.config.final_candidate_review_fail_open:
+                self._emit(agent.id, "final_candidate_review_degraded", {
+                    "reviewer": reviewer_id,
+                    "reason": "reviewer_finished_without_formal_delivery",
+                    "candidate_sha256": digest,
+                })
+                return {"ready": True, "reason": "reviewer_failed_open", "reviewer_id": reviewer_id}
+            return {
+                "ready": False,
+                "reason": "reviewer_finished_without_formal_delivery",
+                "reviewer_id": reviewer_id,
+                "instruction": "Retry after collecting a formal reviewer delivery or use review_override_reason.",
+            }
+
+        previous_round = int((state or {}).get("round") or 0)
+        max_rounds = max(1, int(self.config.final_candidate_review_max_rounds))
+        if previous_round >= max_rounds:
+            return {
+                "ready": False,
+                "reason": "review_round_limit",
+                "rounds": previous_round,
+                "instruction": (
+                    "The candidate changed after the maximum review rounds. Either restore the last reviewed "
+                    "candidate or call set_status with review_override_reason explaining why the change is safe."
+                ),
+            }
+
+        round_number = previous_round + 1
+        self._final_candidate_reviews[agent.id] = {
+            "candidate": candidate,
+            "candidate_sha256": digest,
+            "round": round_number,
+            "created_at": time.time(),
+        }
+        review_task = (
+            "[Runtime final-candidate review]\n"
+            "Review the root's concrete pending submission, not an independently invented solution. "
+            "First call get_task_context(section=\"final_candidate\", offset=0) and continue with "
+            "next_offset while has_more=true. Fetch section=\"contract\" and only the root-task chunks "
+            "needed to resolve omitted details. Audit the exact signature, output shape/type, index base, "
+            "units/constants, boundary and rounding conventions, and library/API spellings. Do not run hidden "
+            "tests or use benchmark-private answers. Then call deliver_to_parent exactly once: answer must be "
+            "either ACCEPT or REVISE; evidence must name concrete defects and the smallest correction. "
+            "Do not place a replacement solution in answer."
+        )
+        if "spawn" in self.config.disabled_tools:
+            spawn_result: dict[str, Any] = {"error": "spawn is disabled by runtime configuration"}
+        else:
+            # This is a bounded completion gate, not a new planning decision.
+            # Authorize exactly this spawn so end-of-run policy pressure cannot
+            # silently skip the review, then immediately restore normal policy.
+            self._strategy_spawn_authorized.add(agent.id)
+            try:
+                spawn_result = await self._invoke_meta_spawn({"task": review_task}, agent)
+            finally:
+                self._strategy_spawn_authorized.discard(agent.id)
+        reviewer_id = str((spawn_result or {}).get("agent_id") or "") if isinstance(spawn_result, dict) else ""
+        if not reviewer_id:
+            self._final_candidate_reviews.pop(agent.id, None)
+            detail = str(spawn_result)[:500]
+            self._emit(agent.id, "final_candidate_review_spawn_failed", {
+                "round": round_number,
+                "candidate_sha256": digest,
+                "detail": detail,
+            })
+            if self.config.final_candidate_review_fail_open:
+                return {"ready": True, "reason": "review_spawn_failed_open", "detail": detail}
+            return {"ready": False, "reason": "review_spawn_failed", "detail": detail}
+
+        self._final_candidate_reviews[agent.id]["reviewer_id"] = reviewer_id
+        reviewer = self.agents.get(reviewer_id)
+        if reviewer is not None:
+            setattr(reviewer, "_final_candidate_reviewer_for", agent.id)
+        self._emit(agent.id, "final_candidate_review_started", {
+            "reviewer": reviewer_id,
+            "round": round_number,
+            "candidate_sha256": digest,
+            "candidate_chars": len(candidate),
+        })
+        return {
+            "ready": False,
+            "reason": "review_started",
+            "reviewer_id": reviewer_id,
+            "round": round_number,
+            "candidate_sha256": digest,
+            "instruction": "Wait for the reviewer delivery, incorporate any concrete correction, then retry set_status(done).",
+        }
+
     def create_agent(
         self,
         task: str,
@@ -2991,6 +3323,7 @@ class Runtime:
                 "parent_task": p.task[:100],
                 "siblings": sibling_info,
                 "depth": depth,
+                "task_capsule": self._build_child_task_capsule(p),
             }
 
         # Merge-submit-path: a spawned child works on a private copy of the task
@@ -14386,6 +14719,8 @@ class Runtime:
         # Context about spawner (for sub-agents)
         context_section = ""
         if parent_context:
+            capsule = str(parent_context.get("task_capsule") or "").strip()
+            capsule_section = f"\n## Task Capsule\n{capsule}\n" if capsule else ""
             context_section = f"""
 ## Your Context
 - Spawned by: agent "{parent_context['parent_id']}" (task: {parent_context['parent_task']})
@@ -14396,9 +14731,10 @@ class Runtime:
 - Do not use query or send for final result delivery. If evidence is incomplete, deliver your best concise candidate with lower confidence instead of returning an empty result.
 - The root owns final files in the shared workspace. Do not create or overwrite a shared final artifact named by the parent task; keep research notes private and use deliver_to_parent for your handoff.
 {web_search_line}
+{capsule_section}
 """
 
-        coordination_tools = {"spawn", "send", "deliver_to_parent", "wait", "query", "kill", "transfer", "set_bio"}
+        coordination_tools = {"spawn", "send", "deliver_to_parent", "wait", "query", "kill", "transfer", "set_bio", "get_task_context"}
         has_coordination_tools = bool(coordination_tools - self.config.disabled_tools)
         if has_coordination_tools:
             meta_line = "- meta tools: coordination (spawn, send, deliver_to_parent, wait, query, kill, transfer, etc.)"
@@ -15018,6 +15354,7 @@ When available, tools are organized in 3 layers:
             "strategy_spawn_authorized": sorted(self._strategy_spawn_authorized),
             "candidate_deliveries": copy.deepcopy(self._candidate_deliveries),
             "candidate_delivery_seq": self._candidate_delivery_seq,
+            "final_candidate_reviews": copy.deepcopy(self._final_candidate_reviews),
             "candidate_convergence_turn_by_root": copy.deepcopy(
                 self._candidate_convergence_turn_by_root
             ),
@@ -15127,6 +15464,9 @@ When available, tools are organized in 3 layers:
         )
         self._candidate_delivery_seq = int(saved.get("candidate_delivery_seq") or 0)
         self._candidate_delivery_events = {}
+        self._final_candidate_reviews = copy.deepcopy(
+            saved.get("final_candidate_reviews") or {}
+        )
         self._candidate_convergence_turn_by_root = copy.deepcopy(
             saved.get("candidate_convergence_turn_by_root") or {}
         )

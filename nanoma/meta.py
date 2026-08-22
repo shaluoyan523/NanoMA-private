@@ -956,6 +956,20 @@ async def meta_get_cost(args: dict[str, Any], agent: "Agent", runtime: "Runtime"
     return result
 
 
+# ─── bounded task context ───────────────────────────────────────────────────
+
+async def meta_get_task_context(
+    args: dict[str, Any], agent: "Agent", runtime: "Runtime"
+) -> dict[str, Any]:
+    """Read an exact task/candidate chunk without importing another agent's history."""
+    return runtime.task_context(
+        agent,
+        section=str(args.get("section", "root") or "root"),
+        offset=args.get("offset", 0),
+        max_tokens=args.get("max_tokens"),
+    )
+
+
 # ─── set_status ──────────────────────────────────────────────────────────────
 
 async def meta_set_status(args: dict[str, Any], agent: "Agent", runtime: "Runtime") -> dict[str, Any]:
@@ -965,6 +979,17 @@ async def meta_set_status(args: dict[str, Any], agent: "Agent", runtime: "Runtim
     if status not in ("done", "idle"):
         return {"error": "status must be 'done' or 'idle'"}
     if status == "done" and agent.parent is None:
+        review = await runtime.ensure_final_candidate_review(
+            agent,
+            str(result or agent.result or ""),
+            override_reason=str(args.get("review_override_reason", "") or ""),
+        )
+        if not review.get("ready"):
+            return {
+                "error": "final candidate review is not satisfied; status remains running",
+                "status": agent.status,
+                "review": review,
+            }
         delivery = runtime.finalize_delivery(agent, trigger="set_status")
         contract = runtime.config.delivery_contract
         if contract is not None and contract.block_done and not delivery.get("ready"):
@@ -1194,6 +1219,20 @@ META_TOOLS: dict[str, dict[str, Any]] = {
             "bio": {"type": "string", "description": "Short description of your role, expertise, or current status"},
         }, "required": ["bio"]},
     }}},
+    "get_task_context": {"handler": meta_get_task_context, "is_meta": True, "schema": {"type": "function", "function": {
+        "name": "get_task_context",
+        "description": (
+            "Read an exact bounded chunk of the root task, parent task, current assignment, "
+            "verbatim contract excerpt, or pending final candidate. Use next_offset while "
+            "has_more=true; the runtime caps every call so full prompts are not copied into "
+            "every child context."
+        ),
+        "parameters": {"type": "object", "properties": {
+            "section": {"type": "string", "enum": ["root", "parent", "assignment", "contract", "final_candidate"], "default": "root"},
+            "offset": {"type": "integer", "minimum": 0, "description": "Character offset returned by the previous chunk", "default": 0},
+            "max_tokens": {"type": "integer", "minimum": 64, "description": "Requested chunk budget; clamped to the runtime maximum"},
+        }},
+    }}},
     "get_cost": {"handler": meta_get_cost, "is_meta": True, "schema": {"type": "function", "function": {
         "name": "get_cost",
         "description": "Get your identity and resource status. Returns: your agent_id, bio, parent, children list, context_tokens/limit, turns used/max, elapsed time, and remaining budget.",
@@ -1205,6 +1244,7 @@ META_TOOLS: dict[str, dict[str, Any]] = {
         "parameters": {"type": "object", "properties": {
             "status": {"type": "string", "enum": ["done", "idle"], "description": "'done' = terminate, 'idle' = sleep until messaged"},
             "result": {"type": "string", "description": "Summary of your output (sent to parent on 'done')"},
+            "review_override_reason": {"type": "string", "description": "Root only: explicit rationale for overriding a disputed or unavailable final review"},
         }, "required": ["status"]},
     }}},
     "rebirth": {"handler": meta_rebirth, "is_meta": True, "schema": {"type": "function", "function": {

@@ -1055,7 +1055,12 @@ async def test_same_model_judge_spawn_and_wait(tmp_workspace, monkeypatch):
                     usage=UsageRecord(input_tokens=100, output_tokens=50, model=model),
                 )
 
-    config = RuntimeConfig(workspace_root=tmp_workspace, budget=10.0, log_dir=None)
+    config = RuntimeConfig(
+        workspace_root=tmp_workspace,
+        budget=10.0,
+        final_candidate_review_enabled=False,
+        log_dir=None,
+    )
     rt = Runtime(config=config, llm_call=mock_llm)
     result = await rt.run("parent task")
     assert result == "parent done"

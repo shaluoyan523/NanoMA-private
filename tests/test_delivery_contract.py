@@ -6,8 +6,8 @@ import pytest
 
 from nanoma import DeliveryContract, DeliveryTree, Runtime, RuntimeConfig
 from nanoma.cost import UsageRecord
-from nanoma.llm import LLMResponse, ToolCall
-from nanoma.meta import meta_set_status, meta_submit
+from nanoma.llm import LLMResponse, ToolCall, estimate_tokens
+from nanoma.meta import meta_get_task_context, meta_set_status, meta_submit
 
 
 def _runtime(tmp_path: Path, *, contract: DeliveryContract | None = None) -> Runtime:
@@ -181,3 +181,88 @@ async def test_runtime_exit_publishes_when_turn_limit_bypasses_done(tmp_path):
 def test_delivery_tree_rejects_unsafe_paths(unsafe):
     with pytest.raises(ValueError):
         DeliveryTree(target=unsafe, candidates=("output",), required=("test.mjs",))
+
+
+@pytest.mark.asyncio
+async def test_child_capsule_is_bounded_and_full_task_is_paged(tmp_path):
+    runtime = Runtime(
+        config=RuntimeConfig(
+            workspace_root=tmp_path / "workspace",
+            task_capsule_max_tokens=180,
+            task_capsule_inline_root_max_tokens=90,
+            task_context_chunk_max_tokens=120,
+            final_candidate_review_enabled=False,
+            log_dir=None,
+        )
+    )
+    root_task = (
+        "Solve the numerical routine.\n"
+        + "Background material that should not be copied into every child.\n" * 400
+        + "def evolve(state: np.ndarray, steps: int) -> np.ndarray:\n"
+        + "Return shape must be exactly (steps, state.size); indexing is one-based.\n"
+    )
+    root = runtime.create_agent(root_task)
+    child = runtime.create_agent("Audit the output contract.", parent=root.id, depth=1)
+
+    system = str(child.history[0]["content"])
+    capsule = system.split("## Task Capsule\n", 1)[1].split("\n## Tool Philosophy", 1)[0].strip()
+    assert estimate_tokens(capsule) <= 180
+    assert "def evolve" in capsule
+    assert root_task not in system
+
+    first = await meta_get_task_context(
+        {"section": "root", "offset": 0, "max_tokens": 10_000}, child, runtime
+    )
+    assert first["chunk_tokens"] <= 120
+    assert first["has_more"] is True
+    second = await meta_get_task_context(
+        {"section": "root", "offset": first["next_offset"]}, child, runtime
+    )
+    assert second["offset"] == first["next_offset"]
+    assert first["content"] + second["content"] == root_task[:second["next_offset"]]
+
+
+@pytest.mark.asyncio
+async def test_root_completion_reviews_the_exact_candidate(tmp_path):
+    runtime = Runtime(
+        config=RuntimeConfig(
+            workspace_root=tmp_path / "workspace",
+            final_candidate_review_enabled=True,
+            log_dir=None,
+        )
+    )
+    root = runtime.create_agent("Return code with the exact required shape.")
+    prior_child = runtime.create_agent("derive a candidate", parent=root.id, depth=1)
+    prior_child.status = "done"
+    runtime.start_agent = lambda _agent: None
+
+    candidate = "def solve(x):\n    return x[:, None]"
+    first = await meta_set_status(
+        {"status": "done", "result": candidate}, root, runtime
+    )
+    assert first["review"]["reason"] == "review_started"
+    assert root.status == "running"
+
+    reviewer_id = first["review"]["reviewer_id"]
+    reviewer = runtime.agents[reviewer_id]
+    exact = await meta_get_task_context(
+        {"section": "final_candidate", "offset": 0}, reviewer, runtime
+    )
+    assert exact["content"] == candidate
+
+    runtime._record_candidate_delivery(
+        reviewer,
+        parent_id=root.id,
+        answer="ACCEPT",
+        evidence="Signature and (n, 1) output shape match the root contract.",
+        confidence=0.9,
+        method="exact final candidate review",
+        source="deliver_to_parent",
+    )
+    reviewer.status = "done"
+    second = await meta_set_status(
+        {"status": "done", "result": candidate}, root, runtime
+    )
+    assert second["status"] == "done"
+    assert root.result == candidate
+    assert any(event["event"] == "final_candidate_review_accepted" for event in runtime._events)
