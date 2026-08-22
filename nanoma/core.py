@@ -24,6 +24,7 @@ from typing import Any, Callable, Awaitable, Literal
 from urllib.parse import parse_qsl, quote_plus, unquote, urlparse
 
 from nanoma.cost import CostLedger, UsageRecord
+from nanoma.delivery import DeliveryContract, publish_delivery_contract
 from nanoma.llm import (
     LLMResponse, Message, RetryConfig, ToolCall, ToolDef,
     anthropic_compatible_call,
@@ -1008,6 +1009,7 @@ class RuntimeConfig:
     workspace_root: Path = field(default_factory=lambda: Path("./workspace"))
     workspace_extra_roots: list[Path] = field(default_factory=list)
     shared_dir: str = "shared"
+    delivery_contract: DeliveryContract | None = None
     system_extra_instructions: str = field(
         default_factory=lambda: os.environ.get("NANOMA_SYSTEM_EXTRA_INSTRUCTIONS", "")
     )
@@ -1381,6 +1383,7 @@ class Runtime:
         self._candidate_deliveries: list[dict[str, Any]] = []
         self._candidate_delivery_seq = 0
         self._candidate_delivery_events: dict[str, asyncio.Event] = {}
+        self._delivery_contract_history: list[dict[str, Any]] = []
         self._candidate_convergence_turn_by_root: dict[str, int] = {}
         self._candidate_convergence_notice_by_root: dict[str, tuple[int, bool]] = {}
         self._candidate_root_parked: set[str] = set()
@@ -3043,6 +3046,77 @@ class Runtime:
         })
         return agent
 
+    def _delivery_candidate_bases(self, agent: Agent) -> list[Path]:
+        """Ordered roots that may contain a complete final artifact tree."""
+
+        contract = self.config.delivery_contract
+        if contract is None:
+            return []
+        candidates = [
+            agent.workspace,
+            contract.target_root,
+            self._tool_context.shared_dir,
+            self.config.workspace_root,
+            *self.config.workspace_extra_roots,
+        ]
+        candidates.extend(
+            other.workspace
+            for other in sorted(self.agents.values(), key=lambda item: item.id)
+            if other.id != agent.id
+        )
+        result: list[Path] = []
+        seen: set[str] = set()
+        for candidate in candidates:
+            path = Path(candidate).expanduser()
+            try:
+                key = str(path.resolve())
+            except OSError:
+                key = str(path.absolute())
+            if key in seen:
+                continue
+            seen.add(key)
+            result.append(path)
+        return result
+
+    def finalize_delivery(
+        self,
+        agent: Agent,
+        *,
+        trigger: str,
+        explicit_paths: list[Path] | None = None,
+    ) -> dict[str, Any]:
+        """Publish and validate the root agent's benchmark delivery contract.
+
+        Child artifacts remain handoffs to their parent.  Only the root can
+        publish the official destination, which prevents a late child from
+        replacing a reconciled result behind the root's back.
+        """
+
+        contract = self.config.delivery_contract
+        if contract is None or agent.parent is not None:
+            return {"ready": True, "trigger": trigger, "contract": False}
+
+        # Only the current submit call gets explicit priority. Later done/exit
+        # checks prefer an already-published official tree, so an older artifact
+        # record cannot overwrite newer reconciled work.
+        explicit = list(explicit_paths or [])
+        report = publish_delivery_contract(
+            contract,
+            candidate_bases=self._delivery_candidate_bases(agent),
+            explicit_paths=explicit,
+            trigger=trigger,
+        ).as_dict()
+        report["contract"] = True
+        self._delivery_contract_history.append(copy.deepcopy(report))
+        self._emit(agent.id, "delivery_contract_ready" if report["ready"] else "delivery_contract_blocked", {
+            "trigger": trigger,
+            "published": report.get("published", []),
+            "satisfied": report.get("satisfied", []),
+            "missing": report.get("missing", []),
+            "checked_candidates": report.get("checked_candidates", [])[-20:],
+        })
+        return report
+
     def start_agent(self, agent: Agent):
         agent._task = asyncio.ensure_future(self._agent_loop(agent))
 
@@ -3575,6 +3649,9 @@ class Runtime:
         except Exception as exc:
             self._emit("root", "merge_promote_error", {"detail": str(exc)[:300]})
         self._merge_restore_best()
+        # The finalizer is runtime-owned and therefore also runs on deadline,
+        # max-turn, cancellation, and other exits that bypass set_status.
+        self.finalize_delivery(root, trigger="runtime_exit")
         return root.result or ""
 
     # ─── Message delivery ────────────────────────────────────────────────
@@ -14336,6 +14413,19 @@ class Runtime:
 {extra}
 """
 
+        delivery_section = ""
+        contract = self.config.delivery_contract
+        if contract is not None and not parent_context:
+            required = ", ".join(str(path) for path in contract.required_targets())
+            delivery_section = f"""
+## Runtime Delivery Contract
+- Required final outputs: {required}
+- `submit` accepts a file or a complete directory tree. The runtime preserves the
+  surrounding tree and atomically publishes it to the required destination.
+- `set_status(done)` is refused while a required output is missing or empty. A
+  failed submit is not completion; fix the path or submit the complete tree.
+"""
+
         return f"""You are agent "{agent_id}" in a multi-agent system.
 
 Task: {task}
@@ -14343,6 +14433,7 @@ Workspace: {workspace} (private to you)
 Shared: {shared} (visible to all agents){time_info}
 {context_section}
 {extra_section}
+{delivery_section}
 ## Tool Philosophy
 Available tools can change from turn to turn. Only call tools that are present in the
 current tool schema. If a tool is absent, switch to one of the available tools instead
@@ -14608,6 +14699,22 @@ When available, tools are organized in 3 layers:
                 "attempts": self._rollback_attempts,
                 "history": copy.deepcopy(self._rollback_history),
                 "last_checkpoint": str(self._last_checkpoint_path) if self._last_checkpoint_path else None,
+            },
+            "delivery_contract": {
+                "enabled": self.config.delivery_contract is not None,
+                "ready": bool(
+                    self._delivery_contract_history
+                    and self._delivery_contract_history[-1].get("ready")
+                ),
+                "attempts": len(self._delivery_contract_history),
+                "published_trees": sum(
+                    len(record.get("published") or [])
+                    for record in self._delivery_contract_history
+                ),
+                "last": (
+                    copy.deepcopy(self._delivery_contract_history[-1])
+                    if self._delivery_contract_history else None
+                ),
             },
             "agents": {
                 "total_spawned": n,

@@ -10,6 +10,8 @@ import time
 from pathlib import Path
 from typing import Any, TYPE_CHECKING
 
+from nanoma.delivery import copy_submission_to_shared
+
 if TYPE_CHECKING:
     from nanoma.core import Agent, Runtime
 
@@ -962,10 +964,30 @@ async def meta_set_status(args: dict[str, Any], agent: "Agent", runtime: "Runtim
     result = args.get("result", "")
     if status not in ("done", "idle"):
         return {"error": "status must be 'done' or 'idle'"}
+    if status == "done" and agent.parent is None:
+        delivery = runtime.finalize_delivery(agent, trigger="set_status")
+        contract = runtime.config.delivery_contract
+        if contract is not None and contract.block_done and not delivery.get("ready"):
+            missing = delivery.get("missing") or []
+            return {
+                "error": (
+                    "delivery contract is not satisfied; status remains running. "
+                    "Write or submit a complete candidate tree for the required output."
+                ),
+                "status": agent.status,
+                "delivery": {
+                    "ready": False,
+                    "missing": missing,
+                    "checked_candidates": delivery.get("checked_candidates", [])[-20:],
+                },
+            }
     agent.status = status
     if result is not None and result != "":
         agent.result = str(result)
-    return {"status": status}
+    response = {"status": status}
+    if status == "done" and agent.parent is None and runtime.config.delivery_contract is not None:
+        response["delivery"] = delivery
+    return response
 
 
 # ─── rebirth ─────────────────────────────────────────────────────────────────
@@ -987,7 +1009,7 @@ async def meta_rebirth(args: dict[str, Any], agent: "Agent", runtime: "Runtime")
 # ─── submit ──────────────────────────────────────────────────────────────────
 
 async def meta_submit(args: dict[str, Any], agent: "Agent", runtime: "Runtime") -> dict[str, Any]:
-    """Submit a file as artifact."""
+    """Submit a file or complete directory tree as an artifact."""
     from nanoma.core import Artifact
     path_str = args.get("path", "")
     if not path_str:
@@ -1002,13 +1024,25 @@ async def meta_submit(args: dict[str, Any], agent: "Agent", runtime: "Runtime") 
     shared = runtime._tool_context.shared_dir
     shared.mkdir(parents=True, exist_ok=True)
     dest = shared / path.name
-    if dest.exists() and dest.is_dir():
-        return {"error": f"Shared destination is a directory: {dest}"}
-    shutil.copy2(path, dest)
+    try:
+        copy_submission_to_shared(path, dest)
+    except Exception as exc:
+        return {"error": f"Failed to copy submission: {type(exc).__name__}: {exc}"}
 
     artifact = Artifact(path=path_str, absolute_path=path, description=args.get("description", ""), agent_id=agent.id)
     agent.artifacts.append(artifact)
-    return {"submitted": path_str, "shared_copy": str(dest)}
+    response = {
+        "submitted": path_str,
+        "shared_copy": str(dest),
+        "kind": "directory" if path.is_dir() else "file",
+    }
+    if agent.parent is None and runtime.config.delivery_contract is not None:
+        response["delivery"] = runtime.finalize_delivery(
+            agent,
+            trigger="submit",
+            explicit_paths=[path],
+        )
+    return response
 
 
 # ─── batch ───────────────────────────────────────────────────────────────────
@@ -1185,9 +1219,9 @@ META_TOOLS: dict[str, dict[str, Any]] = {
     }}},
     "submit": {"handler": meta_submit, "is_meta": True, "schema": {"type": "function", "function": {
         "name": "submit",
-        "description": "Mark a file as a final deliverable/artifact. The file is copied to the shared/ directory so all agents and the user can access it. Use for outputs that represent completed work.",
+        "description": "Submit a file or complete directory tree as a final deliverable. It is copied to shared storage without flattening directories. When a runtime delivery contract is active, the complete candidate tree is atomically published to the benchmark's required final path.",
         "parameters": {"type": "object", "properties": {
-            "path": {"type": "string", "description": "Path to the file to submit (relative to your workspace)"},
+            "path": {"type": "string", "description": "Path to the file or directory tree to submit (relative to your workspace)"},
             "description": {"type": "string", "description": "Brief description of what this deliverable is"},
         }, "required": ["path"]},
     }}},
