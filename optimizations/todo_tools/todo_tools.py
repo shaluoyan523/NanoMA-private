@@ -103,6 +103,9 @@ async def meta_task_create(
     args: dict[str, Any], agent: "Agent", runtime: "Runtime"
 ) -> dict[str, Any]:
     """Create a new pending task in the current agent's task list."""
+    if getattr(runtime, "_is_review_only", lambda _agent: False)(agent):
+        runtime._emit(agent.id, "review_only_task_create_blocked", {})
+        return {"error": "final-candidate reviewer is review-only and cannot create or delegate tasks"}
     subject = str(args.get("subject", "") or "").strip()
     description = str(args.get("description", "") or "").strip()
     active_form = str(args.get("activeForm", "") or args.get("active_form", "") or "").strip()

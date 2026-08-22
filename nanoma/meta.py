@@ -188,6 +188,10 @@ async def meta_spawn(args: dict[str, Any], agent: "Agent", runtime: "Runtime") -
     """Create a child agent."""
     from nanoma.core import ResourceQuota
 
+    if getattr(runtime, "_is_review_only", lambda _agent: False)(agent):
+        runtime._emit(agent.id, "review_only_spawn_blocked", {})
+        return {"error": "final-candidate reviewer is review-only and cannot spawn"}
+
     task = _spawn_task_from_args(args)
     original_task = task
     original_task_preview = original_task[:200]
@@ -262,7 +266,14 @@ async def meta_spawn(args: dict[str, Any], agent: "Agent", runtime: "Runtime") -
         model = runtime.config.allowed_models[0]
 
     child_quota = ResourceQuota(budget=float("inf"), time_limit=agent.quota.time_limit, max_turns=agent.quota.max_turns)
-    child = runtime.create_agent(task=task, model=model, quota=child_quota, parent=agent.id, depth=agent.depth + 1)
+    child = runtime.create_agent(
+        task=task,
+        model=model,
+        quota=child_quota,
+        parent=agent.id,
+        depth=agent.depth + 1,
+        review_only=bool(args.get("_review_only", False)),
+    )
     runtime.start_agent(child)
 
     # Emit spawn event from parent's perspective (for viewer)

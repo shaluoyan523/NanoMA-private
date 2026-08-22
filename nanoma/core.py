@@ -2989,6 +2989,41 @@ class Runtime:
         return current
 
     @staticmethod
+    def _task_payload(task: str) -> str:
+        """Return the authoritative task payload, excluding root-only control text.
+
+        Benchmark runners may wrap an official prompt in runtime orchestration
+        instructions. Those instructions govern the root and must not become a
+        recursively inherited child contract. Explicit payload tags provide a
+        deterministic boundary without asking an LLM to rewrite the task.
+        """
+        source = str(task or "").strip()
+        for tag in (
+            "official_scicode_prompt",
+            "official_task",
+            "benchmark_task",
+            "task_payload",
+        ):
+            match = re.search(
+                rf"<{tag}>\s*(.*?)\s*</{tag}>",
+                source,
+                flags=re.IGNORECASE | re.DOTALL,
+            )
+            if match:
+                return match.group(1).strip()
+        return source
+
+    @staticmethod
+    def _is_review_only(agent: Agent) -> bool:
+        """Whether this is a runtime-owned, non-expanding final reviewer."""
+        return bool(
+            getattr(agent, "_review_only", False)
+            or str(getattr(agent, "task", "") or "").lstrip().startswith(
+                "[Runtime final-candidate review]"
+            )
+        )
+
+    @staticmethod
     def _slice_text_by_tokens(text: str, offset: int, max_tokens: int) -> str:
         """Take an exact character window whose estimated size fits the budget."""
         source = str(text or "")
@@ -3050,15 +3085,16 @@ class Runtime:
         if not self.config.task_capsule_enabled:
             return ""
         root = self._root_agent_for(parent)
-        root_task = str(root.task or "")
+        root_task = self._task_payload(str(root.task or ""))
         digest = hashlib.sha256(root_task.encode("utf-8")).hexdigest()[:16]
         paths = _extract_expected_output_paths(root_task)
         retrieval_limit = max(64, int(self.config.task_context_chunk_max_tokens))
         header = (
             "[Runtime compact task capsule]\n"
             f"Root agent: {root.id}; source SHA-256: {digest}; source chars: {len(root_task)}.\n"
-            "Your Task line above is the child-specific assignment. The exact root task is not "
-            "duplicated into every child context. If omitted scientific/background details matter, "
+            "Your Task line above is the child-specific assignment. The exact authoritative task "
+            "payload is not duplicated into every child context. If omitted scientific/background "
+            "details matter, "
             f"call get_task_context(section=\"root\", offset=0); each call is capped at "
             f"{retrieval_limit} tokens and returns next_offset/has_more.\n"
             + (
@@ -3083,14 +3119,18 @@ class Runtime:
         section = str(section or "root").strip().lower()
         root = self._root_agent_for(agent)
         if section == "root":
-            source = str(root.task or "")
+            source = self._task_payload(str(root.task or ""))
         elif section == "parent":
             parent = self.agents.get(agent.parent or "")
-            source = str(parent.task or "") if parent is not None else str(root.task or "")
+            source = self._task_payload(
+                str(parent.task or "") if parent is not None else str(root.task or "")
+            )
         elif section == "assignment":
             source = str(agent.task or "")
         elif section == "contract":
-            source = self._task_contract_excerpt(str(root.task or ""))
+            source = self._task_contract_excerpt(
+                self._task_payload(str(root.task or ""))
+            )
         elif section == "final_candidate":
             review = self._final_candidate_reviews.get(root.id) or {}
             if agent.id not in {root.id, review.get("reviewer_id")}:
@@ -3258,7 +3298,9 @@ class Runtime:
             # silently skip the review, then immediately restore normal policy.
             self._strategy_spawn_authorized.add(agent.id)
             try:
-                spawn_result = await self._invoke_meta_spawn({"task": review_task}, agent)
+                spawn_result = await self._invoke_meta_spawn(
+                    {"task": review_task, "_review_only": True}, agent
+                )
             finally:
                 self._strategy_spawn_authorized.discard(agent.id)
         reviewer_id = str((spawn_result or {}).get("agent_id") or "") if isinstance(spawn_result, dict) else ""
@@ -3300,6 +3342,7 @@ class Runtime:
         quota: ResourceQuota | None = None,
         parent: str | None = None,
         depth: int = 0,
+        review_only: bool = False,
     ) -> Agent:
         agent_id = self._id_gen.next()
         model = model or self.config.default_model
@@ -3320,10 +3363,11 @@ class Runtime:
             sibling_info = ", ".join(f"{sid}({self.agents[sid].task[:30]})" for sid in siblings[:5])
             parent_context = {
                 "parent_id": parent,
-                "parent_task": p.task[:100],
+                "parent_task": self._task_payload(p.task)[:100],
                 "siblings": sibling_info,
                 "depth": depth,
-                "task_capsule": self._build_child_task_capsule(p),
+                "task_capsule": "" if review_only else self._build_child_task_capsule(p),
+                "review_only": review_only,
             }
 
         # Merge-submit-path: a spawned child works on a private copy of the task
@@ -3354,6 +3398,7 @@ class Runtime:
             parent=parent, depth=depth, workspace=workspace,
             history=[{"role": "system", "content": system_prompt}],
         )
+        agent._review_only = bool(review_only)
 
         # Context limit from model registry
         try:
@@ -4922,6 +4967,9 @@ class Runtime:
             }.items()
             if name not in self.config.disabled_tools
         }
+        if self._is_review_only(agent):
+            for name in ("spawn", "spawn_many", "task_spawn", "task_create"):
+                all_tools.pop(name, None)
         all_tools = self._merge_wrap_submit(agent, all_tools)
 
         try:
@@ -10523,6 +10571,80 @@ class Runtime:
             text = "...(earlier context truncated)...\n\n" + text[-max_chars:]
         return text
 
+    @staticmethod
+    def _spawn_task_terms(task: str) -> set[str]:
+        """Normalize a child assignment for conservative lineage de-duplication."""
+        source = re.split(r"\n\s*\[Context\]", str(task or ""), maxsplit=1)[0].lower()
+        stop = {
+            "about", "after", "agent", "against", "available", "before", "brief",
+            "call", "candidate", "clear", "code", "concise", "context", "current",
+            "details", "exact", "findings", "from", "full", "give", "implementation",
+            "independent", "independently", "into", "needed", "official", "only",
+            "parent", "produce", "prompt", "pull", "query", "read", "report", "result",
+            "return", "task", "then", "this", "using", "with", "without", "work",
+        }
+        return {
+            token
+            for token in re.findall(r"[a-z][a-z0-9_]{2,}", source)
+            if token not in stop
+        }
+
+    def _spawn_lineage_entries(self, agent: Agent) -> list[tuple[str, str]]:
+        """Assignments already represented in this branch and its sibling sets."""
+        entries: list[tuple[str, str]] = []
+        seen: set[str] = set()
+        current: Agent | None = agent
+        while current is not None:
+            # The wrapped root task is the problem payload, not a delegated scope.
+            if current.parent is not None and current.id not in seen:
+                entries.append((current.id, str(current.task or "")))
+                seen.add(current.id)
+            parent = self.agents.get(current.parent or "")
+            if parent is None:
+                break
+            for sibling_id in parent.children:
+                if sibling_id in seen or sibling_id == current.id:
+                    continue
+                sibling = self.agents.get(sibling_id)
+                if sibling is not None:
+                    entries.append((sibling.id, str(sibling.task or "")))
+                    seen.add(sibling.id)
+            current = parent
+        return entries
+
+    def _spawn_duplicate_reason(
+        self,
+        agent: Agent,
+        proposal: str,
+        extra: list[tuple[str, str]] | None = None,
+    ) -> str:
+        proposed_terms = self._spawn_task_terms(proposal)
+        if len(proposed_terms) < 4:
+            return ""
+        for label, existing in [*self._spawn_lineage_entries(agent), *(extra or [])]:
+            existing_terms = self._spawn_task_terms(existing)
+            if len(existing_terms) < 4:
+                continue
+            shared = len(proposed_terms & existing_terms)
+            containment = shared / max(1, min(len(proposed_terms), len(existing_terms)))
+            union = len(proposed_terms | existing_terms)
+            jaccard = shared / max(1, union)
+            if shared >= 5 and (containment >= 0.80 or jaccard >= 0.68):
+                return (
+                    f"overlaps existing assignment {label}: shared={shared}, "
+                    f"containment={containment:.2f}, jaccard={jaccard:.2f}"
+                )
+        return ""
+
+    def _render_spawn_lineage(self, agent: Agent) -> str:
+        entries = self._spawn_lineage_entries(agent)
+        if not entries:
+            return "(no delegated ancestor/sibling assignments)"
+        return "\n".join(
+            f"- {label}: {re.split(r'\n\s*\[Context\]', task, maxsplit=1)[0][:500]}"
+            for label, task in entries[:16]
+        )
+
     async def _spawn_judge_at_plan(self, agent: Agent, plan_hint: str = "") -> bool:
         """At a fresh planning moment, let the working model decide whether to spawn.
 
@@ -10531,12 +10653,14 @@ class Runtime:
         The judge sees the SAME working context the parent sees (agent.history),
         not just a checklist. Children are NOT isolated: each can call
         query(agent_id='<parent>', messages=-1) to read the parent's context, so
-        assignments need not restate everything. The judge is told NOT to reason
-        about cost/budget and to lean toward spawning (speed matters). Returns True
-        iff children were spawned. Best-effort: any failure degrades to "no spawn".
+        assignments need not restate everything. Returns True iff novel children
+        were spawned. Best-effort: any failure degrades to "no spawn".
         """
         import os
         if os.environ.get("NANOMA_SPAWN_TODOLIST_JUDGE") != "1":
+            return False
+        if self._is_review_only(agent):
+            self._emit(agent.id, "spawn_judge_skipped", {"reason": "review_only"})
             return False
         remaining_slots = max(0, self.config.max_agents - len(self.agents))
         if remaining_slots <= 0:
@@ -10562,11 +10686,28 @@ class Runtime:
         ]
         if active_children:
             return False
+        previous_delivery_count = getattr(agent, "_spawn_judge_last_delivery_count", None)
+        current_delivery_count = len(self._candidate_delivery_records(agent))
+        if (
+            previous_delivery_count is not None
+            and current_delivery_count <= int(previous_delivery_count)
+        ):
+            self._emit(agent.id, "spawn_judge_skipped", {
+                "reason": "no_new_evidence_since_previous_expansion",
+                "delivery_count": current_delivery_count,
+            })
+            return False
         judge_model = self._spawn_judge_model(agent)
         if not judge_model:
             return False
 
         context_text = self._render_history_for_judge(agent)
+        custom_policy = os.environ.get("NANOMA_SPAWN_JUDGE_INSTRUCTION", "").strip()
+        policy_section = (
+            "\nRuntime-specific spawn policy (authoritative):\n"
+            f"{custom_policy}\n"
+            if custom_policy else ""
+        )
         sys_msg = (
             "You are the planning judge for a multi-agent research system. At a "
             "planning moment you decide whether the parent agent should fan its next "
@@ -10588,18 +10729,22 @@ class Runtime:
             "Every child already receives its OWN private copy of the task directory and the "
             "runtime folds each child's changes back safely, so children never collide — you "
             "do not need to tell them to copy files or avoid each other.\n"
-            "Bias toward spawning: parallel children finish sooner and can cross-check "
-            "each other, so when parallelism is even plausibly useful, spawn. Do NOT "
-            "reason about token cost, money, or budget — that is handled by the runtime, "
-            "not you, and speed is what matters. Only decline when the next phase is a "
-            "genuinely single, indivisible step where nothing could be gained by any "
-            "parallel worker, verifier, or explorer. Reply with STRICT JSON only, no prose."
+            "This decision is LOCAL to the current assignment. A child having planning ability "
+            "does not by itself justify descendants. Decline when an ancestor, sibling, or prior "
+            "child already covers the proposed work; recursively adding another solver/verifier "
+            "for the same derivation is duplication, not useful verification. Spawn only when the "
+            "next phase contains a materially independent subproblem, method, or newly evidenced "
+            "uncertainty that is absent from the lineage. Do NOT reason about token cost, money, "
+            "or a fixed depth limit. Reply with STRICT JSON only, no prose."
+            + policy_section
         )
         user_msg = (
             f"Parent task:\n{agent.task}\n\n"
             f"Parent agent id (children query this): {agent.id}\n\n"
             "Parent's current working context (this is exactly what the parent sees):\n"
             f"{context_text}\n\n"
+            "Assignments already represented in this branch (do not duplicate them):\n"
+            f"{self._render_spawn_lineage(agent)}\n\n"
             + (f"The parent is about to plan this next: {plan_hint}\n\n" if plan_hint else "")
             + f"You may spawn up to {remaining_slots} parallel children.\n\n"
             "Return JSON exactly like:\n"
@@ -10628,14 +10773,38 @@ class Runtime:
             })
             return False
 
-        subs = decision["subagents"] if decision["spawn"] else []
-        subs = subs[:remaining_slots]
+        proposed_subs = decision["subagents"] if decision["spawn"] else []
+        subs: list[dict[str, str]] = []
+        filtered: list[dict[str, str]] = []
+        accepted_tasks: list[tuple[str, str]] = []
+        for sub in proposed_subs:
+            duplicate_reason = self._spawn_duplicate_reason(
+                agent,
+                str(sub.get("task") or ""),
+                extra=accepted_tasks,
+            )
+            if duplicate_reason:
+                filtered.append({
+                    "subject": str(sub.get("subject") or "")[:120],
+                    "reason": duplicate_reason,
+                })
+                continue
+            subs.append(sub)
+            accepted_tasks.append((f"proposal-{len(subs)}", str(sub.get("task") or "")))
+            if len(subs) >= remaining_slots:
+                break
+        if filtered:
+            self._emit(agent.id, "spawn_judge_duplicate_filtered", {
+                "filtered": filtered[:12],
+                "remaining_children": len(subs),
+            })
         self._emit(agent.id, "spawn_judge_decision", {
             "model": judge_model,
             "spawn": bool(decision["spawn"]) and bool(subs),
             "reasoning": decision.get("reasoning", "")[:300],
             "requested_children": len(decision["subagents"]),
             "children": len(subs),
+            "duplicate_children_filtered": len(filtered),
             "roles": [s.get("role") or "worker" for s in subs],
         })
         if not subs:
@@ -10662,6 +10831,8 @@ class Runtime:
                 self._emit(agent.id, "spawn_judge_error", {"stage": "spawn", "detail": str(result)[:300]})
                 break
             spawned_any = True
+        if spawned_any:
+            agent._spawn_judge_last_delivery_count = current_delivery_count
         return spawned_any
 
     def _delivery_orchestration_report(self, parent: Agent, delivered: Agent) -> str:
@@ -10881,6 +11052,11 @@ class Runtime:
         return ids
 
     async def _invoke_meta_spawn(self, spawn_args: dict, agent: Agent) -> dict:
+        if self._is_review_only(agent):
+            self._emit(agent.id, "review_only_spawn_blocked", {
+                "task_preview": str(spawn_args.get("task") or "")[:200],
+            })
+            return {"error": "final-candidate reviewer is review-only and cannot spawn"}
         from nanoma.meta import meta_spawn
         return await meta_spawn(spawn_args, agent, self)
 
@@ -14721,6 +14897,11 @@ class Runtime:
         if parent_context:
             capsule = str(parent_context.get("task_capsule") or "").strip()
             capsule_section = f"\n## Task Capsule\n{capsule}\n" if capsule else ""
+            review_line = (
+                "- This is a runtime review-only node. Inspect and deliver the verdict directly; "
+                "task_create and all spawn paths are disabled.\n"
+                if parent_context.get("review_only") else ""
+            )
             context_section = f"""
 ## Your Context
 - Spawned by: agent "{parent_context['parent_id']}" (task: {parent_context['parent_task']})
@@ -14730,6 +14911,7 @@ class Runtime:
 - When your evidence supports an answer, call deliver_to_parent(answer=..., evidence=..., confidence=..., method=...) exactly once, then call set_status("done", result=<same answer>).
 - Do not use query or send for final result delivery. If evidence is incomplete, deliver your best concise candidate with lower confidence instead of returning an empty result.
 - The root owns final files in the shared workspace. Do not create or overwrite a shared final artifact named by the parent task; keep research notes private and use deliver_to_parent for your handoff.
+{review_line}
 {web_search_line}
 {capsule_section}
 """

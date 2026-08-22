@@ -1,5 +1,6 @@
 """Deterministic tests for runtime-owned final artifact delivery."""
 
+import json
 from pathlib import Path
 
 import pytest
@@ -8,6 +9,7 @@ from nanoma import DeliveryContract, DeliveryTree, Runtime, RuntimeConfig
 from nanoma.cost import UsageRecord
 from nanoma.llm import LLMResponse, ToolCall, estimate_tokens
 from nanoma.meta import meta_get_task_context, meta_set_status, meta_submit
+from optimizations.todo_tools.todo_tools import meta_task_create
 
 
 def _runtime(tmp_path: Path, *, contract: DeliveryContract | None = None) -> Runtime:
@@ -223,6 +225,152 @@ async def test_child_capsule_is_bounded_and_full_task_is_paged(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_tagged_task_payload_does_not_leak_root_protocol_to_children(tmp_path):
+    runtime = Runtime(
+        config=RuntimeConfig(
+            workspace_root=tmp_path / "workspace",
+            final_candidate_review_enabled=False,
+            log_dir=None,
+        )
+    )
+    official = (
+        "NEXT STEP\n"
+        "def lanczos(A, b, m):\n"
+        "Return Q with shape exactly (M, m + 1).\n"
+    )
+    wrapped = (
+        "Solve this step.\n\n"
+        "Protocol:\n"
+        "- At your first planning boundary call task_create.\n"
+        "- Every child node may call task_create.\n\n"
+        f"<official_scicode_prompt>\n{official}</official_scicode_prompt>"
+    )
+    root = runtime.create_agent(wrapped)
+    child = runtime.create_agent("Audit the Lanczos return shape.", parent=root.id, depth=1)
+
+    system = str(child.history[0]["content"])
+    assert "def lanczos" in system
+    assert "At your first planning boundary" not in system
+    assert "Every child node may call task_create" not in system
+
+    root_context = await meta_get_task_context({"section": "root"}, child, runtime)
+    parent_context = await meta_get_task_context({"section": "parent"}, child, runtime)
+    contract = await meta_get_task_context({"section": "contract"}, child, runtime)
+    assert root_context["content"] == official.strip()
+    assert parent_context["content"] == official.strip()
+    assert "task_create" not in contract["content"]
+
+
+@pytest.mark.asyncio
+async def test_spawn_judge_uses_custom_policy_and_filters_lineage_duplicate(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setenv("NANOMA_SPAWN_TODOLIST_JUDGE", "1")
+    monkeypatch.setenv(
+        "NANOMA_SPAWN_JUDGE_INSTRUCTION",
+        "CUSTOM_POLICY_SENTINEL: spawn only for a genuinely independent scientific subproblem.",
+    )
+    runtime = Runtime(
+        config=RuntimeConfig(
+            workspace_root=tmp_path / "workspace",
+            max_agents=20,
+            max_depth=20,
+            default_model="worker-model",
+            final_candidate_review_enabled=False,
+            log_dir=None,
+        )
+    )
+    runtime.start_agent = lambda _agent: None
+    root = runtime.create_agent("Solve the official numerical task.")
+    assignment = (
+        "Derive the Lanczos recurrence, normalization, alpha beta indexing, "
+        "orthogonality, output shape, and breakdown behavior."
+    )
+    child = runtime.create_agent(assignment, parent=root.id, depth=1)
+
+    class _Response:
+        content = json.dumps({
+            "spawn": True,
+            "reasoning": "repeat the same audit",
+            "subagents": [{
+                "subject": "Repeat Lanczos derivation",
+                "role": "verifier",
+                "task": assignment,
+            }],
+        })
+
+    seen: dict[str, str] = {}
+
+    async def _fake_llm(messages, model, tools=None, **kwargs):
+        seen["system"] = messages[0]["content"]
+        seen["user"] = messages[-1]["content"]
+        return _Response()
+
+    runtime.llm_call = _fake_llm
+    before = len(runtime.agents)
+    spawned = await runtime._spawn_judge_at_plan(child, "audit Lanczos")
+
+    assert spawned is False
+    assert len(runtime.agents) == before
+    assert "CUSTOM_POLICY_SENTINEL" in seen["system"]
+    assert "Assignments already represented" in seen["user"]
+    assert any(
+        event["event"] == "spawn_judge_duplicate_filtered"
+        for event in runtime._events
+    )
+
+
+@pytest.mark.asyncio
+async def test_spawn_judge_requires_new_delivery_before_reexpanding(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setenv("NANOMA_SPAWN_TODOLIST_JUDGE", "1")
+    runtime = Runtime(
+        config=RuntimeConfig(
+            workspace_root=tmp_path / "workspace",
+            max_agents=20,
+            max_depth=20,
+            default_model="worker-model",
+            final_candidate_review_enabled=False,
+            log_dir=None,
+        )
+    )
+    runtime.start_agent = lambda _agent: None
+    root = runtime.create_agent("Solve a multi-part numerical task.")
+
+    class _Response:
+        content = json.dumps({
+            "spawn": True,
+            "reasoning": "independent parts",
+            "subagents": [{
+                "subject": "Derive boundary conditions",
+                "role": "solver",
+                "task": "Derive boundary conditions and indexing for the numerical recurrence.",
+            }],
+        })
+
+    calls = 0
+
+    async def _fake_llm(messages, model, tools=None, **kwargs):
+        nonlocal calls
+        calls += 1
+        return _Response()
+
+    runtime.llm_call = _fake_llm
+    assert await runtime._spawn_judge_at_plan(root, "split the recurrence") is True
+    for child_id in root.children:
+        runtime.agents[child_id].status = "done"
+
+    assert await runtime._spawn_judge_at_plan(root, "split it again") is False
+    assert calls == 1
+    assert any(
+        event["event"] == "spawn_judge_skipped"
+        and event["data"].get("reason") == "no_new_evidence_since_previous_expansion"
+        for event in runtime._events
+    )
+
+
+@pytest.mark.asyncio
 async def test_root_completion_reviews_the_exact_candidate(tmp_path):
     runtime = Runtime(
         config=RuntimeConfig(
@@ -245,6 +393,19 @@ async def test_root_completion_reviews_the_exact_candidate(tmp_path):
 
     reviewer_id = first["review"]["reviewer_id"]
     reviewer = runtime.agents[reviewer_id]
+    assert runtime._is_review_only(reviewer)
+    assert "## Task Capsule" not in str(reviewer.history[0]["content"])
+    assert "task_create and all spawn paths are disabled" in str(
+        reviewer.history[0]["content"]
+    )
+    blocked_spawn = await runtime._invoke_meta_spawn(
+        {"task": "delegate this review"}, reviewer
+    )
+    blocked_plan = await meta_task_create(
+        {"subject": "delegate this review"}, reviewer, runtime
+    )
+    assert "review-only" in blocked_spawn["error"]
+    assert "review-only" in blocked_plan["error"]
     exact = await meta_get_task_context(
         {"section": "final_candidate", "offset": 0}, reviewer, runtime
     )
