@@ -13516,12 +13516,12 @@ class Runtime:
         sanity condition the task imposes, such as the submitted algorithm still
         being discoverable under the name the judge runs.
         """
+        override = self.config.submit_preflight_timeout
+        if override is None:
+            raw = os.environ.get("NANOMA_SUBMIT_PREFLIGHT_TIMEOUT")
+            override = raw if raw else self.PREFLIGHT_TIMEOUT_DEFAULT
         try:
-            timeout = float(
-                self.config.submit_preflight_timeout
-                or os.environ.get("NANOMA_SUBMIT_PREFLIGHT_TIMEOUT")
-                or self.PREFLIGHT_TIMEOUT_DEFAULT
-            )
+            timeout = float(override)
         except ValueError:
             timeout = self.PREFLIGHT_TIMEOUT_DEFAULT
         try:

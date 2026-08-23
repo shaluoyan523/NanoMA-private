@@ -118,8 +118,7 @@ async def meta_task_create(
     # the todolist — so the list is only ever created on the no-spawn path
     # (decide first, plan second). The same model sees the parent's full context
     # and owns the split; on spawn we suppress local task creation entirely.
-    import os
-    if os.environ.get("NANOMA_SPAWN_TODOLIST_JUDGE") == "1":
+    if getattr(runtime, "_spawn_judge_enabled", lambda: False)():
         cur = int(getattr(agent, "_turns", 0) or 0)
         _delegated = {
             "delegated": True,
