@@ -961,63 +961,139 @@ def _runtime_env_int(name: str, default: int) -> int:
         return default
 
 
+# ─── 归档配置 ────────────────────────────────────────────────────────────────
+# 以下几组字段属于已被 spawn judge 取代的历代编排机制。字段本身仍然有效，
+# 传入 RuntimeConfig(...) 一样会生效；分组只是把它们移出主体，让 RuntimeConfig
+# 的类体只呈现当前执行路径上的配置。需要复活某一代时整组搬回即可。
+
 @dataclass
-class RuntimeConfig:
-    max_agents: int = 1000
-    max_depth: int = 100
-    max_concurrent_llm: int = 50
-    llm_admission_control: bool = field(
-        default_factory=lambda: _runtime_env_bool("NANOMA_LLM_ADMISSION_CONTROL", False)
+class _ArchivedFixedTopologyConfig:
+    """第 2 代 · 声明式固定拓扑（3 个字段）。
+
+    nanoma/topologies/ 下 54 个 JSON 与 fixed_orchestration.py 的配置入口。
+    没有任何 benchmark adapter 或 launch 脚本设置这些字段。
+    """
+
+    fixed_orchestration_profile: str = field(
+        default_factory=lambda: os.environ.get("NANOMA_FIXED_ORCHESTRATION_PROFILE", "")
     )
-    llm_min_start_spacing: float = field(
-        default_factory=lambda: max(0.0, _runtime_env_float("NANOMA_LLM_MIN_START_SPACING", 0.0))
+    fixed_orchestration_config_path: Path | None = field(
+        default_factory=lambda: (
+            Path(value).expanduser()
+            if (value := os.environ.get("NANOMA_FIXED_ORCHESTRATION_CONFIG", "").strip())
+            else None
+        )
     )
-    llm_large_context_tokens: int = field(
-        default_factory=lambda: max(0, _runtime_env_int("NANOMA_LLM_LARGE_CONTEXT_TOKENS", 32000))
+    fixed_orchestration_poll_seconds: float = field(
+        default_factory=lambda: max(
+            0.25, _runtime_env_float("NANOMA_FIXED_ORCHESTRATION_POLL_SECONDS", 2.0)
+        )
     )
-    llm_large_context_spacing: float = field(
-        default_factory=lambda: max(0.0, _runtime_env_float("NANOMA_LLM_LARGE_CONTEXT_SPACING", 0.0))
-    )
-    llm_overload_cooldown_seconds: float = field(
-        default_factory=lambda: max(0.0, _runtime_env_float("NANOMA_LLM_OVERLOAD_COOLDOWN_SECONDS", 0.0))
-    )
-    llm_admission_max_delay: float = field(
-        default_factory=lambda: max(0.0, _runtime_env_float("NANOMA_LLM_ADMISSION_MAX_DELAY", 120.0))
-    )
-    budget: float = 10.0
-    max_total_tokens: int = 0
+
+
+@dataclass
+class _ArchivedStrategyConfig:
+    """第 3 代 · 确定性策略层（42 个字段）。
+
+    nanoma/strategy.py 六个策略的开关与阈值，含 LowValueAgentKillStrategy
+    的 auto_kill_* 组。所有 enabled 开关默认 False。
+    """
+
+    strategy_log_events: bool = False
+    auto_kill_low_value_agents: bool = False
+    auto_kill_min_llm: int = 10
+    auto_kill_max_llm_no_candidate: int = 14
+    auto_kill_max_tokens_no_candidate: int = 160000
+    auto_kill_max_llm_duplicate: int = 22
+    auto_kill_max_agents: int = 3
+    auto_kill_only_tool: bool = False
+    auto_kill_query_before_kill: bool = False
+    strategy_spawn_portfolio: bool = False
+    strategy_spawn_portfolio_target_agents: int = 5
+    strategy_spawn_portfolio_max_root_turn: int = 3
+    strategy_root_recovery_spawn: bool = False
+    strategy_root_recovery_min_turns: int = 6
+    strategy_root_recovery_target_agents: int = 4
+    strategy_root_recovery_min_shared_candidates: int = 1
+    strategy_root_recovery_max_attempts: int = 2
+    strategy_root_recovery_require_no_active_children: bool = True
+    strategy_candidate_evidence_gate: bool = False
+    strategy_candidate_evidence_min_root_turns: int = 4
+    strategy_candidate_evidence_min_shared_candidates: int = 1
+    strategy_candidate_evidence_required_files: int = 1
+    strategy_candidate_evidence_max_attempts: int = 2
+    strategy_final_evidence_gate: bool = False
+    strategy_final_evidence_min_root_turns: int = 4
+    strategy_final_evidence_min_shared_candidates: int = 1
+    strategy_final_evidence_min_candidate_agents: int = 1
+    strategy_final_evidence_query_coverage_ratio: float = 1.0
+    strategy_final_evidence_require_verification: bool = True
+    strategy_final_evidence_require_verification_review: bool = True
+    strategy_final_evidence_allow_spawn_verifier: bool = True
+    strategy_final_evidence_max_verifier_spawns: int = 2
+    strategy_finalize_candidates: bool = False
+    strategy_finalize_min_shared_candidates: int = 2
+    strategy_finalize_after_turns: int = 8
+    strategy_improve_after_turns: int = 6
+    strategy_readable_bytes_threshold: int = 900
+    strategy_max_improve_attempts: int = 2
+    strategy_stop_improve_when_stalled: bool = True
+    strategy_finalize_min_stable_observations: int = 0
+    strategy_finalize_once_per_best: bool = False
+    strategy_max_finalize_attempts: int = 0
+
+
+@dataclass
+class _ArchivedSupervisorConfig:
+    """第 4 代 · LLM 拓扑监督者（33 个字段）。
+
+    supervisor_enabled 默认 False，且与固定拓扑互斥。
+    """
+
+    supervisor_enabled: bool = False
+    supervisor_model: str = "claude-opus-4-8"
+    supervisor_protocol: str = "anthropic"
+    supervisor_base_url: str | None = None
+    supervisor_api_key: str | None = None
+    supervisor_max_calls: int = 0
+    supervisor_max_tokens: int = 1200
+    supervisor_temperature: float = 0.0
+    supervisor_http_timeout: float = 45.0
+    supervisor_max_retries: int = 1
+    supervisor_error_backoff_turns: int = 4
+    supervisor_error_fallback_spawn: bool = True
+    supervisor_root_only: bool = False
+    supervisor_min_turn_interval: int = 1
+    supervisor_recent_events: int = 12
+    supervisor_history_messages: int = 4
+    supervisor_fail_open: bool = True
+    supervisor_one_step_topology: bool = True
+    supervisor_min_child_turns: int = 2
+    supervisor_trigger_mode: str = "decision_points"
+    supervisor_initial_root_turns: int = 1
+    supervisor_stall_turns: int = 8
+    supervisor_stall_interval: int = 6
+    supervisor_leaf_stall_tokens: int = 120000
+    supervisor_decomposition_min_turns: int = 8
+    supervisor_decomposition_min_tokens: int = 300000
+    supervisor_noop_backoff_threshold: int = 1
+    supervisor_quantitative_combo_required: bool = True
+    supervisor_payload_task_chars: int = 900
+    supervisor_payload_agent_task_chars: int = 240
+    supervisor_payload_message_chars: int = 320
+    supervisor_retry_override_on_wrong_tool: bool = True
+    supervisor_override_wrong_tool_limit: int = 1
+
+
+@dataclass
+class _ArchivedToolPolicyConfig:
+    """第 5 代 · 状态感知工具策略（58 个字段）。
+
+    GAIA / DRACO 仍以 adaptive 模式使用；主力 harness EdgeBench 将
+    NANOMA_TOOL_POLICY_MODE 设为 off。
+    """
+
     tool_policy_soft_total_tokens: int = 0
-    time_limit: float = 0.0
-    max_turns: int = 200
-    malformed_tool_repair_turns: int = field(
-        default_factory=lambda: max(0, _runtime_env_int("NANOMA_MALFORMED_TOOL_REPAIR_TURNS", 3))
-    )
-    malformed_tool_fail_after: int = field(
-        default_factory=lambda: max(1, _runtime_env_int("NANOMA_MALFORMED_TOOL_FAIL_AFTER", 8))
-    )
-    llm_400_compact_retry_enabled: bool = field(
-        default_factory=lambda: _runtime_env_bool("NANOMA_LLM_400_COMPACT_RETRY", True)
-    )
-    llm_400_compact_keep_recent: int = field(
-        default_factory=lambda: max(2, _runtime_env_int("NANOMA_LLM_400_COMPACT_KEEP_RECENT", 8))
-    )
-    llm_400_compact_max_retries_per_agent: int = field(
-        default_factory=lambda: max(0, _runtime_env_int("NANOMA_LLM_400_COMPACT_MAX_RETRIES_PER_AGENT", 8))
-    )
-    allowed_models: list[str] | None = None
-    disabled_tools: set[str] = field(default_factory=set)
-    extra_tools: dict[str, dict[str, Any]] = field(default_factory=dict)
-    context_compress_ratio: float = 0.8
-    default_model: str = "deepseek-v4-flash"
-    log_dir: Path | None = field(default_factory=lambda: Path("./logs"))
-    workspace_root: Path = field(default_factory=lambda: Path("./workspace"))
-    workspace_extra_roots: list[Path] = field(default_factory=list)
-    shared_dir: str = "shared"
-    delivery_contract: DeliveryContract | None = None
-    system_extra_instructions: str = field(
-        default_factory=lambda: os.environ.get("NANOMA_SYSTEM_EXTRA_INSTRUCTIONS", "")
-    )
-    retry: RetryConfig = field(default_factory=RetryConfig)
     # Runtime tool policy: state variables narrow tool availability without
     # injecting policy text into the agent loop.
     tool_policy_mode: ToolPolicyMode = "adaptive"
@@ -1080,6 +1156,86 @@ class RuntimeConfig:
     tool_policy_delivery_verify_min_source_reviews: int = 1
     tool_policy_delivery_verify_resource_cutoff: float = 0.92
     tool_policy_log_events: bool = False
+
+
+@dataclass
+class _ArchivedCandidateConvergenceConfig:
+    """候选收敛与 root park（7 个字段）。
+
+    candidate_convergence_enabled 与 candidate_root_park_enabled 均默认 False。
+    """
+
+    candidate_convergence_enabled: bool = False
+    candidate_convergence_time_fraction: float = 0.75
+    candidate_convergence_max_root_turns: int = 2
+    candidate_convergence_min_confidence: float = 0.50
+    candidate_convergence_high_confidence_threshold: float = 0.90
+    candidate_root_park_enabled: bool = False
+    candidate_root_park_poll_seconds: float = 1.0
+
+
+@dataclass
+class RuntimeConfig(
+    _ArchivedFixedTopologyConfig,
+    _ArchivedStrategyConfig,
+    _ArchivedSupervisorConfig,
+    _ArchivedToolPolicyConfig,
+    _ArchivedCandidateConvergenceConfig,
+):
+    max_agents: int = 1000
+    max_depth: int = 100
+    max_concurrent_llm: int = 50
+    llm_admission_control: bool = field(
+        default_factory=lambda: _runtime_env_bool("NANOMA_LLM_ADMISSION_CONTROL", False)
+    )
+    llm_min_start_spacing: float = field(
+        default_factory=lambda: max(0.0, _runtime_env_float("NANOMA_LLM_MIN_START_SPACING", 0.0))
+    )
+    llm_large_context_tokens: int = field(
+        default_factory=lambda: max(0, _runtime_env_int("NANOMA_LLM_LARGE_CONTEXT_TOKENS", 32000))
+    )
+    llm_large_context_spacing: float = field(
+        default_factory=lambda: max(0.0, _runtime_env_float("NANOMA_LLM_LARGE_CONTEXT_SPACING", 0.0))
+    )
+    llm_overload_cooldown_seconds: float = field(
+        default_factory=lambda: max(0.0, _runtime_env_float("NANOMA_LLM_OVERLOAD_COOLDOWN_SECONDS", 0.0))
+    )
+    llm_admission_max_delay: float = field(
+        default_factory=lambda: max(0.0, _runtime_env_float("NANOMA_LLM_ADMISSION_MAX_DELAY", 120.0))
+    )
+    budget: float = 10.0
+    max_total_tokens: int = 0
+    time_limit: float = 0.0
+    max_turns: int = 200
+    malformed_tool_repair_turns: int = field(
+        default_factory=lambda: max(0, _runtime_env_int("NANOMA_MALFORMED_TOOL_REPAIR_TURNS", 3))
+    )
+    malformed_tool_fail_after: int = field(
+        default_factory=lambda: max(1, _runtime_env_int("NANOMA_MALFORMED_TOOL_FAIL_AFTER", 8))
+    )
+    llm_400_compact_retry_enabled: bool = field(
+        default_factory=lambda: _runtime_env_bool("NANOMA_LLM_400_COMPACT_RETRY", True)
+    )
+    llm_400_compact_keep_recent: int = field(
+        default_factory=lambda: max(2, _runtime_env_int("NANOMA_LLM_400_COMPACT_KEEP_RECENT", 8))
+    )
+    llm_400_compact_max_retries_per_agent: int = field(
+        default_factory=lambda: max(0, _runtime_env_int("NANOMA_LLM_400_COMPACT_MAX_RETRIES_PER_AGENT", 8))
+    )
+    allowed_models: list[str] | None = None
+    disabled_tools: set[str] = field(default_factory=set)
+    extra_tools: dict[str, dict[str, Any]] = field(default_factory=dict)
+    context_compress_ratio: float = 0.8
+    default_model: str = "deepseek-v4-flash"
+    log_dir: Path | None = field(default_factory=lambda: Path("./logs"))
+    workspace_root: Path = field(default_factory=lambda: Path("./workspace"))
+    workspace_extra_roots: list[Path] = field(default_factory=list)
+    shared_dir: str = "shared"
+    delivery_contract: DeliveryContract | None = None
+    system_extra_instructions: str = field(
+        default_factory=lambda: os.environ.get("NANOMA_SYSTEM_EXTRA_INSTRUCTIONS", "")
+    )
+    retry: RetryConfig = field(default_factory=RetryConfig)
     # Resource notification thresholds (fraction consumed, e.g. 0.5 = 50%)
     notify_thresholds: list[float] = field(default_factory=lambda: [0.25, 0.50, 0.70, 0.80, 0.90, 0.95])
     # Compression / truncation settings
@@ -1114,14 +1270,7 @@ class RuntimeConfig:
     task_capsule_inline_root_max_tokens: int = 650
     task_context_chunk_max_tokens: int = 1200
     candidate_delivery_ledger_enabled: bool = True
-    candidate_convergence_enabled: bool = False
-    candidate_convergence_time_fraction: float = 0.75
-    candidate_convergence_max_root_turns: int = 2
-    candidate_convergence_min_confidence: float = 0.50
-    candidate_convergence_high_confidence_threshold: float = 0.90
     candidate_llm_interrupt_enabled: bool = True
-    candidate_root_park_enabled: bool = False
-    candidate_root_park_poll_seconds: float = 1.0
     single_tool_max_tokens: int = field(
         default_factory=lambda: max(
             0, _runtime_env_int("NANOMA_SINGLE_TOOL_MAX_TOKENS", 900)
@@ -1159,21 +1308,6 @@ class RuntimeConfig:
     final_candidate_review_max_rounds: int = 2
     final_candidate_review_fail_open: bool = True
     web_search_failover_after_low_signal: bool = False
-    fixed_orchestration_profile: str = field(
-        default_factory=lambda: os.environ.get("NANOMA_FIXED_ORCHESTRATION_PROFILE", "")
-    )
-    fixed_orchestration_config_path: Path | None = field(
-        default_factory=lambda: (
-            Path(value).expanduser()
-            if (value := os.environ.get("NANOMA_FIXED_ORCHESTRATION_CONFIG", "").strip())
-            else None
-        )
-    )
-    fixed_orchestration_poll_seconds: float = field(
-        default_factory=lambda: max(
-            0.25, _runtime_env_float("NANOMA_FIXED_ORCHESTRATION_POLL_SECONDS", 2.0)
-        )
-    )
     probe_resume_instruction: str | None = None
     intervention_file: Path | None = field(
         default_factory=lambda: (
@@ -1182,81 +1316,6 @@ class RuntimeConfig:
             else None
         )
     )
-    strategy_log_events: bool = False
-    auto_kill_low_value_agents: bool = False
-    auto_kill_min_llm: int = 10
-    auto_kill_max_llm_no_candidate: int = 14
-    auto_kill_max_tokens_no_candidate: int = 160000
-    auto_kill_max_llm_duplicate: int = 22
-    auto_kill_max_agents: int = 3
-    auto_kill_only_tool: bool = False
-    auto_kill_query_before_kill: bool = False
-    strategy_spawn_portfolio: bool = False
-    strategy_spawn_portfolio_target_agents: int = 5
-    strategy_spawn_portfolio_max_root_turn: int = 3
-    strategy_root_recovery_spawn: bool = False
-    strategy_root_recovery_min_turns: int = 6
-    strategy_root_recovery_target_agents: int = 4
-    strategy_root_recovery_min_shared_candidates: int = 1
-    strategy_root_recovery_max_attempts: int = 2
-    strategy_root_recovery_require_no_active_children: bool = True
-    strategy_candidate_evidence_gate: bool = False
-    strategy_candidate_evidence_min_root_turns: int = 4
-    strategy_candidate_evidence_min_shared_candidates: int = 1
-    strategy_candidate_evidence_required_files: int = 1
-    strategy_candidate_evidence_max_attempts: int = 2
-    strategy_final_evidence_gate: bool = False
-    strategy_final_evidence_min_root_turns: int = 4
-    strategy_final_evidence_min_shared_candidates: int = 1
-    strategy_final_evidence_min_candidate_agents: int = 1
-    strategy_final_evidence_query_coverage_ratio: float = 1.0
-    strategy_final_evidence_require_verification: bool = True
-    strategy_final_evidence_require_verification_review: bool = True
-    strategy_final_evidence_allow_spawn_verifier: bool = True
-    strategy_final_evidence_max_verifier_spawns: int = 2
-    strategy_finalize_candidates: bool = False
-    strategy_finalize_min_shared_candidates: int = 2
-    strategy_finalize_after_turns: int = 8
-    strategy_improve_after_turns: int = 6
-    strategy_readable_bytes_threshold: int = 900
-    strategy_max_improve_attempts: int = 2
-    strategy_stop_improve_when_stalled: bool = True
-    strategy_finalize_min_stable_observations: int = 0
-    strategy_finalize_once_per_best: bool = False
-    strategy_max_finalize_attempts: int = 0
-    supervisor_enabled: bool = False
-    supervisor_model: str = "claude-opus-4-8"
-    supervisor_protocol: str = "anthropic"
-    supervisor_base_url: str | None = None
-    supervisor_api_key: str | None = None
-    supervisor_max_calls: int = 0
-    supervisor_max_tokens: int = 1200
-    supervisor_temperature: float = 0.0
-    supervisor_http_timeout: float = 45.0
-    supervisor_max_retries: int = 1
-    supervisor_error_backoff_turns: int = 4
-    supervisor_error_fallback_spawn: bool = True
-    supervisor_root_only: bool = False
-    supervisor_min_turn_interval: int = 1
-    supervisor_recent_events: int = 12
-    supervisor_history_messages: int = 4
-    supervisor_fail_open: bool = True
-    supervisor_one_step_topology: bool = True
-    supervisor_min_child_turns: int = 2
-    supervisor_trigger_mode: str = "decision_points"
-    supervisor_initial_root_turns: int = 1
-    supervisor_stall_turns: int = 8
-    supervisor_stall_interval: int = 6
-    supervisor_leaf_stall_tokens: int = 120000
-    supervisor_decomposition_min_turns: int = 8
-    supervisor_decomposition_min_tokens: int = 300000
-    supervisor_noop_backoff_threshold: int = 1
-    supervisor_quantitative_combo_required: bool = True
-    supervisor_payload_task_chars: int = 900
-    supervisor_payload_agent_task_chars: int = 240
-    supervisor_payload_message_chars: int = 320
-    supervisor_retry_override_on_wrong_tool: bool = True
-    supervisor_override_wrong_tool_limit: int = 1
 
 
 # ─── Agent ───────────────────────────────────────────────────────────────────
