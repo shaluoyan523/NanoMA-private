@@ -989,6 +989,7 @@ class _ArchivedFixedTopologyConfig:
             0.25, _runtime_env_float("NANOMA_FIXED_ORCHESTRATION_POLL_SECONDS", 2.0)
         )
     )
+    fixed_build_timeout_seconds: float | None = None
 
 
 @dataclass
@@ -1317,6 +1318,33 @@ class RuntimeConfig(
         )
     )
 
+    # ─── 环境变量覆盖位 ──────────────────────────────────────────────────────
+    # 以下字段全部默认 None，含义是「回落到对应的 NANOMA_* 环境变量」。环境变量
+    # 在调用时读取而非构造时，因为 optimizations 的测试会在一次运行中途开关它们。
+    # 赋任何非 None 值即完全接管，此后不再看环境。
+    #
+    # 这些开关此前只存在于 core.py 的调用点上，RuntimeConfig 里没有任何痕迹——
+    # 整个 EdgeBench 优化栈（merge-submit 路径、spawn judge、提交门禁）都由它们
+    # 控制，却无法通过读这个 dataclass 发现。声明在此是为了让它们可被发现。
+    spawn_judge_enabled: bool | None = None
+    spawn_judge_instruction: str | None = None
+    merge_submit_path_enabled: bool | None = None
+    merge_paths: str | None = None
+    merge_shared_paths: str | None = None
+    merge_max_mb: float | None = None
+    merge_max_files: int | None = None
+    official_lower_is_better: bool | None = None
+    noise_margin_sigmas: float | None = None
+    submit_preflight_command: str | None = None
+    submit_preflight_timeout: float | None = None
+    submit_require_verified: bool | None = None
+    submit_require_measured: bool | None = None
+    submit_require_complete_aggregate: bool | None = None
+    max_parallel_children: int | None = None
+    child_mem_mb: float | None = None
+    runtime_reserve_mb: float | None = None
+    aggregate_wait_seconds: float | None = None
+
 
 # ─── Agent ───────────────────────────────────────────────────────────────────
 
@@ -1383,6 +1411,10 @@ class Runtime:
         restore_hook: Callable[[Path], Any] | None = None,
     ):
         self.config = config or RuntimeConfig()
+        if self.config.aggregate_wait_seconds is not None:
+            # Stays an instance attribute rather than a property: tests and
+            # optimizations.merge_submit assign to it directly on the runtime.
+            self._AGGREGATE_WAIT_SECONDS = self.config.aggregate_wait_seconds
         self._fixed_plan = load_fixed_orchestration_plan(
             self.config.fixed_orchestration_profile,
             self.config.fixed_orchestration_config_path,
@@ -2083,7 +2115,9 @@ class Runtime:
             argv=("lake", "build"),
             timeout_seconds=max(
                 30.0,
-                float(os.environ.get("NANOMA_FIXED_BUILD_TIMEOUT", "900") or 900),
+                self.config.fixed_build_timeout_seconds
+                if self.config.fixed_build_timeout_seconds is not None
+                else float(os.environ.get("NANOMA_FIXED_BUILD_TIMEOUT", "900") or 900),
             ),
         )
 
@@ -10587,6 +10621,16 @@ class Runtime:
             "subagents": clean_subs,
         }
 
+    def _spawn_judge_enabled(self) -> bool:
+        if self.config.spawn_judge_enabled is not None:
+            return self.config.spawn_judge_enabled
+        return os.environ.get("NANOMA_SPAWN_TODOLIST_JUDGE") == "1"
+
+    def _spawn_judge_custom_policy(self) -> str:
+        if self.config.spawn_judge_instruction is not None:
+            return self.config.spawn_judge_instruction.strip()
+        return os.environ.get("NANOMA_SPAWN_JUDGE_INSTRUCTION", "").strip()
+
     def _spawn_judge_model(self, agent: "Agent") -> str:
         """Use the working agent's model for its topology decision."""
         return str(getattr(agent, "model", "") or self.config.default_model or "").strip()
@@ -10716,8 +10760,7 @@ class Runtime:
         assignments need not restate everything. Returns True iff novel children
         were spawned. Best-effort: any failure degrades to "no spawn".
         """
-        import os
-        if os.environ.get("NANOMA_SPAWN_TODOLIST_JUDGE") != "1":
+        if not self._spawn_judge_enabled():
             return False
         if self._is_review_only(agent):
             self._emit(agent.id, "spawn_judge_skipped", {"reason": "review_only"})
@@ -10762,7 +10805,7 @@ class Runtime:
             return False
 
         context_text = self._render_history_for_judge(agent)
-        custom_policy = os.environ.get("NANOMA_SPAWN_JUDGE_INSTRUCTION", "").strip()
+        custom_policy = self._spawn_judge_custom_policy()
         policy_section = (
             "\nRuntime-specific spawn policy (authoritative):\n"
             f"{custom_policy}\n"
@@ -10962,7 +11005,7 @@ class Runtime:
         becomes something the runtime can re-run rather than prose in a message.
         Best-effort: any failure degrades to no spawn.
         """
-        if os.environ.get("NANOMA_SPAWN_TODOLIST_JUDGE") != "1":
+        if not self._spawn_judge_enabled():
             return False
         if not self._merge_active():
             return False
@@ -11139,9 +11182,23 @@ class Runtime:
     # Conflating them is what turned a 509MB ann-benchmarks tree into either an
     # OOM (copy everything) or unrunnable 12KB stubs (copy only the scope).
 
+    def _merge_submit_path_enabled(self) -> bool:
+        if self.config.merge_submit_path_enabled is not None:
+            return self.config.merge_submit_path_enabled
+        return os.environ.get("NANOMA_MERGE_SUBMIT_PATH") == "1"
+
+    def _merge_size_caps(self) -> tuple[float, int]:
+        """Copy-cost ceiling for a clone: (max duplicated MB, max file count)."""
+        max_mb = self.config.merge_max_mb
+        if max_mb is None:
+            max_mb = float(os.environ.get("NANOMA_MERGE_MAX_MB", "200") or 200)
+        max_files = self.config.merge_max_files
+        if max_files is None:
+            max_files = int(os.environ.get("NANOMA_MERGE_MAX_FILES", "40000") or 40000)
+        return float(max_mb), int(max_files)
+
     def _merge_active(self) -> bool:
-        import os
-        if os.environ.get("NANOMA_MERGE_SUBMIT_PATH") != "1":
+        if not self._merge_submit_path_enabled():
             return False
         if self._merge_disabled_reason:
             return False
@@ -11157,7 +11214,10 @@ class Runtime:
         whole tree, which is only safe for small task directories.
         """
         import os
-        raw = os.environ.get("NANOMA_MERGE_PATHS") or os.environ.get("SFORGE_SUBMIT_PATHS") or ""
+        if self.config.merge_paths is not None:
+            raw = self.config.merge_paths
+        else:
+            raw = os.environ.get("NANOMA_MERGE_PATHS") or os.environ.get("SFORGE_SUBMIT_PATHS") or ""
         roots: list[Path] = []
         for token in raw.replace(",", " ").split():
             token = token.strip().strip('"').strip("'")
@@ -11226,9 +11286,7 @@ class Runtime:
         Measures what a copy actually costs (duplicated bytes, not the tree size)
         so a task that is large only because of linkable datasets stays eligible.
         """
-        import os
-        max_mb = float(os.environ.get("NANOMA_MERGE_MAX_MB", "200") or 200)
-        max_files = int(os.environ.get("NANOMA_MERGE_MAX_FILES", "40000") or 40000)
+        max_mb, max_files = self._merge_size_caps()
         duplicated, count = self._merge_clone_cost(target)
         too_big = max_mb > 0 and duplicated > max_mb * 1024 * 1024
         too_many = max_files > 0 and count > max_files
@@ -11296,7 +11354,9 @@ class Runtime:
         already excluded from merge diffs (for example, a path below ``.lake``).
         This prevents an accidental setting from sharing editable deliverables.
         """
-        raw = os.environ.get("NANOMA_MERGE_SHARED_PATHS", "")
+        raw = self.config.merge_shared_paths
+        if raw is None:
+            raw = os.environ.get("NANOMA_MERGE_SHARED_PATHS", "")
         if not raw.strip():
             return ()
         scopes = self._merge_scope_roots()
@@ -11908,6 +11968,8 @@ class Runtime:
 
     def _ledger_higher_is_better(self) -> bool:
         """Direction of the judge's score, mirroring `verify`'s own parameter."""
+        if self.config.official_lower_is_better is not None:
+            return not self.config.official_lower_is_better
         return os.environ.get("NANOMA_OFFICIAL_LOWER_IS_BETTER") != "1"
 
     @staticmethod
@@ -12127,7 +12189,11 @@ class Runtime:
         if spread is None:
             return None
         try:
-            k = float(os.environ.get("NANOMA_NOISE_MARGIN_SIGMAS", "2") or 2)
+            k = float(
+                self.config.noise_margin_sigmas
+                if self.config.noise_margin_sigmas is not None
+                else os.environ.get("NANOMA_NOISE_MARGIN_SIGMAS", "2") or 2
+            )
         except ValueError:
             k = 2.0
         relative, absolute = spread
@@ -13207,9 +13273,7 @@ class Runtime:
         return self._merge_change_signature(files, set())
 
     def _merge_snapshot_affordable(self, target: Path) -> bool:
-        import os
-        max_mb = float(os.environ.get("NANOMA_MERGE_MAX_MB", "200") or 200)
-        max_files = int(os.environ.get("NANOMA_MERGE_MAX_FILES", "40000") or 40000)
+        max_mb, max_files = self._merge_size_caps()
         total, count = self._merge_scope_stats(target)
         return not (
             (max_mb > 0 and total > max_mb * 1024 * 1024)
@@ -13404,9 +13468,13 @@ class Runtime:
     PREFLIGHT_TIMEOUT_DEFAULT = 120.0
 
     def _submit_preflight_command(self) -> str:
+        if self.config.submit_preflight_command is not None:
+            return self.config.submit_preflight_command.strip()
         return (os.environ.get("NANOMA_SUBMIT_PREFLIGHT") or "").strip()
 
     def _submit_requires_verified_state(self) -> bool:
+        if self.config.submit_require_verified is not None:
+            return self.config.submit_require_verified
         return os.environ.get("NANOMA_SUBMIT_REQUIRE_VERIFIED") == "1"
 
     def _submit_requires_measured_state(self) -> bool:
@@ -13424,10 +13492,14 @@ class Runtime:
         """
         if not self._merge_active():
             return False
+        if self.config.submit_require_measured is not None:
+            return self.config.submit_require_measured
         return os.environ.get("NANOMA_SUBMIT_REQUIRE_MEASURED", "1") == "1"
 
     def _submit_requires_complete_aggregate(self) -> bool:
         """Whether a timed-out aggregate wait may still spend a submission."""
+        if self.config.submit_require_complete_aggregate is not None:
+            return self.config.submit_require_complete_aggregate
         return os.environ.get("NANOMA_SUBMIT_REQUIRE_COMPLETE", "1") == "1"
 
     def _submit_gate_enabled(self) -> bool:
@@ -13446,7 +13518,8 @@ class Runtime:
         """
         try:
             timeout = float(
-                os.environ.get("NANOMA_SUBMIT_PREFLIGHT_TIMEOUT")
+                self.config.submit_preflight_timeout
+                or os.environ.get("NANOMA_SUBMIT_PREFLIGHT_TIMEOUT")
                 or self.PREFLIGHT_TIMEOUT_DEFAULT
             )
         except ValueError:
@@ -13741,6 +13814,8 @@ class Runtime:
         Returns None when no limit can be determined (no cap).
         """
         import os
+        if self.config.max_parallel_children is not None:
+            return self.config.max_parallel_children if self.config.max_parallel_children > 0 else None
         explicit = os.environ.get("NANOMA_MAX_PARALLEL_CHILDREN", "").strip()
         if explicit:
             try:
@@ -13751,8 +13826,12 @@ class Runtime:
         limit = self._container_memory_limit_bytes()
         if not limit:
             return None
-        per_child_mb = float(os.environ.get("NANOMA_CHILD_MEM_MB", "1500") or 1500)
-        reserve_mb = float(os.environ.get("NANOMA_RUNTIME_RESERVE_MB", "1500") or 1500)
+        per_child_mb = self.config.child_mem_mb
+        if per_child_mb is None:
+            per_child_mb = float(os.environ.get("NANOMA_CHILD_MEM_MB", "1500") or 1500)
+        reserve_mb = self.config.runtime_reserve_mb
+        if reserve_mb is None:
+            reserve_mb = float(os.environ.get("NANOMA_RUNTIME_RESERVE_MB", "1500") or 1500)
         if per_child_mb <= 0:
             return None
         usable_mb = max(0.0, limit / (1024 * 1024) - reserve_mb)
