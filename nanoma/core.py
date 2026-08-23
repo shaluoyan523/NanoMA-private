@@ -64,6 +64,17 @@ from nanoma.merge_submit import (
     _MERGE_HASH_MAX_BYTES,
     MergeSubmitMixin,
 )
+from nanoma.tool_groups import (
+    _COORDINATION_TOOLS,
+    _CREATE_TOOLS,
+    _DELIVERY_READ_TOOLS,
+    _DELIVERY_WRITE_TOOLS,
+    _FINISH_TOOLS,
+    _LIFECYCLE_TOOLS,
+    _READ_TOOLS,
+    _SHELL_TOOLS,
+    _WORK_TOOLS,
+)
 
 logger = logging.getLogger("nanoma")
 
@@ -88,21 +99,6 @@ _NATO = [
 ToolPolicyMode = Literal["off", "adaptive", "enforce"]
 ShellCapability = Literal["web", "python", "fs", "process", "package", "system", "unknown"]
 
-_CREATE_TOOLS = {"spawn", "spawn_many"}
-_COORDINATION_TOOLS = {"send", "deliver_to_parent", "wait", "query", "kill", "transfer", "set_bio"}
-_LIFECYCLE_TOOLS = {"get_cost", "set_status", "rebirth", "submit"}
-_SHELL_TOOLS = {"shell", "tb_shell"}
-_DELIVERY_READ_TOOLS = {
-    "ws_read_file", "ws_grep", "ws_code_outline", "ws_read_symbol",
-    "tb_read_file", "get_task_context",
-}
-_DELIVERY_WRITE_TOOLS = {
-    "ws_create_file", "ws_append_file", "ws_replace_string",
-    "ws_multi_replace", "ws_apply_patch", "tb_write_file",
-}
-_READ_TOOLS = _DELIVERY_READ_TOOLS | {"query", "get_cost"} | _SHELL_TOOLS
-_WORK_TOOLS = _DELIVERY_WRITE_TOOLS | _SHELL_TOOLS | {"batch", "submit"}
-_FINISH_TOOLS = {"set_status", "submit", "tb_write_file", "ws_create_file", "ws_append_file"}
 _SUPERVISOR_TOPOLOGY_TOOL_ORDER = (
     "spawn_many", "spawn", "query", "wait", "kill", "send", "set_status",
 )

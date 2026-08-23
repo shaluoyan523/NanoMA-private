@@ -29,6 +29,8 @@ import time
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
+from nanoma.tool_groups import _SHELL_TOOLS
+
 if TYPE_CHECKING:
     from nanoma.core import Agent
 
@@ -1123,11 +1125,6 @@ class MergeSubmitMixin:
         thing a child can reach, without needing container privileges or model
         compliance.
         """
-        # Deferred: core imports this module, so the tool-name vocabulary can only
-        # be read back at call time. Moving those constants to a neutral module
-        # would let this become a top-level import.
-        from nanoma.core import _SHELL_TOOLS
-
         copy_dir = getattr(agent, "_merge_copy", None)
         if not copy_dir or not self._merge_active():
             return
