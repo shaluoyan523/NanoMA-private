@@ -135,6 +135,7 @@ _OUTPUT_PATH_TOKEN_RE = re.compile(
 )
 _MARKDOWN_TABLE_LINE_RE = re.compile(r"^\s*\|[^|\n]+\|", re.MULTILINE)
 _CSVISH_LINE_RE = re.compile(r"^\s*[^,\t\n]+[,\t][^,\t\n]+(?:[,\t][^,\t\n]+)+\s*$")
+_CONTEXT_SUFFIX_RE = re.compile(r"\n\s*\[Context\]")
 _WEB_URL_RE = re.compile(r"https?://[^\s'\"<>]+", re.IGNORECASE)
 _WEB_LOW_SIGNAL_PATTERNS = (
     "access denied",
@@ -10574,7 +10575,7 @@ class Runtime:
     @staticmethod
     def _spawn_task_terms(task: str) -> set[str]:
         """Normalize a child assignment for conservative lineage de-duplication."""
-        source = re.split(r"\n\s*\[Context\]", str(task or ""), maxsplit=1)[0].lower()
+        source = _CONTEXT_SUFFIX_RE.split(str(task or ""), maxsplit=1)[0].lower()
         stop = {
             "about", "after", "agent", "against", "available", "before", "brief",
             "call", "candidate", "clear", "code", "concise", "context", "current",
@@ -10641,7 +10642,7 @@ class Runtime:
         if not entries:
             return "(no delegated ancestor/sibling assignments)"
         return "\n".join(
-            f"- {label}: {re.split(r'\n\s*\[Context\]', task, maxsplit=1)[0][:500]}"
+            f"- {label}: {_CONTEXT_SUFFIX_RE.split(task, maxsplit=1)[0][:500]}"
             for label, task in entries[:16]
         )
 
