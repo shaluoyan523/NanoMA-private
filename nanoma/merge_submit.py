@@ -30,6 +30,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from nanoma.tool_groups import _SHELL_TOOLS
+from nanoma import online_objective
 
 if TYPE_CHECKING:
     from nanoma.core import Agent
@@ -648,6 +649,8 @@ class MergeSubmitMixin:
 
     def _ledger_higher_is_better(self) -> bool:
         """Direction of the judge's score, mirroring `verify`'s own parameter."""
+        if self._online_objective is not None:
+            return self._online_objective["direction"] == "maximize"
         if self.config.official_lower_is_better is not None:
             return not self.config.official_lower_is_better
         return os.environ.get("NANOMA_OFFICIAL_LOWER_IS_BETTER") != "1"
@@ -682,14 +685,34 @@ class MergeSubmitMixin:
 
     def _ledger_best(self) -> dict | None:
         """The best measurement on record, read from disk rather than memory."""
+        return self._ledger_best_with_breadth()[0]
+
+    def _ledger_best_with_breadth(self) -> tuple[dict | None, int, int]:
+        """The best measurement, plus the field it was chosen from.
+
+        `max` keeps the first of a tie, so a plateaued run silently commits to one
+        state while equally good ones leave no trace. Reporting how many entries
+        were in contention, and how many matched the winning metric, is what makes
+        that choice auditable after the fact.
+        """
+        if self._online_objective is not None:
+            pairs = [(row, online_objective.rank(row, self._online_objective))
+                     for row in self._ledger_entries()]
+            pairs = [(row, key) for row, key in pairs if key is not None]
+            if not pairs:
+                return None, 0, 0
+            best, key = max(pairs, key=lambda pair: pair[1])
+            return best, len(pairs), sum(other == key for _, other in pairs)
         scored = [
             e for e in self._ledger_entries()
             if isinstance(e.get("metric"), (int, float)) and e.get("counts", True)
         ]
         if not scored:
-            return None
+            return None, 0, 0
         sign = 1 if self._ledger_higher_is_better() else -1
-        return max(scored, key=lambda e: sign * float(e["metric"]))
+        best = max(scored, key=lambda e: sign * float(e["metric"]))
+        tied = sum(1 for e in scored if float(e["metric"]) == float(best["metric"]))
+        return best, len(scored), tied
 
     def _ledger_note(
         self,
@@ -721,7 +744,7 @@ class MergeSubmitMixin:
         if extra:
             entry.update(extra)
 
-        previous_best = self._ledger_best()
+        previous_best, prior_candidates, prior_tied = self._ledger_best_with_breadth()
         try:
             self._ledger_path().parent.mkdir(parents=True, exist_ok=True)
             with self._ledger_path().open("a") as handle:
@@ -735,10 +758,15 @@ class MergeSubmitMixin:
             improved = previous_best is None or (
                 sign * float(metric) > sign * float(previous_best.get("metric", 0.0))
             )
+            if self._online_objective is not None:
+                key = online_objective.rank(entry, self._online_objective)
+                old_key = online_objective.rank(previous_best, self._online_objective) if previous_best else None
+                improved = key is not None and (old_key is None or key > old_key)
             if improved:
                 self._ledger_keep_state(digest, metric, agent_id)
         self._emit(agent_id, "ledger_note", {
             "source": source, "metric": metric, "state": digest, "counts": counts,
+            "prior_candidates": prior_candidates, "prior_tied_at_best": prior_tied,
         })
         return entry
 
@@ -753,6 +781,11 @@ class MergeSubmitMixin:
         """
         target = self._merge_target()
         if target is None or not self._merge_snapshot_affordable(target):
+            return
+        if self._online_objective is not None and self._ledger_digest(self._merge_scope_signature(target)) != digest:
+            self._emit(agent_id, "ledger_snapshot_skipped", {
+                "state": digest, "reason": "workspace changed while submission was evaluated",
+            })
             return
         destination = self._ledger_snapshot_dir(digest)
         if destination.is_dir():
@@ -791,11 +824,26 @@ class MergeSubmitMixin:
             return []
         return [
             float(e["metric"])
-            for e in self._ledger_entries()
+            for e in self._ledger_entries_for_metric(source)
             if e.get("state") == digest
             and isinstance(e.get("metric"), (int, float))
             and (source is None or e.get("source") == source)
         ]
+
+    def _ledger_entries_for_metric(self, source: str | None) -> list[dict]:
+        entries = self._ledger_entries()
+        if self._online_objective is None:
+            return entries
+        channel = source or "official"
+        if channel == "official":
+            return [e for e in entries if online_objective.rank(e, self._online_objective) is not None]
+        if channel == "verify":
+            spec = self._authoritative_spec() or {}
+            direction = "maximize" if spec.get("higher_is_better", True) else "minimize"
+            return [e for e in entries if e.get("source") == "verify"
+                    and spec.get("command") and e.get("check") == spec["command"]
+                    and e.get("direction") == direction and online_objective.finite(e.get("metric")) is not None]
+        return []
 
     def _measurement_spread(self, source: str) -> tuple[float, float] | None:
         """Scatter of repeat measurements of a single unchanged state.
@@ -814,7 +862,7 @@ class MergeSubmitMixin:
         comparison — that is the intended answer, not a degenerate one.
         """
         by_state: dict[str, list[float]] = {}
-        for entry in self._ledger_entries():
+        for entry in self._ledger_entries_for_metric(source):
             metric, state = entry.get("metric"), entry.get("state")
             if entry.get("source") != source or state is None:
                 continue
@@ -912,6 +960,7 @@ class MergeSubmitMixin:
             "pass_rate": pass_rate,
             "score": score,
             "failed": [f.strip() for f in failed][:20],
+            "failed_total": len(failed),
             "round": round_id,
         }
 
@@ -1023,7 +1072,10 @@ class MergeSubmitMixin:
                     signature=self._merge_scope_signature(target),
                     agent_id=agent.id,
                     counts=False,
-                    extra={"ok": bool(verification["ok"])},
+                    extra={"ok": bool(verification["ok"]), **(
+                        {"check": spec["command"], "direction": "maximize" if spec.get("higher_is_better", True) else "minimize"}
+                        if self._online_objective is not None and spec else {}
+                    )},
                 )
             keep = True
             if rank is not None:
@@ -1099,7 +1151,9 @@ class MergeSubmitMixin:
             "kept": keep,
             "metric_proven": proven,
             "changed_files": sorted(changed)[:20],
+            "changed_files_total": len(changed),
             "deleted_files": sorted(deleted)[:20],
+            "deleted_files_total": len(deleted),
             "note": note,
             "verification_output": (verification or {}).get("output", "")[-1500:],
         }
@@ -1193,6 +1247,10 @@ class MergeSubmitMixin:
         it was edited after its last verification: an unchecked edit is worth
         less than a state that is known to work.
         """
+        if self._online_objective is not None and self._merge_active():
+            measured = self._ledger_best()
+            if measured and measured.get("valid", True) and self._ledger_restore(measured["state"]):
+                return
         if not self._merge_active() or self._merge_best_rank is None:
             return
         best_dir = self._merge_best_dir()

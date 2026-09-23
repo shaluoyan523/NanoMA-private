@@ -13,12 +13,13 @@ import time
 from pathlib import Path
 
 from nanoma import Runtime, RuntimeConfig
+from nanoma.online_objective import parse_feedback, runtime_time_limit
 
 
 def _runtime_prompt(prompt: str, task_cwd: Path, *, iteration: int, wall_seconds: float, deadline: float) -> str:
     if wall_seconds > 0:
         remaining = max(0.0, deadline - time.time())
-        lifecycle = f"""12-hour benchmark protocol:
+        lifecycle = f"""Wall-clock benchmark protocol:
 - This SForge task is running under a {wall_seconds:.0f}s wall-clock benchmark budget.
 - Current NanoMA improvement iteration: {iteration}; approximate remaining runner budget: {remaining:.0f}s.
 - Do not treat one candidate submission as the end of the benchmark. Use this iteration to inspect the workspace, improve the current solution, run focused validation, and submit a better candidate when meaningful.
@@ -208,18 +209,21 @@ async def _prepare_seed_archive(task_cwd: Path, workspace: Path) -> dict:
 
 
 async def _run_sforge_submit_once(task_cwd: Path, *, timeout: float) -> dict:
+    proc = None
     try:
         proc = await asyncio.create_subprocess_exec(
             "sforge-submit",
             cwd=str(task_cwd),
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
+            start_new_session=True,
         )
         stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=timeout)
         return {
             "exit_code": proc.returncode,
             "stdout": stdout.decode(errors="replace")[-4000:],
             "stderr": stderr.decode(errors="replace")[-4000:],
+            "objective_observation": parse_feedback(stdout.decode(errors="replace")),
         }
     except Exception as exc:
         return {
@@ -227,6 +231,10 @@ async def _run_sforge_submit_once(task_cwd: Path, *, timeout: float) -> dict:
             "stdout": "",
             "stderr": f"{type(exc).__name__}: {exc}",
         }
+    finally:
+        if proc is not None and proc.returncode is None:
+            from nanoma.sandbox import _terminate_process_tree
+            await _terminate_process_tree(proc)
 
 
 async def _sforge_submit_with_retry(task_cwd: Path, *, attempts: int, timeout: float) -> dict:
@@ -315,7 +323,11 @@ def _append_jsonl(path: Path, row: dict) -> None:
 async def _run_single_iteration(args: argparse.Namespace) -> int:
     prompt = Path(args.prompt_file).read_text(encoding="utf-8")
     task_cwd = Path(args.task_cwd)
-    workspace = Path(args.workspace) if args.workspace else task_cwd / ".nanoma-task-work"
+    workspace = (
+        Path(args.workspace)
+        if args.workspace
+        else Path.home() / ".nanoma-task-work" / task_cwd.name
+    )
     log_dir = Path(args.log_dir) if args.log_dir else workspace / "logs"
     workspace.mkdir(parents=True, exist_ok=True)
     log_dir.mkdir(parents=True, exist_ok=True)
@@ -368,16 +380,40 @@ async def _run_single_iteration(args: argparse.Namespace) -> int:
         else (Path("/tmp/nanoma-checkpoints") if auto_checkpoint_enabled else None)
     )
 
+    objective = None
+    direction = os.environ.get("SFORGE_SCORE_DIRECTION")
+    selection = os.environ.get("SFORGE_SELECTION_POLICY")
+    if direction and selection and _env_enabled("NANOMA_ONLINE_OBJECTIVE_ENABLED", True):
+        objective = {
+            "visibility": "agent_submission", "metric_id": "official_score",
+            "direction": direction, "selection": selection,
+            "plateau_window": int(os.environ.get("NANOMA_OBJECTIVE_PLATEAU_WINDOW", "3")),
+        }
+    resumed_elapsed = 0.0
+    if resume_probe is not None:
+        import pickle
+        with resume_probe.open("rb") as handle:
+            saved = pickle.load(handle)  # Same trusted checkpoint used by continue_from_probe.
+        resumed_elapsed = float((saved.get("runtime_resume_state") or {}).get("effective_elapsed_seconds", 0.0))
+    effective_time_limit = runtime_time_limit(
+        args.time_limit, deadline, wall_seconds,
+        float(os.environ.get("NANOMA_EDGE_FINAL_SAFETY_SECONDS", "90")),
+        now=time.time(), elapsed=resumed_elapsed,
+    )
+
     config = RuntimeConfig(
         budget=args.budget,
-        time_limit=args.time_limit,
+        time_limit=effective_time_limit,
+        online_objective=objective,
         max_agents=1_000_000,
         max_depth=1_000_000,
+        max_parallel_children=0,  # Heavy commands are scheduled; agent count is not capped.
         max_concurrent_llm=int(os.environ.get("NANOMA_MAX_CONCURRENT_LLM", "50")),
         default_model=args.model,
         allowed_models=[args.model],
         workspace_root=workspace,
         workspace_extra_roots=[task_cwd],
+        final_candidate_review_snapshot_roots=(task_cwd,),
         log_dir=iter_log_dir,
         probe_dir=resume_probe.parents[1] if resume_probe is not None else None,
         auto_checkpoint_enabled=auto_checkpoint_enabled,
@@ -422,6 +458,7 @@ async def _run_single_iteration(args: argparse.Namespace) -> int:
             },
         },
         shell_max_timeout=int(os.environ.get("NANOMA_SHELL_MAX_TIMEOUT", "300")),
+        shell_memory_strict_admission=_env_enabled("NANOMA_SHELL_STRICT_ADMISSION", True),
         shell_max_output=int(os.environ.get("NANOMA_SHELL_MAX_OUTPUT", "40000")),
         file_read_max_chars=int(os.environ.get("NANOMA_FILE_READ_MAX_CHARS", "200000")),
         file_list_max_entries=int(os.environ.get("NANOMA_FILE_LIST_MAX_ENTRIES", "5000")),
@@ -443,6 +480,9 @@ async def _run_single_iteration(args: argparse.Namespace) -> int:
         "remaining_seconds": max(0.0, deadline - time.time()) if wall_seconds > 0 else None,
         "pid": os.getpid(),
         "resume_probe": str(resume_probe) if resume_probe is not None else None,
+        "runtime_time_limit_seconds": effective_time_limit,
+        "online_objective": objective,
+        "shell_memory_strict_admission": config.shell_memory_strict_admission,
         "seed": seed_record,
         "seed_submit": seed_submit_result,
     }
@@ -459,7 +499,7 @@ async def _run_single_iteration(args: argparse.Namespace) -> int:
                     iteration=iteration,
                     wall_seconds=wall_seconds,
                     deadline=deadline,
-                ),
+                ) + ("\n" + runtime._online_objective_summary() if objective else ""),
                 model=args.model,
             )
         stats = runtime.stats()
@@ -538,7 +578,11 @@ async def _run_single_iteration(args: argparse.Namespace) -> int:
 
 async def _run_outer_loop(args: argparse.Namespace) -> int:
     task_cwd = Path(args.task_cwd)
-    workspace = Path(args.workspace) if args.workspace else task_cwd / ".nanoma-task-work"
+    workspace = (
+        Path(args.workspace)
+        if args.workspace
+        else Path.home() / ".nanoma-task-work" / task_cwd.name
+    )
     log_dir = Path(args.log_dir) if args.log_dir else workspace / "logs"
     workspace.mkdir(parents=True, exist_ok=True)
     log_dir.mkdir(parents=True, exist_ok=True)

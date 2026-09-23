@@ -11,6 +11,7 @@ import argparse
 import asyncio
 import json
 import os
+import re
 import shutil
 import stat
 import subprocess
@@ -66,6 +67,73 @@ BLOCKED_SHELL_PATTERNS = [
 ]
 
 PUBLIC_C_PROBES = ["0", "1", "2", "3", "4", "5", "8", "13", "21", "34", "55"]
+
+_ESM_IMPORT = re.compile(
+    r"(?:\b(?:import|export)\s+(?:[^\"'();]*?\s+from\s+)?|\bimport\s*\(\s*)"
+    r"[\"'](?P<specifier>[^\"']+)[\"']",
+    flags=re.MULTILINE,
+)
+
+_NODE_BUILTINS = {
+    "assert", "assert/strict", "buffer", "crypto", "events", "fs", "fs/promises",
+    "module", "os", "path", "perf_hooks", "process", "querystring", "stream",
+    "string_decoder", "timers", "timers/promises", "url", "util", "worker_threads",
+    "zlib",
+}
+
+
+def validate_py2js_delivery_tree(tree_root: Path, entry_name: str) -> str | None:
+    """Validate syntax and the reachable local ESM dependency closure."""
+
+    root = tree_root.resolve()
+    entry = root / entry_name
+    pending = [entry]
+    visited: set[Path] = set()
+    while pending:
+        current = pending.pop()
+        try:
+            resolved = current.resolve(strict=True)
+        except OSError as exc:
+            return f"missing local ESM dependency: {current}: {exc}"
+        try:
+            resolved.relative_to(root)
+        except ValueError:
+            return f"local ESM dependency escapes the delivery tree: {resolved}"
+        if resolved in visited:
+            continue
+        if not resolved.is_file() or resolved.stat().st_size <= 0:
+            return f"local ESM dependency is missing or empty: {resolved}"
+        visited.add(resolved)
+        try:
+            source = resolved.read_text(encoding="utf-8")
+        except (OSError, UnicodeError) as exc:
+            return f"cannot read local ESM dependency {resolved}: {exc}"
+        if re.search(r"\brequire\s*\(|\bmodule\.exports\b|\bexports\s*\.", source):
+            return f"CommonJS is forbidden; use pure ESM: {resolved}"
+        syntax = subprocess.run(
+            [str(NODE), "--check", str(resolved)],
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        if syntax.returncode != 0:
+            detail = (syntax.stderr or syntax.stdout or "syntax check failed").strip()
+            return f"Node syntax check failed for {resolved}: {detail[-2000:]}"
+        for match in _ESM_IMPORT.finditer(source):
+            specifier = match.group("specifier").split("?", 1)[0].split("#", 1)[0]
+            if specifier.startswith(("./", "../")):
+                pending.append(resolved.parent / specifier)
+                continue
+            normalized = specifier[5:] if specifier.startswith("node:") else specifier
+            if normalized == "child_process":
+                return (
+                    "process spawning is forbidden for pure-JavaScript submissions: "
+                    f"{resolved} imports {specifier}"
+                )
+            if specifier.startswith("node:") or normalized in _NODE_BUILTINS:
+                continue
+            return f"external package import is forbidden: {resolved} imports {specifier}"
+    return None
 
 
 def parse_args() -> argparse.Namespace:
@@ -350,8 +418,9 @@ Official task requirements:
 Continuation checkpoint:
 - Prior candidate sources are available in `{checkpoint_dir}`. The strongest candidate on a fixed
   public black-box probe set has already been copied to `{paths['output']}` and compiled.
-- Continue from these artifacts instead of restarting. Compare concrete functions and observed
-  oracle mismatches, then preserve every improvement in the official output path.
+- Continue from these artifacts instead of restarting. Decide the planning topology, implementation
+  risks, and public verification strategy from the task contract and the restored candidate; the
+  checkpoint mechanism does not prescribe scenarios or agent roles.
 - At regular milestones and before waiting for children, copy the best compiling candidate to
   `{paths['output']}` and rebuild `{paths['binary']}`. A partial candidate is preferable to no
   deliverable at the deadline.
@@ -385,9 +454,10 @@ async def generate(kind: str, spec: dict[str, Any], paths: dict[str, Path], args
     workspace.mkdir(parents=True, exist_ok=True)
 
     config = RuntimeConfig(
-        max_agents=sys.maxsize,
-        max_depth=sys.maxsize,
+        max_agents=getattr(args, "max_agents", sys.maxsize),
+        max_depth=getattr(args, "max_depth", sys.maxsize),
         max_concurrent_llm=args.max_concurrent_llm,
+        max_parallel_children=getattr(args, "max_parallel_children", None),
         budget=1000.0,
         max_total_tokens=0,
         time_limit=args.time_limit,
@@ -404,11 +474,20 @@ async def generate(kind: str, spec: dict[str, Any], paths: dict[str, Path], args
                     target="output",
                     candidates=("output", "Py2JS/output"),
                     required=(paths["output"].name,),
+                    validator=(
+                        lambda tree_root: validate_py2js_delivery_tree(
+                            tree_root,
+                            paths["output"].name,
+                        )
+                    ) if kind == "py2js" else None,
                 ),
             ),
         ),
         blocked_shell_patterns=BLOCKED_SHELL_PATTERNS,
-        shell_max_timeout=300,
+        # Candidate programs are untrusted generated code. A non-terminating
+        # implementation must become review evidence quickly instead of
+        # occupying the task for five minutes per probe.
+        shell_max_timeout=60,
         shell_max_output=40000,
         file_read_max_chars=200000,
         file_list_max_entries=5000,
@@ -417,6 +496,8 @@ async def generate(kind: str, spec: dict[str, Any], paths: dict[str, Path], args
         tool_policy_delivery_enabled=False,
         tool_policy_delivery_prepare_enabled=False,
         tool_policy_delivery_verify_enabled=False,
+        spawn_judge_enabled=getattr(args, "spawn_judge_enabled", None),
+        spawn_judge_instruction=getattr(args, "spawn_judge_instruction", None),
         system_extra_instructions=(
             f"RepoZero task directory is {paths['task_dir']}. Work only inside this task directory. "
             "The input source and black-box executable are public task materials. Hidden tests, "

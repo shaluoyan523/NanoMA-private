@@ -229,9 +229,9 @@ async def meta_spawn(args: dict[str, Any], agent: "Agent", runtime: "Runtime") -
             "protocol_chars": len(task) - len(original_task),
             "original_task_preview": original_task_preview,
         })
-    if agent.depth + 1 > runtime.config.max_depth:
+    if runtime.config.max_depth > 0 and agent.depth + 1 > runtime.config.max_depth:
         return {"error": f"Max depth ({runtime.config.max_depth}) exceeded"}
-    if len(runtime.agents) >= runtime.config.max_agents:
+    if runtime.config.max_agents > 0 and len(runtime.agents) >= runtime.config.max_agents:
         return {"error": f"Max agents ({runtime.config.max_agents}) reached"}
     memory_block = runtime._spawn_memory_block_reason()
     if memory_block:
@@ -450,6 +450,211 @@ async def meta_deliver_to_parent(
         return {"error": "'confidence' must be a number between 0 and 1"}
     confidence = max(0.0, min(1.0, confidence))
 
+    artifact_path_arg = str(args.get("artifact_path", "") or "").strip()
+    artifact_report = {
+        "ready": False,
+        "captured": [],
+        "artifact_sha256": "",
+        "rejected": [],
+        "missing": [],
+        "checked_candidates": [],
+    }
+    explicit_paths: list[Path] = []
+    if artifact_path_arg:
+        if runtime.config.delivery_contract is None:
+            return {"error": "artifact_path requires a runtime delivery contract"}
+        artifact_path = Path(artifact_path_arg).expanduser()
+        if not artifact_path.is_absolute():
+            artifact_path = agent.workspace / artifact_path
+        try:
+            resolved_artifact = artifact_path.resolve(strict=True)
+            resolved_artifact.relative_to(agent.workspace.resolve())
+        except FileNotFoundError:
+            return {"error": f"artifact_path does not exist: {artifact_path}"}
+        except ValueError:
+            return {
+                "error": (
+                    "artifact_path must remain inside the delivering agent's private workspace"
+                )
+            }
+        except OSError as exc:
+            return {"error": f"cannot resolve artifact_path: {exc}"}
+        explicit_paths.append(resolved_artifact)
+
+    if runtime.config.delivery_contract is not None:
+        artifact_report = runtime._capture_candidate_artifacts(
+            agent,
+            explicit_paths=explicit_paths,
+        )
+        if artifact_path_arg and not artifact_report.get("ready"):
+            return {
+                "error": "artifact_path does not satisfy the runtime delivery contract",
+                "artifact_path": artifact_path_arg,
+                "rejected": artifact_report.get("rejected", []),
+                "missing": artifact_report.get("missing", []),
+                "checked_candidates": artifact_report.get("checked_candidates", [])[-20:],
+            }
+
+    reviewed_artifact_sha256 = ""
+    reviewed_root = str(getattr(agent, "_final_candidate_reviewer_for", "") or "")
+    verification_checks: list[dict[str, Any]] = []
+    coverage_summary = ""
+    if reviewed_root:
+        review_state = runtime._final_candidate_reviews.get(reviewed_root) or {}
+        reviewed_artifact_sha256 = str(
+            review_state.get("artifact_sha256") or ""
+        )
+        requires_executed_evidence = bool(
+            runtime.config.final_candidate_review_require_executed_evidence
+            and review_state.get("artifact_snapshots")
+        )
+        if requires_executed_evidence:
+            raw_checks = args.get("verification_checks")
+            coverage_summary = str(args.get("coverage_summary") or "").strip()
+            if not isinstance(raw_checks, list) or not raw_checks or not coverage_summary:
+                return {
+                    "error": "final reviewer verdict requires self-derived executed evidence",
+                    "required_behavior": (
+                        "Derive material properties from the public task and exact artifact, "
+                        "execute appropriate public checks, then retry with coverage_summary "
+                        "and verification_checks. No benchmark scenario list is provided."
+                    ),
+                }
+            executed_commands: dict[str, Any] = {}
+            for event in runtime._events:
+                data = event.get("data") or {}
+                if (
+                    event.get("agent") != agent.id
+                    or event.get("event") != "tool_call"
+                    or str(data.get("tool") or "") not in {"shell", "tb_shell"}
+                ):
+                    continue
+                command = str((data.get("args") or {}).get("command") or "").strip()
+                if command:
+                    executed_commands[command] = data.get("result")
+            invalid_checks: list[dict[str, Any]] = []
+            covered: set[str] = set()
+            reported_commands = {
+                str(raw.get("command") or "").strip()
+                for raw in raw_checks
+                if isinstance(raw, dict) and str(raw.get("command") or "").strip()
+            }
+            bind_single_execution = (
+                len(executed_commands) == 1
+                and (
+                    len(reported_commands) <= 1
+                    or bool(
+                        getattr(agent, "_final_review_execution_complete", False)
+                    )
+                )
+            )
+            for index, raw in enumerate(raw_checks):
+                if not isinstance(raw, dict):
+                    invalid_checks.append({"index": index, "reason": "check must be an object"})
+                    continue
+                property_name = str(raw.get("property") or "").strip()
+                rationale = str(raw.get("rationale") or "").strip()
+                command = str(raw.get("command") or "").strip()
+                if command not in executed_commands and bind_single_execution:
+                    # The bounded review path deliberately has one execution
+                    # phase.  Bind evidence to that recorded command directly
+                    # instead of spending another LLM turn reproducing a long
+                    # shell string byte-for-byte in JSON.
+                    command = next(iter(executed_commands))
+                expected = str(raw.get("expected_observation") or "").strip()
+                expected_basis = str(raw.get("expected_basis") or "").strip()
+                actual = str(raw.get("actual_observation") or "").strip()
+                if property_name in covered:
+                    invalid_checks.append({
+                        "index": index,
+                        "property": property_name,
+                        "reason": "property labels must be unique",
+                    })
+                    continue
+                missing_fields = [
+                    name for name, value in (
+                        ("property", property_name),
+                        ("rationale", rationale),
+                        ("command", command),
+                        ("expected_observation", expected),
+                        ("expected_basis", expected_basis),
+                        ("actual_observation", actual),
+                    )
+                    if not value
+                ]
+                if missing_fields:
+                    invalid_checks.append({
+                        "index": index,
+                        "property": property_name,
+                        "reason": "missing fields: " + ", ".join(missing_fields),
+                    })
+                    continue
+                if command not in executed_commands:
+                    invalid_checks.append({
+                        "index": index,
+                        "property": property_name,
+                        "reason": "command was not executed by this reviewer",
+                    })
+                    continue
+                execution_result = executed_commands[command]
+                if isinstance(execution_result, str):
+                    try:
+                        execution_result = json.loads(execution_result)
+                    except (TypeError, ValueError):
+                        execution_result = None
+                execution_failed = bool(
+                    isinstance(execution_result, dict)
+                    and (
+                        execution_result.get("blocked")
+                        or execution_result.get("timed_out")
+                        or (
+                            isinstance(execution_result.get("exit_code"), int)
+                            and execution_result["exit_code"] != 0
+                        )
+                    )
+                )
+                if bool(raw.get("passed")) and execution_failed:
+                    invalid_checks.append({
+                        "index": index,
+                        "property": property_name,
+                        "reason": "passed check command did not complete successfully",
+                    })
+                    continue
+                covered.add(property_name)
+                verification_checks.append({
+                    "property": property_name,
+                    "rationale": rationale,
+                    "command": command,
+                    "expected_observation": expected,
+                    "expected_basis": expected_basis,
+                    "actual_observation": actual,
+                    "passed": bool(raw.get("passed")),
+                })
+            if invalid_checks:
+                return {
+                    "error": "final reviewer self-derived verification evidence is invalid",
+                    "invalid_checks": invalid_checks,
+                    "executed_commands": list(executed_commands)[-20:],
+                    "required_behavior": (
+                        "Correct the evidence using exact commands already executed by this "
+                        "reviewer, or run the missing public check; do not describe an "
+                        "unexecuted test."
+                    ),
+                }
+            verdict = answer.split(None, 1)[0].upper().rstrip(":") if answer else ""
+            failed_checks = [
+                item["property"] for item in verification_checks if not item["passed"]
+            ]
+            if verdict == "ACCEPT" and failed_checks:
+                return {
+                    "error": "final reviewer cannot ACCEPT failed self-derived checks",
+                    "failed_properties": failed_checks,
+                    "required_behavior": (
+                        "Deliver REVISE with the observed mismatch, or correct the artifact and "
+                        "rerun the relevant public checks before ACCEPT."
+                    ),
+                }
+
     record = runtime._record_candidate_delivery(
         agent,
         parent_id=agent.parent,
@@ -458,6 +663,10 @@ async def meta_deliver_to_parent(
         confidence=confidence,
         method=method,
         source="deliver_to_parent",
+        artifacts=list(artifact_report.get("captured") or []),
+        artifact_sha256=str(artifact_report.get("artifact_sha256") or ""),
+        reviewed_artifact_sha256=reviewed_artifact_sha256,
+        verification_checks=verification_checks,
     )
     agent.result = answer
     message = (
@@ -465,7 +674,11 @@ async def meta_deliver_to_parent(
         f"answer: {answer}\n"
         f"confidence: {confidence:.2f}\n"
         f"method: {method or 'unspecified'}\n"
-        f"evidence: {evidence or 'not supplied'}"
+        f"evidence: {evidence or 'not supplied'}\n"
+        f"artifact_sha256: {artifact_report.get('artifact_sha256') or 'none'}\n"
+        f"artifact_snapshots: {', '.join(str(item.get('snapshot')) for item in artifact_report.get('captured', [])) or 'none'}\n"
+        f"verification_properties: {', '.join(item['property'] for item in verification_checks) or 'none'}\n"
+        f"verification_coverage: {coverage_summary or 'none'}"
     )
     tokens = estimate_tokens(message)
     await runtime.deliver(Envelope(
@@ -483,6 +696,10 @@ async def meta_deliver_to_parent(
         "method": method[:120],
         "evidence": evidence[:500],
         "record_seq": record.get("seq") if record else None,
+        "artifact_sha256": artifact_report.get("artifact_sha256") or "",
+        "artifact_count": len(artifact_report.get("captured") or []),
+        "verification_properties": [item["property"] for item in verification_checks],
+        "verification_coverage": coverage_summary[:500],
     })
     auto_completed = bool(
         runtime.config.child_delivery_auto_complete
@@ -501,6 +718,18 @@ async def meta_deliver_to_parent(
         "answer": answer,
         "confidence": confidence,
         "record_seq": record.get("seq") if record else None,
+        "artifact_sha256": artifact_report.get("artifact_sha256") or "",
+        "artifacts": [
+            {
+                "target": item.get("target"),
+                "snapshot": item.get("snapshot"),
+                "sha256": item.get("sha256"),
+                "validated": item.get("validated"),
+            }
+            for item in artifact_report.get("captured", [])
+        ],
+        "verification_checks": verification_checks,
+        "coverage_summary": coverage_summary,
         "agent_completed": auto_completed,
     }
 
@@ -990,18 +1219,7 @@ async def meta_set_status(args: dict[str, Any], agent: "Agent", runtime: "Runtim
     if status not in ("done", "idle"):
         return {"error": "status must be 'done' or 'idle'"}
     if status == "done" and agent.parent is None:
-        review = await runtime.ensure_final_candidate_review(
-            agent,
-            str(result or agent.result or ""),
-            override_reason=str(args.get("review_override_reason", "") or ""),
-        )
-        if not review.get("ready"):
-            return {
-                "error": "final candidate review is not satisfied; status remains running",
-                "status": agent.status,
-                "review": review,
-            }
-        delivery = runtime.finalize_delivery(agent, trigger="set_status")
+        delivery = runtime.finalize_delivery(agent, trigger="set_status_pre_review")
         contract = runtime.config.delivery_contract
         if contract is not None and contract.block_done and not delivery.get("ready"):
             missing = delivery.get("missing") or []
@@ -1014,8 +1232,28 @@ async def meta_set_status(args: dict[str, Any], agent: "Agent", runtime: "Runtim
                 "delivery": {
                     "ready": False,
                     "missing": missing,
+                    "rejected": delivery.get("rejected", []),
                     "checked_candidates": delivery.get("checked_candidates", [])[-20:],
                 },
+            }
+        review = await runtime.ensure_final_candidate_review(
+            agent,
+            str(result or agent.result or ""),
+            override_reason=str(args.get("review_override_reason", "") or ""),
+        )
+        if not review.get("ready"):
+            review = await runtime.await_final_candidate_review(
+                agent,
+                str(result or agent.result or ""),
+                review,
+                override_reason=str(args.get("review_override_reason", "") or ""),
+            )
+        if not review.get("ready"):
+            return {
+                "error": "final candidate review is not satisfied; status remains running",
+                "status": agent.status,
+                "review": review,
+                "delivery": delivery,
             }
     agent.status = status
     if result is not None and result != "":
@@ -1176,12 +1414,34 @@ META_TOOLS: dict[str, dict[str, Any]] = {
     }}},
     "deliver_to_parent": {"handler": meta_deliver_to_parent, "is_meta": True, "schema": {"type": "function", "function": {
         "name": "deliver_to_parent",
-        "description": "Deliver a completed answer candidate to your parent through a durable structured channel. Use this exactly once when your evidence supports an answer, then call set_status(done, result=<same answer>). Do not use query or send for final result delivery.",
+        "description": "Deliver a completed answer candidate to your parent through a durable structured channel. When you produced runnable files, pass artifact_path for the complete private candidate tree; the runtime validates and freezes it. Use this exactly once when your evidence supports an answer, then call set_status(done, result=<same answer>). Do not use query or send for final result delivery.",
         "parameters": {"type": "object", "properties": {
             "answer": {"type": "string", "description": "Concise answer-only candidate expected by the task"},
             "evidence": {"type": "string", "description": "Brief decisive evidence or calculation supporting the answer"},
             "confidence": {"type": "number", "minimum": 0, "maximum": 1, "description": "Confidence from 0 to 1", "default": 0.7},
             "method": {"type": "string", "description": "Short method label, such as independent calculation, source lookup, or elimination"},
+            "artifact_path": {"type": "string", "description": "Optional file or directory inside your private workspace containing the complete runnable candidate. The runtime validates and freezes it before delivery."},
+            "coverage_summary": {
+                "type": "string",
+                "description": "Final artifact reviewers only: concise explanation of the task-specific properties selected from the public contract and why those checks cover the material risks.",
+            },
+            "verification_checks": {
+                "type": "array",
+                "description": "Final artifact reviewers only: self-derived, actually executed public checks. The runtime supplies no benchmark-specific scenario list.",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "property": {"type": "string", "description": "Unique task-specific property or risk selected by the reviewer"},
+                        "rationale": {"type": "string", "description": "Why this property is material for the exact task and artifact"},
+                        "command": {"type": "string", "description": "Exact shell command already executed by this reviewer"},
+                        "expected_observation": {"type": "string", "description": "Expected public behavior or invariant"},
+                        "expected_basis": {"type": "string", "description": "Public contract, oracle, test, build rule, invariant, or metamorphic relation supporting the expectation"},
+                        "actual_observation": {"type": "string", "description": "Concrete output observed from the exact frozen candidate"},
+                        "passed": {"type": "boolean", "description": "Whether the observed behavior satisfied this property"},
+                    },
+                    "required": ["property", "rationale", "command", "expected_observation", "expected_basis", "actual_observation", "passed"],
+                },
+            },
         }, "required": ["answer"]},
     }}},
     "query": {"handler": meta_query, "is_meta": True, "schema": {"type": "function", "function": {
@@ -1255,7 +1515,7 @@ META_TOOLS: dict[str, dict[str, Any]] = {
         "parameters": {"type": "object", "properties": {
             "status": {"type": "string", "enum": ["done", "idle"], "description": "'done' = terminate, 'idle' = sleep until messaged"},
             "result": {"type": "string", "description": "Summary of your output (sent to parent on 'done')"},
-            "review_override_reason": {"type": "string", "description": "Root only: explicit rationale for overriding a disputed or unavailable final review"},
+            "review_override_reason": {"type": "string", "description": "Root only: recover a reviewer that terminated without a formal verdict for this exact candidate; cannot override ACCEPT or REVISE"},
         }, "required": ["status"]},
     }}},
     "rebirth": {"handler": meta_rebirth, "is_meta": True, "schema": {"type": "function", "function": {

@@ -9,11 +9,12 @@ and swaps it into place only after every required file is present.
 from __future__ import annotations
 
 import os
+import hashlib
 import shutil
 import tempfile
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Iterable, Sequence
+from typing import Callable, Iterable, Sequence
 
 
 def _relative_path(value: str | Path, *, label: str) -> Path:
@@ -37,6 +38,11 @@ class DeliveryTree:
     target: str
     candidates: tuple[str, ...]
     required: tuple[str, ...]
+    validator: Callable[[Path], str | None] | None = field(
+        default=None,
+        repr=False,
+        compare=False,
+    )
 
     def __post_init__(self) -> None:
         _relative_path(self.target, label="delivery target")
@@ -79,6 +85,7 @@ class DeliveryReport:
     published: list[dict] = field(default_factory=list)
     satisfied: list[dict] = field(default_factory=list)
     missing: list[dict] = field(default_factory=list)
+    rejected: list[dict] = field(default_factory=list)
     checked_candidates: list[str] = field(default_factory=list)
 
     def as_dict(self) -> dict:
@@ -88,6 +95,7 @@ class DeliveryReport:
             "published": list(self.published),
             "satisfied": list(self.satisfied),
             "missing": list(self.missing),
+            "rejected": list(self.rejected),
             "checked_candidates": list(self.checked_candidates),
         }
 
@@ -108,6 +116,32 @@ def _deduplicate_paths(paths: Iterable[Path]) -> list[Path]:
     return result
 
 
+def delivery_tree_digest(tree_root: Path) -> str:
+    """Return a stable content digest for one complete delivery tree."""
+
+    root = Path(tree_root).resolve()
+    digest = hashlib.sha256()
+    for path in sorted(root.rglob("*"), key=lambda item: item.as_posix()):
+        relative = path.relative_to(root).as_posix()
+        if path.is_symlink():
+            digest.update(b"L\0")
+            digest.update(relative.encode("utf-8", errors="surrogateescape"))
+            digest.update(b"\0")
+            digest.update(os.readlink(path).encode("utf-8", errors="surrogateescape"))
+            digest.update(b"\0")
+            continue
+        if not path.is_file():
+            continue
+        digest.update(b"F\0")
+        digest.update(relative.encode("utf-8", errors="surrogateescape"))
+        digest.update(b"\0")
+        with path.open("rb") as handle:
+            while chunk := handle.read(1024 * 1024):
+                digest.update(chunk)
+        digest.update(b"\0")
+    return digest.hexdigest()
+
+
 def _has_required(tree_root: Path, required: Sequence[str]) -> bool:
     for raw in required:
         path = tree_root / _relative_path(raw, label="delivery required path")
@@ -117,6 +151,18 @@ def _has_required(tree_root: Path, required: Sequence[str]) -> bool:
         except OSError:
             return False
     return True
+
+
+def _validation_error(tree_root: Path, tree: DeliveryTree) -> str | None:
+    if not _has_required(tree_root, tree.required):
+        return "required output is missing or empty"
+    if tree.validator is None:
+        return None
+    try:
+        error = tree.validator(tree_root)
+    except Exception as exc:
+        return f"validator raised {type(exc).__name__}: {exc}"
+    return str(error).strip() if error else None
 
 
 def _path_endswith(path: Path, suffix: Path) -> bool:
@@ -156,7 +202,144 @@ def _explicit_tree_candidates(
     return _deduplicate_paths(candidates)
 
 
-def _atomic_overlay_tree(source: Path, target: Path, required: Sequence[str]) -> None:
+def _tree_candidates(
+    tree: DeliveryTree,
+    *,
+    candidate_bases: Sequence[Path],
+    explicit_paths: Sequence[Path] = (),
+) -> list[Path]:
+    """Enumerate candidate roots, including a workspace root itself.
+
+    Agents commonly create the required entry directly in their private
+    workspace.  Treating only ``workspace/<candidate>`` as eligible silently
+    discarded those otherwise complete results.
+    """
+
+    candidates: list[Path] = []
+    for path in explicit_paths:
+        candidates.extend(_explicit_tree_candidates(Path(path), tree))
+    for base in candidate_bases:
+        base = Path(base).expanduser()
+        candidates.append(base)
+        for raw in tree.candidates:
+            candidates.append(base / _relative_path(raw, label="delivery candidate"))
+    return _deduplicate_paths(candidates)
+
+
+def _make_tree_read_only(root: Path) -> None:
+    """Best-effort protection against accidental mutation of review snapshots."""
+
+    for path in sorted(root.rglob("*"), key=lambda item: len(item.parts), reverse=True):
+        try:
+            path.chmod(0o555 if path.is_dir() else 0o444)
+        except OSError:
+            pass
+    try:
+        root.chmod(0o555)
+    except OSError:
+        pass
+
+
+def snapshot_delivery_candidates(
+    contract: DeliveryContract,
+    *,
+    candidate_bases: Sequence[Path],
+    snapshot_root: Path,
+    explicit_paths: Sequence[Path] = (),
+) -> dict:
+    """Validate and freeze the first complete candidate for each contract tree.
+
+    The returned paths are content-addressed and read-only.  They can therefore
+    be referenced by parent agents and final reviewers without depending on a
+    child's mutable workspace.
+    """
+
+    snapshot_root = Path(snapshot_root).expanduser()
+    captured: list[dict] = []
+    rejected: list[dict] = []
+    missing: list[dict] = []
+    checked: list[str] = []
+
+    for index, tree in enumerate(contract.trees):
+        source: Path | None = None
+        for path in _tree_candidates(
+            tree,
+            candidate_bases=() if explicit_paths else candidate_bases,
+            explicit_paths=explicit_paths,
+        ):
+            checked.append(str(path))
+            if not path.is_dir() or not _has_required(path, tree.required):
+                continue
+            validation_error = _validation_error(path, tree)
+            if validation_error:
+                rejected.append({
+                    "target": tree.target,
+                    "candidate": str(path),
+                    "reason": validation_error,
+                })
+                continue
+            source = path
+            break
+        if source is None:
+            missing.append({
+                "target": tree.target,
+                "required": list(tree.required),
+            })
+            continue
+
+        digest = delivery_tree_digest(source)
+        target_label = _relative_path(tree.target, label="delivery target").as_posix().replace("/", "__")
+        destination = snapshot_root / f"{index:02d}-{target_label}-{digest[:20]}"
+        if not destination.is_dir() or delivery_tree_digest(destination) != digest:
+            snapshot_root.mkdir(parents=True, exist_ok=True)
+            stage = Path(tempfile.mkdtemp(prefix=".nanoma-candidate-", dir=snapshot_root))
+            try:
+                shutil.copytree(source, stage, dirs_exist_ok=True, symlinks=False)
+                validation_error = _validation_error(stage, tree)
+                if validation_error:
+                    raise RuntimeError(f"snapshot validation failed: {validation_error}")
+                if destination.exists():
+                    shutil.rmtree(destination)
+                os.replace(stage, destination)
+            finally:
+                if stage.exists():
+                    shutil.rmtree(stage)
+            _make_tree_read_only(destination)
+
+        manifest = []
+        for path in sorted(destination.rglob("*"), key=lambda item: item.as_posix()):
+            if path.is_file():
+                manifest.append({
+                    "path": path.relative_to(destination).as_posix(),
+                    "bytes": path.stat().st_size,
+                })
+        captured.append({
+            "target": tree.target,
+            "source": str(source),
+            "snapshot": str(destination),
+            "sha256": digest,
+            "required": list(tree.required),
+            "manifest": manifest,
+            "validated": True,
+        })
+
+    composite = ""
+    if captured:
+        composite_input = "\n".join(
+            f"{item['target']}\0{item['sha256']}" for item in captured
+        )
+        composite = hashlib.sha256(composite_input.encode("utf-8")).hexdigest()
+    return {
+        "ready": len(captured) == len(contract.trees),
+        "captured": captured,
+        "artifact_sha256": composite,
+        "rejected": rejected,
+        "missing": missing,
+        "checked_candidates": checked,
+    }
+
+
+def _atomic_overlay_tree(source: Path, target: Path, tree: DeliveryTree) -> None:
     """Overlay ``source`` onto ``target`` and replace the target atomically."""
 
     target.parent.mkdir(parents=True, exist_ok=True)
@@ -168,8 +351,11 @@ def _atomic_overlay_tree(source: Path, target: Path, required: Sequence[str]) ->
                 raise RuntimeError(f"delivery target is not a directory: {target}")
             shutil.copytree(target, stage, dirs_exist_ok=True, symlinks=True)
         shutil.copytree(source, stage, dirs_exist_ok=True, symlinks=True)
-        if not _has_required(stage, required):
-            raise RuntimeError(f"staged delivery is incomplete: {stage}")
+        validation_error = _validation_error(stage, tree)
+        if validation_error:
+            raise RuntimeError(
+                f"staged delivery is invalid: {stage}: {validation_error}"
+            )
 
         if target.exists():
             backup = target.with_name(f".{target.name}.nanoma-backup-{os.getpid()}")
@@ -212,7 +398,8 @@ def publish_delivery_contract(
 
     for tree in contract.trees:
         target = contract.target_root / _relative_path(tree.target, label="delivery target")
-        if _has_required(target, tree.required) and not explicit:
+        target_error = _validation_error(target, tree)
+        if target_error is None and not explicit:
             report.satisfied.append({
                 "target": str(target),
                 "source": str(target),
@@ -220,21 +407,29 @@ def publish_delivery_contract(
             })
             continue
 
-        candidates: list[Path] = []
-        for path in explicit:
-            candidates.extend(_explicit_tree_candidates(path, tree))
-        for base in bases:
-            for raw in tree.candidates:
-                candidates.append(base / _relative_path(raw, label="delivery candidate"))
-        candidates = _deduplicate_paths(candidates)
+        candidates = _tree_candidates(
+            tree,
+            candidate_bases=() if explicit else bases,
+            explicit_paths=explicit,
+        )
         report.checked_candidates.extend(str(path) for path in candidates)
 
-        source = next(
-            (path for path in candidates if path.is_dir() and _has_required(path, tree.required)),
-            None,
-        )
+        source = None
+        for path in candidates:
+            if not path.is_dir() or not _has_required(path, tree.required):
+                continue
+            validation_error = _validation_error(path, tree)
+            if validation_error:
+                report.rejected.append({
+                    "target": str(target),
+                    "candidate": str(path),
+                    "reason": validation_error,
+                })
+                continue
+            source = path
+            break
         if source is None:
-            if _has_required(target, tree.required):
+            if target_error is None and not explicit:
                 report.satisfied.append({
                     "target": str(target),
                     "source": str(target),
@@ -245,6 +440,13 @@ def publish_delivery_contract(
             report.missing.append({
                 "target": str(target),
                 "required": [str(target / item) for item in tree.required],
+                "target_validation_error": target_error,
+                "reason": (
+                    "explicit submission did not contain a valid complete candidate; "
+                    "the previously published target was preserved"
+                    if explicit and target_error is None
+                    else "no valid complete candidate was found"
+                ),
             })
             continue
 
@@ -269,7 +471,7 @@ def publish_delivery_contract(
             continue
 
         try:
-            _atomic_overlay_tree(source, target, tree.required)
+            _atomic_overlay_tree(source, target, tree)
         except Exception as exc:
             report.ready = False
             report.missing.append({

@@ -107,6 +107,8 @@ class ShellMemoryArbiter:
         self._in_flight: int = 0
         self._room = asyncio.Condition()
         self.waits: int = 0  # for tests and for the run's own record
+        self._tickets: dict[int, dict] = {}
+        self._background: set[asyncio.Task] = set()
 
     # ── what is known ────────────────────────────────────────────────────────
 
@@ -154,7 +156,16 @@ class ShellMemoryArbiter:
         limit = container_memory_limit_bytes() or budget
         return usage < limit * _UNKNOWN_HEADROOM_FRACTION
 
-    async def acquire(self, cmd: str, timeout: float) -> dict:
+    def _strict_fits(self, want: int, budget: int) -> bool:
+        usage = container_memory_usage_bytes()
+        if usage is None:
+            return self._reserved + want <= budget
+        # RSS already materialized in the cgroup must not be counted twice.
+        pending = sum(max(0, t["reserved"] - t.get("rss", 0)) for t in self._tickets.values())
+        legacy_reserved = max(0, self._reserved - sum(t["reserved"] for t in self._tickets.values()))
+        return usage + pending + legacy_reserved + want <= budget
+
+    async def acquire(self, cmd: str, timeout: float, *, strict: bool = False) -> dict:
         """Wait for room to run `cmd`. Returns how the wait went.
 
         `granted` is False only when the wait ran out, which the caller reports
@@ -167,6 +178,10 @@ class ShellMemoryArbiter:
             return {"granted": True, "reserved": 0, "waited": 0.0}
 
         want = self.estimate_bytes(cmd)
+        if strict and want is None:
+            # Reserve for a first observation before RSS has had time to grow.
+            # This schedules commands, not agents or their planning depth.
+            want = max(1, budget // 4)
         loop = asyncio.get_running_loop()
         started = loop.time()
         deadline = started + max(0.0, timeout)
@@ -174,6 +189,7 @@ class ShellMemoryArbiter:
         async with self._room:
             while True:
                 ready = (
+                    self._strict_fits(want, budget) if strict else
                     self._fits(want, budget) if want is not None
                     else self._unknown_may_start(budget)
                 )
@@ -184,7 +200,11 @@ class ShellMemoryArbiter:
                     waited = loop.time() - started
                     if waited > 0:
                         self.waits += 1
-                    return {"granted": True, "reserved": reserved, "waited": waited}
+                    ticket = {"granted": True, "reserved": reserved, "waited": waited}
+                    if strict:
+                        ticket["rss"] = 0
+                        self._tickets[id(ticket)] = ticket
+                    return ticket
                 remaining = deadline - loop.time()
                 if remaining <= 0:
                     return {
@@ -205,9 +225,34 @@ class ShellMemoryArbiter:
     async def release(self, cmd: str, ticket: dict, peak_rss_bytes: int | None) -> None:
         self.record(cmd, peak_rss_bytes)
         async with self._room:
+            if ticket.get("released"):
+                return
+            ticket["released"] = True
+            self._tickets.pop(id(ticket), None)
             self._reserved = max(0, self._reserved - int(ticket.get("reserved") or 0))
             self._in_flight = max(0, self._in_flight - 1)
             self._room.notify_all()
+
+    def release_after_process(self, cmd: str, ticket: dict, pgid: int, peak: int = 0) -> None:
+        """A background child in the tracked process group still owns its claim."""
+        from nanoma.sandbox import process_group_rss_bytes
+
+        async def follow():
+            observed = peak
+            try:
+                while True:
+                    rss = process_group_rss_bytes(pgid)
+                    ticket["rss"] = rss
+                    observed = max(observed, rss)
+                    if rss <= 0:
+                        break
+                    await asyncio.sleep(1)
+            finally:
+                await self.release(cmd, ticket, observed)
+
+        task = asyncio.create_task(follow())
+        self._background.add(task)
+        task.add_done_callback(self._background.discard)
 
     def snapshot(self) -> dict:
         """For the run's own record, and for tests."""

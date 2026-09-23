@@ -24,7 +24,12 @@ from typing import Any, Callable, Awaitable, Literal
 from urllib.parse import parse_qsl, quote_plus, unquote, urlparse
 
 from nanoma.cost import CostLedger, UsageRecord
-from nanoma.delivery import DeliveryContract, publish_delivery_contract
+from nanoma.delivery import (
+    DeliveryContract,
+    DeliveryTree,
+    publish_delivery_contract,
+    snapshot_delivery_candidates,
+)
 from nanoma.llm import (
     LLMResponse, Message, RetryConfig, ToolCall, ToolDef,
     anthropic_compatible_call,
@@ -32,6 +37,7 @@ from nanoma.llm import (
     openai_compatible_call, set_log_dir,
 )
 from nanoma.scheduler import Scheduler
+from nanoma import online_objective
 from nanoma.fixed_orchestration import (
     FixedAgentSpec,
     FixedCheckpoint,
@@ -65,6 +71,24 @@ from nanoma.merge_submit import (
     MergeSubmitMixin,
 )
 from nanoma.legacy import FixedTopologyMixin, SupervisorMixin
+from nanoma.web_research_guards import WebResearchGuardsMixin
+from nanoma.web_primitives import (
+    ShellCapability,
+    _WEB_HARD_BLOCK_PATTERNS,
+    _WEB_LOW_SIGNAL_PATTERNS,
+    _WEB_SEARCH_DOMAINS,
+    _WEB_URL_RE,
+    _extract_web_urls,
+    _first_effective_shell_command,
+    _is_search_domain,
+    _web_command_domain,
+    _web_command_signature,
+    _web_command_writes_download,
+    _web_command_writes_html_download,
+    _web_result_hard_block,
+    _web_result_low_signal,
+    classify_shell_capability,
+)
 from nanoma.tool_groups import (
     _COORDINATION_TOOLS,
     _CREATE_TOOLS,
@@ -98,7 +122,6 @@ _NATO = [
 ]
 
 ToolPolicyMode = Literal["off", "adaptive", "enforce"]
-ShellCapability = Literal["web", "python", "fs", "process", "package", "system", "unknown"]
 
 _MALFORMED_WRITE_PENDING = "malformed_write_pending"
 _CHILD_EVIDENCE_DELIVERY_PREFIX = "child_evidence_delivery_after:"
@@ -116,71 +139,12 @@ _OUTPUT_PATH_TOKEN_RE = re.compile(
 _MARKDOWN_TABLE_LINE_RE = re.compile(r"^\s*\|[^|\n]+\|", re.MULTILINE)
 _CSVISH_LINE_RE = re.compile(r"^\s*[^,\t\n]+[,\t][^,\t\n]+(?:[,\t][^,\t\n]+)+\s*$")
 _CONTEXT_SUFFIX_RE = re.compile(r"\n\s*\[Context\]")
-_WEB_URL_RE = re.compile(r"https?://[^\s'\"<>]+", re.IGNORECASE)
-_WEB_LOW_SIGNAL_PATTERNS = (
-    "access denied",
-    "attention required",
-    "blocked",
-    "captcha",
-    "cloudflare",
-    "forbidden",
-    "no results",
-    "not found",
-    "permission denied",
-    "rate limit",
-    "too many requests",
-    "robot check",
-    "temporarily unavailable",
-    "traceback",
-    "unrecognized parameters",
-    "unrecognized value for parameter",
-    "validation-failure",
-    "wikimedia error",
-)
-_WEB_HARD_BLOCK_PATTERNS = (
-    "checking your connection",
-    "verify you are human",
-    "robot check",
-    "captcha",
-    "cf-chl-",
-)
-_WEB_SEARCH_DOMAINS = (
-    "bing.com",
-    "duckduckgo.com",
-    "google.com",
-    "mojeek.com",
-    "search.brave.com",
-    "searx.",
-    "yahoo.com",
-    "yandex.",
-)
 _TASK_KEYWORD_STOPWORDS = {
     "about", "after", "again", "answer", "article", "before", "being", "could",
     "final", "first", "given", "have", "into", "need", "only", "otherwise",
     "paper", "question", "return", "should", "their", "there", "these", "thing",
     "this", "using", "what", "when", "where", "which", "with", "without", "would",
 }
-
-
-def _first_effective_shell_command(command: str) -> str:
-    """Return the first non-comment shell line for capability classification."""
-    for line in command.splitlines():
-        stripped = line.strip()
-        if not stripped or stripped.startswith("#"):
-            continue
-        stripped = re.sub(
-            r"^(?:(?:export\s+)?[A-Za-z_][A-Za-z0-9_]*="
-            r"(?:'[^']*'|\"[^\"]*\"|[^\s;&|]+)\s*(?:(?:&&|;)\s*)?)+",
-            "",
-            stripped,
-        ).lstrip()
-        stripped = re.sub(
-            r"^(?:cd\s+(?:'[^']*'|\"[^\"]*\"|[^\s;&|]+)\s*&&\s*)+",
-            "",
-            stripped,
-        ).lstrip()
-        return stripped
-    return command.strip()
 
 
 def _repair_bare_python_block(command: str) -> str:
@@ -277,87 +241,6 @@ def _task_expects_structured_collection(task: str) -> bool:
     return any(Path(path).suffix.lower() in {".csv", ".tsv", ".md"} for path in expected)
 
 
-def classify_shell_capability(command: str) -> ShellCapability:
-    """Classify a shell command for internal policy pruning.
-
-    The public tool remains a single `shell` function. This classification is
-    used only by the runtime to narrow what that tool may execute under
-    constraint pressure.
-    """
-    cmd = _first_effective_shell_command(command)
-    if not cmd:
-        return "unknown"
-
-    first = re.split(r"\s+", cmd, maxsplit=1)[0].split("/")[-1]
-    lowered = command.lower()
-
-    python_network_markers = (
-        "http.client",
-        "requests.",
-        "urllib.",
-        "socket.",
-        "ssl.",
-        "aiohttp",
-        "httpx",
-        "urlopen",
-        "wrap_socket",
-        "create_connection",
-    )
-
-    imports_network_module = bool(
-        re.search(r"\b(?:import|from)\s+(?:aiohttp|http\.client|httpx|requests|socket|ssl|urllib)\b", lowered)
-        or re.search(r"\bimport\s+[A-Za-z0-9_.,\s]*(?:socket|ssl|urllib|requests|httpx|aiohttp)\b", lowered)
-    )
-
-    if (
-        first in {"curl", "wget"}
-        or re.search(r"https?://", lowered)
-        or any(marker in lowered for marker in python_network_markers)
-        or imports_network_module
-    ):
-        return "web"
-    if first in {"python", "python3", "python2"} or re.match(r"python\d?\s*<<", lowered):
-        return "python"
-    if first in {
-        "cat", "cd", "cp", "du", "echo", "file", "find", "head", "ls", "mkdir",
-        "grep", "mv", "pwd", "realpath", "rm", "rmdir", "sed", "sort", "stat",
-        "tail", "tee", "touch", "tree", "uniq", "wc",
-    }:
-        return "fs"
-    if first in {
-        "c++", "cc", "clang", "clang++", "g++", "gcc", "go", "javac", "ps",
-        "pkill", "kill", "killall", "jobs", "pgrep", "rustc", "sleep", "timeout",
-    }:
-        return "process"
-    if first in {"apt", "apt-get", "brew", "conda", "npm", "npx", "pip", "pip3", "pnpm", "yarn"}:
-        return "package"
-    if first in {
-        "bash", "chmod", "chown", "docker", "git", "make", "node", "perl", "ruby",
-        "sh", "sudo", "tar", "unzip", "xz", "zip",
-    }:
-        return "system"
-    return "unknown"
-
-
-def _extract_web_urls(command: str) -> list[str]:
-    urls: list[str] = []
-    for match in _WEB_URL_RE.finditer(command):
-        url = match.group(0).rstrip("),.;]")
-        if url:
-            urls.append(url)
-    return urls
-
-
-def _web_command_domain(command: str) -> str:
-    urls = _extract_web_urls(command)
-    if not urls:
-        return ""
-    try:
-        return (urlparse(urls[0]).netloc or "").lower()
-    except Exception:
-        return ""
-
-
 def _web_command_query(command: str) -> str:
     for url in _extract_web_urls(command):
         try:
@@ -379,28 +262,6 @@ def _web_command_query(command: str) -> str:
                 return ""
             return decoded
     return ""
-
-
-def _web_command_writes_download(command: str) -> bool:
-    """Return true when a web command explicitly persists the response to a file."""
-    value = str(command or "")
-    return bool(
-        re.search(r"(?:^|\s)(?:-o|--output)(?:\s+|=)[^\s;&|]+", value)
-        or re.search(r"(?:^|\s)(?:-O|--output-document)(?:\s+|=)[^\s;&|]+", value)
-    )
-
-
-def _web_command_writes_html_download(command: str) -> bool:
-    """Return true when the persisted response is an HTML page, not a research asset."""
-    value = str(command or "")
-    matches = re.findall(
-        r"(?:^|\s)(?:-o|--output|-O|--output-document)(?:\s+|=)([^\s;&|]+)",
-        value,
-    )
-    return any(
-        str(path).strip("'\"").lower().split("?", 1)[0].endswith((".html", ".htm"))
-        for path in matches
-    )
 
 
 def _bing_rss_search_sync(query: str, limit: int = 8) -> dict[str, Any]:
@@ -484,100 +345,6 @@ def _structured_web_search_sync(query: str, limit: int = 8) -> dict[str, Any]:
     return _bing_rss_search_sync(query, limit=limit)
 
 
-def _web_command_signature(command: str) -> str:
-    urls = _extract_web_urls(command)
-    if not urls:
-        return re.sub(r"\s+", " ", command.strip().lower())[:240]
-
-    try:
-        parsed = urlparse(urls[0])
-    except Exception:
-        return urls[0].lower()[:240]
-
-    query = dict(parse_qsl(parsed.query, keep_blank_values=True))
-    query_text = (
-        query.get("q")
-        or query.get("query")
-        or query.get("search")
-        or query.get("srsearch")
-        or query.get("title")
-        or ""
-    )
-    if query_text:
-        if re.search(r"[{}]|\$\(|\b(?:quote|quote_plus|urlencode)\s*\(", query_text):
-            return ""
-        query_part = unquote(query_text).lower()
-    else:
-        stable_params = [
-            (k, v)
-            for k, v in parse_qsl(parsed.query, keep_blank_values=True)
-            if k.lower() not in {"api_key", "apikey", "key", "token", "access_token"}
-        ][:6]
-        query_part = "&".join(f"{k}={v}" for k, v in stable_params).lower()
-
-    path = parsed.path.rstrip("/") or "/"
-    return re.sub(
-        r"\s+",
-        " ",
-        f"{(parsed.netloc or '').lower()}{path.lower()}?{query_part}",
-    )[:240]
-
-
-def _web_result_low_signal(result: Any) -> bool:
-    if not isinstance(result, dict):
-        return True
-
-    try:
-        exit_code = int(result.get("exit_code", 0))
-    except Exception:
-        exit_code = 0
-    if exit_code != 0:
-        return True
-
-    text = f"{result.get('stdout', '')}\n{result.get('stderr', '')}".strip()
-    if len(text) < 80:
-        return True
-
-    lowered = text.lower()
-    if any(pattern in lowered for pattern in _WEB_LOW_SIGNAL_PATTERNS):
-        return True
-
-    if re.search(r'"(?:totalhits|count|total|num_found)"\s*:\s*0\b', lowered):
-        return True
-    if re.search(r'"(?:items|results|search)"\s*:\s*\[\s*\]', lowered):
-        return True
-
-    return False
-
-
-def _web_result_hard_block(result: Any) -> bool:
-    """Detect explicit remote denial/challenge pages, not merely weak content."""
-    if not isinstance(result, dict):
-        return False
-    text = f"{result.get('stdout', '')}\n{result.get('stderr', '')}".strip().lower()
-    if not text:
-        return False
-    head = text[:12000]
-    headings = " ".join(re.findall(
-        r"<(?:title|h1)[^>]*>(.*?)</(?:title|h1)>",
-        head,
-        flags=re.DOTALL,
-    ))
-    headings = re.sub(r"<[^>]+>", " ", headings)
-    headings = re.sub(r"\s+", " ", headings).strip()
-    if any(pattern in headings for pattern in _WEB_HARD_BLOCK_PATTERNS):
-        return True
-    if (
-        ("cf-chl-" in head or "challenge-platform" in head)
-        and ("just a moment" in headings or "checking your connection" in head[:2000])
-    ):
-        return True
-    status_pattern = r"(?:\b403\b.{0,80}\bforbidden\b|\b429\b.{0,80}\btoo many requests\b)"
-    if re.search(status_pattern, headings, re.DOTALL):
-        return True
-    return len(text) <= 6000 and bool(re.search(status_pattern, head, re.DOTALL))
-
-
 def _web_result_text(result: Any) -> str:
     if isinstance(result, dict):
         return f"{result.get('stdout', '')}\n{result.get('stderr', '')}".strip()
@@ -587,11 +354,6 @@ def _web_result_text(result: Any) -> str:
 def _stable_text_digest(text: str) -> str:
     normalized = re.sub(r"\s+", " ", text.lower()).strip()
     return hashlib.sha1(normalized[:20000].encode("utf-8", errors="ignore")).hexdigest()
-
-
-def _is_search_domain(domain: str) -> bool:
-    domain = domain.lower()
-    return any(marker in domain for marker in _WEB_SEARCH_DOMAINS)
 
 
 def _task_keywords(task: str) -> set[str]:
@@ -730,6 +492,7 @@ class ToolContext:
     workspace_extra_roots: tuple[Path, ...] = ()
     shell_max_output: int = 10000
     shell_max_timeout: int = 30
+    shell_memory_strict_admission: bool = False
     file_read_max_chars: int = 50000
     file_list_max_entries: int = 500
     grep_max_results: int = 100
@@ -1163,6 +926,9 @@ class RuntimeConfig(
     _ArchivedToolPolicyConfig,
     _ArchivedCandidateConvergenceConfig,
 ):
+    # Non-positive values mean unbounded.  This lets callers remove runtime
+    # topology caps without substituting a large sentinel that leaks into
+    # planning prompts and pressure calculations.
     max_agents: int = 1000
     max_depth: int = 100
     max_concurrent_llm: int = 50
@@ -1211,6 +977,12 @@ class RuntimeConfig(
     log_dir: Path | None = field(default_factory=lambda: Path("./logs"))
     workspace_root: Path = field(default_factory=lambda: Path("./workspace"))
     workspace_extra_roots: list[Path] = field(default_factory=list)
+    # Some benchmark harnesses own a mutable task worktree and score it in
+    # place instead of publishing through a DeliveryContract.  Callers may
+    # expose those roots for the same immutable final-candidate review used by
+    # artifact-delivery tasks.  This is review-only: it neither validates a
+    # benchmark-specific scenario nor publishes files back to the worktree.
+    final_candidate_review_snapshot_roots: tuple[Path, ...] = ()
     shared_dir: str = "shared"
     delivery_contract: DeliveryContract | None = None
     system_extra_instructions: str = field(
@@ -1225,6 +997,7 @@ class RuntimeConfig(
     compress_max_chars: int = 300           # max chars per message in summary (0 = unlimited)
     shell_max_output: int = 10000           # max chars for shell output (0 = unlimited)
     shell_max_timeout: int = 30             # max seconds per shell call (0 = unlimited)
+    shell_memory_strict_admission: bool = False
     file_read_max_chars: int = 50000        # max chars for file_read (0 = unlimited)
     file_list_max_entries: int = 500        # max entries for file_list (0 = unlimited)
     grep_max_results: int = 100             # max grep results (0 = unlimited)
@@ -1286,8 +1059,17 @@ class RuntimeConfig(
     # up to this bounded number of rounds; the root can explicitly override a
     # disputed review with a reason instead of being trapped in a loop.
     final_candidate_review_enabled: bool = True
-    final_candidate_review_max_rounds: int = 2
+    # Zero means that every materially new artifact gets an independent review.
+    # The root task's existing time/turn budgets are the convergence guard; a
+    # fixed review count is unsafe because the last post-review correction
+    # would otherwise be the first artifact allowed to escape inspection.
+    final_candidate_review_max_rounds: int = 0
     final_candidate_review_fail_open: bool = True
+    # A final reviewer of a concrete artifact must derive task-specific public
+    # checks from the task contract and execute them before accepting.  The
+    # runtime validates evidence provenance, while the reviewer chooses the
+    # properties and methods; benchmark adapters must not prescribe scenarios.
+    final_candidate_review_require_executed_evidence: bool = True
     web_search_failover_after_low_signal: bool = False
     probe_resume_instruction: str | None = None
     intervention_file: Path | None = field(
@@ -1314,6 +1096,8 @@ class RuntimeConfig(
     merge_max_mb: float | None = None
     merge_max_files: int | None = None
     official_lower_is_better: bool | None = None
+    # Only adapters with agent-visible online measurements provide this contract.
+    online_objective: dict[str, Any] | None = None
     noise_margin_sigmas: float | None = None
     submit_preflight_command: str | None = None
     submit_preflight_timeout: float | None = None
@@ -1380,7 +1164,12 @@ class Agent:
 
 # ─── Runtime ─────────────────────────────────────────────────────────────────
 
-class Runtime(MergeSubmitMixin, FixedTopologyMixin, SupervisorMixin):
+class Runtime(
+    MergeSubmitMixin,
+    WebResearchGuardsMixin,
+    FixedTopologyMixin,
+    SupervisorMixin,
+):
     def __init__(
         self,
         config: RuntimeConfig | None = None,
@@ -1391,6 +1180,8 @@ class Runtime(MergeSubmitMixin, FixedTopologyMixin, SupervisorMixin):
         restore_hook: Callable[[Path], Any] | None = None,
     ):
         self.config = config or RuntimeConfig()
+        self._online_objective = online_objective.contract(self.config.online_objective)
+        self._objective_notice_seen: dict[str, str] = {}
         if self.config.aggregate_wait_seconds is not None:
             # Stays an instance attribute rather than a property: tests and
             # optimizations.merge_submit assign to it directly on the runtime.
@@ -1423,6 +1214,7 @@ class Runtime(MergeSubmitMixin, FixedTopologyMixin, SupervisorMixin):
             workspace_extra_roots=tuple(self.config.workspace_extra_roots),
             shell_max_output=self.config.shell_max_output,
             shell_max_timeout=self.config.shell_max_timeout,
+            shell_memory_strict_admission=self.config.shell_memory_strict_admission,
             file_read_max_chars=self.config.file_read_max_chars,
             file_list_max_entries=self.config.file_list_max_entries,
             grep_max_results=self.config.grep_max_results,
@@ -1759,6 +1551,16 @@ class Runtime(MergeSubmitMixin, FixedTopologyMixin, SupervisorMixin):
                     range(max(0, index - 1), min(len(lines), index + 2))
                 )
 
+        # Preserve a single connective line between two selected interface
+        # fragments.  This commonly occurs in compact source examples where a
+        # parameter-free call (for example an aggregate) sits between calls
+        # that mention explicit arguments.  Leaving that one-line hole can
+        # silently remove an output or transformation from the child contract.
+        selected_in_order = sorted(signal_selected)
+        for left, right in zip(selected_in_order, selected_in_order[1:]):
+            if right - left == 2:
+                signal_selected.add(left + 1)
+
         boundary_selected = set(nonempty[:4]) | set(nonempty[-10:])
         excerpt_lines: list[str] = ["[Interface and constraint lines]"]
         excerpt_lines.extend(lines[index] for index in sorted(signal_selected))
@@ -1769,6 +1571,249 @@ class Runtime(MergeSubmitMixin, FixedTopologyMixin, SupervisorMixin):
         excerpt_lines.append("[… fetch omitted source with get_task_context …]")
         excerpt = "\n".join(excerpt_lines).strip()
         return self._slice_text_by_tokens(excerpt, 0, inline_limit)
+
+    def _delivery_contract_instructions(self, *, child: bool) -> str:
+        """Render the runtime-owned artifact contract for model context."""
+
+        contract = self.config.delivery_contract
+        if contract is None:
+            return ""
+        lines = ["[Runtime artifact delivery contract]"]
+        for tree in contract.trees:
+            candidates = ", ".join(tree.candidates)
+            required = ", ".join(tree.required)
+            lines.append(
+                f"- final target {tree.target}; private candidate directories: "
+                f"{candidates}; required inside the candidate tree: {required}."
+            )
+        if child:
+            lines.extend([
+                "- If your work produces runnable files, build a complete candidate tree in your private workspace; do not edit the official final target.",
+                "- Call deliver_to_parent with artifact_path pointing to that tree. If artifact_path is omitted, the runtime still searches the approved candidate directories and your workspace root, validates the result, and freezes it.",
+            ])
+        else:
+            lines.append(
+                "- The root owns publication to the official target; completion is blocked until the published tree validates."
+            )
+        lines.append(
+            "- Derive any verification strategy from the public task contract and the current artifact; "
+            "do not use hidden/private evidence or fit an implementation to a few observed examples."
+        )
+        return "\n".join(lines)
+
+    def _capture_candidate_artifacts(
+        self,
+        agent: Agent,
+        *,
+        explicit_paths: list[Path] | None = None,
+        final_targets: bool = False,
+    ) -> dict[str, Any]:
+        """Validate and freeze a candidate independently of mutable workspaces."""
+
+        contract = self.config.delivery_contract
+        if contract is None:
+            review_roots = tuple(
+                Path(path).expanduser()
+                for path in self.config.final_candidate_review_snapshot_roots
+            )
+            if not final_targets or not review_roots:
+                return {
+                    "ready": False,
+                    "captured": [],
+                    "artifact_sha256": "",
+                    "rejected": [],
+                    "missing": [],
+                    "checked_candidates": [],
+                }
+
+            captured: list[dict[str, Any]] = []
+            rejected: list[dict[str, Any]] = []
+            missing: list[dict[str, Any]] = []
+            checked: list[str] = []
+            for index, root in enumerate(review_roots):
+                try:
+                    resolved_root = root.resolve()
+                except OSError:
+                    resolved_root = root.absolute()
+                sentinel: Path | None = None
+                if resolved_root.is_dir():
+                    for path in sorted(
+                        resolved_root.rglob("*"), key=lambda item: item.as_posix()
+                    ):
+                        try:
+                            if path.is_file() and not path.is_symlink() and path.stat().st_size > 0:
+                                sentinel = path
+                                break
+                        except OSError:
+                            continue
+                if sentinel is None:
+                    missing.append({
+                        "target": f"review-root-{index:02d}",
+                        "root": str(resolved_root),
+                        "reason": "review root is missing or contains no non-empty files",
+                    })
+                    continue
+
+                # DeliveryTree's required path is only a generic snapshot
+                # sentinel.  Correctness properties remain entirely selected
+                # by the reviewer from the public task contract.
+                sentinel_relative = sentinel.relative_to(resolved_root).as_posix()
+                review_contract = DeliveryContract(
+                    target_root=resolved_root.parent,
+                    trees=(DeliveryTree(
+                        target=f"review-root-{index:02d}",
+                        candidates=("candidate",),
+                        required=(sentinel_relative,),
+                    ),),
+                    block_done=False,
+                    auto_publish=False,
+                )
+                report = snapshot_delivery_candidates(
+                    review_contract,
+                    candidate_bases=(),
+                    explicit_paths=(resolved_root,),
+                    snapshot_root=(
+                        self.config.workspace_root
+                        / ".candidate_snapshots"
+                        / agent.id
+                        / f"external-{index:02d}"
+                    ),
+                )
+                for item in report.get("captured", []):
+                    item["review_root"] = str(resolved_root)
+                    item["snapshot_sentinel"] = sentinel_relative
+                    captured.append(item)
+                rejected.extend(report.get("rejected", []))
+                missing.extend(report.get("missing", []))
+                checked.extend(report.get("checked_candidates", []))
+
+            composite = ""
+            if captured:
+                composite_input = "\n".join(
+                    f"{item.get('target')}\0{item.get('sha256')}"
+                    for item in captured
+                )
+                composite = hashlib.sha256(composite_input.encode("utf-8")).hexdigest()
+            report = {
+                "ready": len(captured) == len(review_roots),
+                "captured": captured,
+                "artifact_sha256": composite,
+                "rejected": rejected,
+                "missing": missing,
+                "checked_candidates": checked,
+            }
+            for item in captured:
+                snapshot = Path(str(item.get("snapshot") or ""))
+                if not snapshot.is_dir():
+                    continue
+                if not any(existing.absolute_path == snapshot for existing in agent.artifacts):
+                    agent.artifacts.append(Artifact(
+                        path=str(snapshot),
+                        absolute_path=snapshot,
+                        description=(
+                            "immutable external worktree candidate for "
+                            f"{item.get('review_root')} sha256={item.get('sha256')}"
+                        ),
+                        agent_id=agent.id,
+                    ))
+            return report
+        explicit = list(explicit_paths or [])
+        bases: list[Path] = []
+        if final_targets:
+            explicit.extend(
+                contract.target_root / tree.target for tree in contract.trees
+            )
+        else:
+            merge_copy = getattr(agent, "_merge_copy", None)
+            if merge_copy:
+                bases.append(Path(merge_copy))
+            bases.append(agent.workspace)
+        report = snapshot_delivery_candidates(
+            contract,
+            candidate_bases=bases,
+            explicit_paths=explicit,
+            snapshot_root=(
+                self.config.workspace_root
+                / ".candidate_snapshots"
+                / agent.id
+            ),
+        )
+        for item in report.get("captured", []):
+            snapshot = Path(str(item.get("snapshot") or ""))
+            if not snapshot.is_dir():
+                continue
+            if not any(existing.absolute_path == snapshot for existing in agent.artifacts):
+                agent.artifacts.append(Artifact(
+                    path=str(snapshot),
+                    absolute_path=snapshot,
+                    description=(
+                        f"validated immutable candidate for {item.get('target')} "
+                        f"sha256={item.get('sha256')}"
+                    ),
+                    agent_id=agent.id,
+                ))
+        return report
+
+    def _descendant_artifact_candidates(
+        self,
+        root: Agent,
+        *,
+        exclude_sha256: str = "",
+    ) -> list[dict[str, Any]]:
+        """Return validated immutable alternatives produced below ``root``."""
+
+        descendants: set[str] = set()
+        pending = list(root.children)
+        while pending:
+            agent_id = pending.pop()
+            if agent_id in descendants:
+                continue
+            descendants.add(agent_id)
+            child = self.agents.get(agent_id)
+            if child is not None:
+                pending.extend(child.children)
+        alternatives: list[dict[str, Any]] = []
+        seen: set[str] = set()
+        for record in sorted(
+            self._candidate_deliveries,
+            key=lambda item: int(item.get("seq") or 0),
+            reverse=True,
+        ):
+            if str(record.get("agent_id") or "") not in descendants:
+                continue
+            artifact_sha = str(record.get("artifact_sha256") or "")
+            if (
+                not artifact_sha
+                or artifact_sha == exclude_sha256
+                or artifact_sha in seen
+                or not record.get("artifact_validated")
+            ):
+                continue
+            artifacts = []
+            for item in list(record.get("artifacts") or []):
+                snapshot = Path(str(item.get("snapshot") or ""))
+                if not item.get("validated") or not snapshot.is_dir():
+                    continue
+                artifacts.append({
+                    "target": item.get("target"),
+                    "snapshot": str(snapshot),
+                    "sha256": item.get("sha256"),
+                    "required": item.get("required"),
+                })
+            if not artifacts:
+                continue
+            seen.add(artifact_sha)
+            alternatives.append({
+                "agent_id": record.get("agent_id"),
+                "delivery_seq": record.get("seq"),
+                "artifact_sha256": artifact_sha,
+                "artifacts": artifacts,
+                "answer": str(record.get("answer") or "")[:800],
+                "evidence": str(record.get("evidence") or "")[:1500],
+                "confidence": record.get("confidence"),
+                "method": str(record.get("method") or "")[:200],
+            })
+        return alternatives
 
     def _build_child_task_capsule(self, parent: Agent) -> str:
         if not self.config.task_capsule_enabled:
@@ -1820,11 +1865,16 @@ class Runtime(MergeSubmitMixin, FixedTopologyMixin, SupervisorMixin):
             source = self._task_contract_excerpt(
                 self._task_payload(str(root.task or ""))
             )
+            artifact_contract = self._delivery_contract_instructions(
+                child=agent.parent is not None
+            )
+            if artifact_contract:
+                source = f"{source}\n\n{artifact_contract}"
         elif section == "final_candidate":
             review = self._final_candidate_reviews.get(root.id) or {}
             if agent.id not in {root.id, review.get("reviewer_id")}:
                 return {"error": "final_candidate is visible only to the root and its active final reviewer"}
-            source = str(review.get("candidate") or "")
+            source = str(review.get("review_payload") or review.get("candidate") or "")
             if not source:
                 return {"error": "no final candidate is pending review"}
         else:
@@ -1877,22 +1927,118 @@ class Runtime(MergeSubmitMixin, FixedTopologyMixin, SupervisorMixin):
         """Gate root completion on a review of the concrete submitted candidate."""
         if not self.config.final_candidate_review_enabled or agent.parent is not None:
             return {"ready": True, "reason": "disabled_or_not_root"}
-        if not agent.children:
+        if (
+            not agent.children
+            and not self.config.final_candidate_review_snapshot_roots
+        ):
             return {"ready": True, "reason": "single_agent_path"}
 
         candidate = str(candidate or agent.result or "").strip()
         if not candidate:
             return {"ready": True, "reason": "no_text_candidate"}
-        digest = hashlib.sha256(candidate.encode("utf-8")).hexdigest()
+        artifact_report = self._capture_candidate_artifacts(
+            agent,
+            final_targets=True,
+        )
+        artifact_sha256 = str(artifact_report.get("artifact_sha256") or "")
+        captured = list(artifact_report.get("captured") or [])
+        alternative_artifacts = self._descendant_artifact_candidates(
+            agent,
+            exclude_sha256=artifact_sha256,
+        )
+        if captured:
+            compact_artifacts = []
+            for item in captured:
+                manifest = list(item.get("manifest") or [])
+                compact_artifacts.append({
+                    "target": item.get("target"),
+                    "snapshot": item.get("snapshot"),
+                    "sha256": item.get("sha256"),
+                    "required": item.get("required"),
+                    "manifest": manifest[:200],
+                    "manifest_files": len(manifest),
+                    "validated": item.get("validated"),
+                })
+            review_payload = json.dumps({
+                "result_text": candidate,
+                "artifact_sha256": artifact_sha256,
+                "artifacts": compact_artifacts,
+                "validated_child_alternatives": alternative_artifacts[:12],
+                "review_rule": (
+                    "Inspect these read-only snapshots. The verdict is bound to "
+                    "artifact_sha256; do not review a mutable workspace substitute. "
+                    "When validated child alternatives exist, compare their public behavior "
+                    "and evidence before accepting a weaker final artifact."
+                ),
+            }, ensure_ascii=False, indent=2)
+        else:
+            review_payload = candidate
+        # For artifact-delivery tasks, file bytes are the candidate identity.
+        # A root often paraphrases its completion message after waiting for a
+        # reviewer; that must not consume another review round when the exact
+        # published tree is unchanged.  Text remains authoritative for tasks
+        # without a captured artifact.
+        digest = (
+            artifact_sha256
+            if artifact_sha256
+            else hashlib.sha256(candidate.encode("utf-8")).hexdigest()
+        )
+        state = self._final_candidate_reviews.get(agent.id)
         override_reason = str(override_reason or "").strip()
         if override_reason:
+            if not state or state.get("candidate_sha256") != digest:
+                return {
+                    "ready": False,
+                    "reason": "override_requires_matching_review",
+                    "candidate_sha256": digest,
+                    "artifact_sha256": artifact_sha256,
+                    "instruction": (
+                        "An override may only recover a reviewer that ended without a formal verdict "
+                        "for this exact candidate. Start and await the candidate review first."
+                    ),
+                }
+            reviewer_id = str(state.get("reviewer_id") or "")
+            reviewer = self.agents.get(reviewer_id)
+            delivery = self._final_review_delivery(agent.id, reviewer_id)
+            if delivery is not None:
+                answer = str(delivery.get("answer") or "").strip()
+                verdict = answer.split(None, 1)[0].upper().rstrip(":") if answer else ""
+                return {
+                    "ready": False,
+                    "reason": "formal_review_cannot_be_overridden",
+                    "reviewer_id": reviewer_id,
+                    "round": state.get("round"),
+                    "verdict_label": verdict,
+                    "evidence": str(delivery.get("evidence") or "")[:2000],
+                    "candidate_sha256": digest,
+                    "artifact_sha256": artifact_sha256,
+                    "instruction": (
+                        "A formal reviewer verdict cannot be bypassed. If it is REVISE, change the "
+                        "artifact so the new digest receives a fresh independent review."
+                    ),
+                }
+            if reviewer is not None and reviewer.status not in {"done", "failed", "killed"}:
+                return {
+                    "ready": False,
+                    "reason": "review_in_progress",
+                    "reviewer_id": reviewer_id,
+                    "round": state.get("round"),
+                    "instruction": "Wait for the final reviewer to deliver its verdict.",
+                }
             self._emit(agent.id, "final_candidate_review_overridden", {
                 "candidate_sha256": digest,
+                "artifact_sha256": artifact_sha256,
+                "reviewer": reviewer_id,
                 "reason": override_reason[:500],
             })
-            return {"ready": True, "reason": "explicit_override", "candidate_sha256": digest}
+            return {
+                "ready": True,
+                "reason": "failed_reviewer_override",
+                "reviewer_id": reviewer_id,
+                "candidate_sha256": digest,
+                "artifact_sha256": artifact_sha256,
+            }
 
-        state = self._final_candidate_reviews.get(agent.id)
         if state and state.get("candidate_sha256") == digest:
             reviewer_id = str(state.get("reviewer_id") or "")
             reviewer = self.agents.get(reviewer_id)
@@ -1901,11 +2047,18 @@ class Runtime(MergeSubmitMixin, FixedTopologyMixin, SupervisorMixin):
                 answer = str(delivery.get("answer") or "").strip()
                 verdict = answer.split(None, 1)[0].upper().rstrip(":") if answer else ""
                 state.update({"verdict": verdict, "review_seq": delivery.get("seq")})
-                if verdict == "ACCEPT":
+                reviewed_artifact = str(
+                    delivery.get("reviewed_artifact_sha256") or ""
+                )
+                artifact_bound = (
+                    not artifact_sha256 or reviewed_artifact == artifact_sha256
+                )
+                if verdict == "ACCEPT" and artifact_bound:
                     self._emit(agent.id, "final_candidate_review_accepted", {
                         "reviewer": reviewer_id,
                         "round": state.get("round"),
                         "candidate_sha256": digest,
+                        "artifact_sha256": artifact_sha256,
                     })
                     return {
                         "ready": True,
@@ -1913,17 +2066,37 @@ class Runtime(MergeSubmitMixin, FixedTopologyMixin, SupervisorMixin):
                         "reviewer_id": reviewer_id,
                         "round": state.get("round"),
                         "candidate_sha256": digest,
+                        "artifact_sha256": artifact_sha256,
                     }
                 return {
                     "ready": False,
-                    "reason": "revision_requested" if verdict == "REVISE" else "unclear_verdict",
+                    "reason": (
+                        "revision_requested"
+                        if verdict == "REVISE"
+                        else "artifact_digest_mismatch"
+                        if verdict == "ACCEPT" and not artifact_bound
+                        else "unclear_verdict"
+                    ),
                     "reviewer_id": reviewer_id,
                     "round": state.get("round"),
+                    # `reason` flattens every non-ACCEPT/REVISE verdict into one
+                    # bucket, so the reviewer's own word is carried separately —
+                    # otherwise an unrecognised verdict is indistinguishable from
+                    # a reviewer that said nothing usable.
+                    "verdict_label": verdict,
                     "verdict": answer[:200],
+                    "verdict_chars_total": len(answer),
                     "evidence": str(delivery.get("evidence") or "")[:2000],
+                    "artifact_sha256": artifact_sha256,
+                    "reviewed_artifact_sha256": reviewed_artifact,
+                    "baseline_snapshots": [
+                        item.get("snapshot") for item in captured
+                    ],
                     "instruction": (
                         "Revise the concrete result and call set_status(done, result=<revised candidate>) "
-                        "again. If the reviewer is wrong, supply review_override_reason with a concise rationale."
+                        "again. The immutable baseline snapshots above remain available for comparison or "
+                        "rollback. A formal REVISE cannot be overridden; materially change the artifact so "
+                        "the new digest receives a fresh independent review."
                     ),
                 }
             if reviewer is not None and reviewer.status not in {"done", "failed", "killed"}:
@@ -1949,35 +2122,62 @@ class Runtime(MergeSubmitMixin, FixedTopologyMixin, SupervisorMixin):
             }
 
         previous_round = int((state or {}).get("round") or 0)
-        max_rounds = max(1, int(self.config.final_candidate_review_max_rounds))
-        if previous_round >= max_rounds:
+        max_rounds = int(self.config.final_candidate_review_max_rounds)
+        if max_rounds > 0 and previous_round >= max_rounds:
             return {
                 "ready": False,
                 "reason": "review_round_limit",
                 "rounds": previous_round,
                 "instruction": (
-                    "The candidate changed after the maximum review rounds. Either restore the last reviewed "
-                    "candidate or call set_status with review_override_reason explaining why the change is safe."
+                    "The candidate changed after the configured maximum review rounds. Restore the last "
+                    "accepted candidate or increase the review-round budget outside this task."
                 ),
             }
 
         round_number = previous_round + 1
         self._final_candidate_reviews[agent.id] = {
             "candidate": candidate,
+            "review_payload": review_payload,
             "candidate_sha256": digest,
+            "artifact_sha256": artifact_sha256,
+            "artifact_snapshots": captured,
+            "alternative_artifacts": alternative_artifacts,
             "round": round_number,
             "created_at": time.time(),
         }
+        structured_review_rule = ""
+        if (
+            self.config.final_candidate_review_require_executed_evidence
+            and captured
+        ):
+            structured_review_rule = (
+                " Derive only the smallest material property set from this task's public contract. "
+                "When execution is needed, use one bounded shell call that combines artifact inspection "
+                "and all chosen public checks; do not open separate exploratory probes for additional "
+                "variants after that call. Use an oracle only when the public task explicitly supplies it, "
+                "and never substitute a host-installed dependency version for the target. Then immediately "
+                "pass coverage_summary and verification_checks to deliver_to_parent. Every row must name "
+                "its self-chosen property, why it is material, the exact command from that single execution "
+                "phase, the expected observation and public basis, the actual observation, and whether it "
+                "passed. The runtime rejects unexecuted evidence and forbids ACCEPT when a reported property "
+                "failed."
+            )
         review_task = (
             "[Runtime final-candidate review]\n"
-            "Review the root's concrete pending submission, not an independently invented solution. "
-            "First call get_task_context(section=\"final_candidate\", offset=0) and continue with "
-            "next_offset while has_more=true. Fetch section=\"contract\" and only the root-task chunks "
-            "needed to resolve omitted details. Audit the exact signature, output shape/type, index base, "
-            "units/constants, boundary and rounding conventions, and library/API spellings. Do not run hidden "
-            "tests or use benchmark-private answers. Then call deliver_to_parent exactly once: answer must be "
-            "either ACCEPT or REVISE; evidence must name concrete defects and the smallest correction. "
-            "Do not place a replacement solution in answer."
+            "This is a bounded finish gate, not a second implementation or an open-ended research task. "
+            "Review the root's concrete pending submission. First fetch final_candidate and contract with "
+            "get_task_context; fetch root chunks only if those two omit a detail required for the verdict. "
+            "Inspect the listed read-only snapshot, never the mutable root workspace. Choose the smallest "
+            "set of checks that covers the public interface and the most material implementation risk, and "
+            "consolidate inspection and execution into one bounded shell call. Do not enumerate parser quirks, "
+            "input variants, or library edge cases through separate probes. Never use hidden tests or private "
+            "answers. Do not use shell environment-inspection commands such as set, env, printenv, or pwd; "
+            "some isolated tasks block them, including set -e/set -u. Chain the concrete checks directly. "
+            "After that single verification phase, immediately call deliver_to_parent exactly once. "
+            "Answer only ACCEPT or REVISE; REVISE evidence must name the concrete defect and smallest correction. "
+            "For this verdict omit artifact_path because the frozen snapshot is already runtime-bound. "
+            "Do not implement a replacement solution."
+            + structured_review_rule
         )
         if "spawn" in self.config.disabled_tools:
             spawn_result: dict[str, Any] = {"error": "spawn is disabled by runtime configuration"}
@@ -2013,6 +2213,7 @@ class Runtime(MergeSubmitMixin, FixedTopologyMixin, SupervisorMixin):
             "reviewer": reviewer_id,
             "round": round_number,
             "candidate_sha256": digest,
+            "artifact_sha256": artifact_sha256,
             "candidate_chars": len(candidate),
         })
         return {
@@ -2021,8 +2222,97 @@ class Runtime(MergeSubmitMixin, FixedTopologyMixin, SupervisorMixin):
             "reviewer_id": reviewer_id,
             "round": round_number,
             "candidate_sha256": digest,
+            "artifact_sha256": artifact_sha256,
             "instruction": "Wait for the reviewer delivery, incorporate any concrete correction, then retry set_status(done).",
         }
+
+    async def await_final_candidate_review(
+        self,
+        agent: Agent,
+        candidate: str,
+        review: dict[str, Any],
+        *,
+        override_reason: str = "",
+    ) -> dict[str, Any]:
+        """Park a completing root until its exact candidate has a verdict.
+
+        The review agent is an ordinary child and retains the same freedom as
+        every other node.  What is special here is only the caller lifecycle:
+        once the root has asked to finish, it must not spend more LLM turns
+        polling that child or mutate the candidate while the child is reading
+        its frozen snapshot.  If another already-running child changes the
+        published bytes meanwhile, the new digest is reviewed next, serially,
+        without waking the root between stale rounds.
+
+        A reviewer created by a test harness or embedding may deliberately not
+        have a running task.  In that case preserve the asynchronous API and
+        return the pending state instead of waiting forever.
+        """
+        current = dict(review or {})
+        if current.get("ready"):
+            return current
+        wait_reasons = {"review_started", "review_in_progress"}
+        if current.get("reason") not in wait_reasons:
+            return current
+
+        parked_at = time.time()
+        waited_reviewers: list[str] = []
+        self._emit(agent.id, "final_candidate_review_parent_park_start", {
+            "reviewer": current.get("reviewer_id"),
+            "round": current.get("round"),
+            "candidate_sha256": current.get("candidate_sha256"),
+        })
+        try:
+            while current.get("reason") in wait_reasons:
+                reviewer_id = str(current.get("reviewer_id") or "")
+                reviewer = self.agents.get(reviewer_id)
+                reviewer_task = reviewer._task if reviewer is not None else None
+                if not reviewer_id or reviewer is None or reviewer_task is None:
+                    return current
+                if reviewer_id not in waited_reviewers:
+                    waited_reviewers.append(reviewer_id)
+
+                while (
+                    self._final_review_delivery(agent.id, reviewer_id) is None
+                    and reviewer.status not in {"done", "failed", "killed"}
+                    and not reviewer_task.done()
+                ):
+                    if agent.quota.time_limit > 0:
+                        remaining = agent.quota.time_limit - self.effective_elapsed()
+                        if remaining <= 0:
+                            return {
+                                **current,
+                                "ready": False,
+                                "reason": "review_wait_deadline",
+                                "instruction": (
+                                    "The runtime deadline arrived while the exact-candidate "
+                                    "review was still running. Preserve the current candidate."
+                                ),
+                            }
+                        poll_seconds = min(0.25, max(0.01, remaining))
+                    else:
+                        poll_seconds = 0.25
+                    await asyncio.sleep(poll_seconds)
+
+                # Re-capture the live delivery target.  ACCEPT is usable only
+                # when it names these current bytes; otherwise this call starts
+                # one fresh serial review and parks again without an LLM turn.
+                current = await self.ensure_final_candidate_review(
+                    agent,
+                    candidate,
+                    override_reason=override_reason,
+                )
+                if current.get("ready") or current.get("reason") not in wait_reasons:
+                    return current
+            return current
+        finally:
+            self._emit(agent.id, "final_candidate_review_parent_park_end", {
+                "reviewers": waited_reviewers,
+                "round": current.get("round"),
+                "reason": current.get("reason"),
+                "ready": bool(current.get("ready")),
+                "waited_seconds": round(time.time() - parked_at, 3),
+            })
 
     def create_agent(
         self,
@@ -2751,6 +3041,10 @@ class Runtime(MergeSubmitMixin, FixedTopologyMixin, SupervisorMixin):
         confidence: float = 0.5,
         method: str = "",
         source: str = "done",
+        artifacts: list[dict[str, Any]] | None = None,
+        artifact_sha256: str = "",
+        reviewed_artifact_sha256: str = "",
+        verification_checks: list[dict[str, Any]] | None = None,
     ) -> dict[str, Any] | None:
         """Persist a child candidate independently from inbox delivery."""
         if not self.config.candidate_delivery_ledger_enabled:
@@ -2763,11 +3057,16 @@ class Runtime(MergeSubmitMixin, FixedTopologyMixin, SupervisorMixin):
             confidence = max(0.0, min(1.0, float(confidence)))
         except (TypeError, ValueError):
             confidence = 0.5
+        artifacts = copy.deepcopy(list(artifacts or []))
+        artifact_sha256 = str(artifact_sha256 or "").strip()
+        reviewed_artifact_sha256 = str(reviewed_artifact_sha256 or "").strip()
+        verification_checks = copy.deepcopy(list(verification_checks or []))
         for existing in reversed(self._candidate_deliveries):
             if (
                 existing.get("agent_id") == agent.id
                 and existing.get("parent_id") == parent_id
                 and existing.get("answer") == answer
+                and str(existing.get("artifact_sha256") or "") == artifact_sha256
             ):
                 old_confidence = float(existing.get("confidence") or 0)
                 source_rank = {
@@ -2794,6 +3093,15 @@ class Runtime(MergeSubmitMixin, FixedTopologyMixin, SupervisorMixin):
                     existing["source"] = source
                 if confidence_upgrade_allowed:
                     existing["confidence"] = max(old_confidence, confidence)
+                if artifacts:
+                    existing["artifacts"] = artifacts
+                    existing["artifact_validated"] = all(
+                        bool(item.get("validated")) for item in artifacts
+                    )
+                if reviewed_artifact_sha256:
+                    existing["reviewed_artifact_sha256"] = reviewed_artifact_sha256
+                if verification_checks:
+                    existing["verification_checks"] = verification_checks
                 existing["updated_at"] = time.time()
                 event = self._candidate_delivery_events.get(parent_id)
                 if event is not None and self._candidate_record_usable_for_convergence(existing):
@@ -2809,6 +3117,15 @@ class Runtime(MergeSubmitMixin, FixedTopologyMixin, SupervisorMixin):
                     })
                 return existing
         self._candidate_delivery_seq += 1
+        duplicate_of_seq = None
+        if artifact_sha256:
+            for existing in reversed(self._candidate_deliveries):
+                if (
+                    existing.get("parent_id") == parent_id
+                    and str(existing.get("artifact_sha256") or "") == artifact_sha256
+                ):
+                    duplicate_of_seq = existing.get("seq")
+                    break
         record = {
             "seq": self._candidate_delivery_seq,
             "agent_id": agent.id,
@@ -2818,6 +3135,14 @@ class Runtime(MergeSubmitMixin, FixedTopologyMixin, SupervisorMixin):
             "confidence": confidence,
             "method": str(method or "").strip(),
             "source": source,
+            "artifacts": artifacts,
+            "artifact_sha256": artifact_sha256,
+            "artifact_validated": bool(artifacts) and all(
+                bool(item.get("validated")) for item in artifacts
+            ),
+            "reviewed_artifact_sha256": reviewed_artifact_sha256,
+            "verification_checks": verification_checks,
+            "duplicate_artifact_of_seq": duplicate_of_seq,
             "created_at": time.time(),
         }
         self._candidate_deliveries.append(record)
@@ -2828,6 +3153,9 @@ class Runtime(MergeSubmitMixin, FixedTopologyMixin, SupervisorMixin):
             "confidence": confidence,
             "method": record["method"][:120],
             "source": source,
+            "artifact_sha256": artifact_sha256,
+            "artifact_count": len(artifacts),
+            "duplicate_artifact_of_seq": duplicate_of_seq,
         })
         event = self._candidate_delivery_events.get(parent_id)
         if event is not None and self._candidate_record_usable_for_convergence(record):
@@ -3657,8 +3985,23 @@ class Runtime(MergeSubmitMixin, FixedTopologyMixin, SupervisorMixin):
             if name not in self.config.disabled_tools
         }
         if self._is_review_only(agent):
-            for name in ("spawn", "spawn_many", "task_spawn", "task_create"):
-                all_tools.pop(name, None)
+            # A final reviewer audits a frozen artifact; it must not drift into
+            # building a competing implementation.  Keep coordination and
+            # workspace policy for ordinary agents untouched, while exposing a
+            # compact read/execute/deliver surface for this review-only node.
+            review_tools = {
+                "shell",
+                "ws_read_file",
+                "ws_grep",
+                "ws_code_outline",
+                "ws_read_symbol",
+                "get_task_context",
+                "deliver_to_parent",
+            }
+            all_tools = {
+                name: tool for name, tool in all_tools.items()
+                if name in review_tools
+            }
         all_tools = self._merge_wrap_submit(agent, all_tools)
 
         try:
@@ -3761,6 +4104,14 @@ class Runtime(MergeSubmitMixin, FixedTopologyMixin, SupervisorMixin):
                 turn_tools, tool_policy = self._apply_spawn_todolist_gate(
                     agent, turn_tools, tool_policy
                 )
+                if (
+                    self._is_review_only(agent)
+                    and bool(getattr(agent, "_final_review_execution_complete", False))
+                ):
+                    turn_tools = {
+                        name: tool for name, tool in turn_tools.items()
+                        if name != "shell"
+                    }
                 self._maybe_inject_delivery_finalization_notice(agent, tool_policy, turn_tools)
                 self._ensure_tool_call_responses(agent)
                 if (
@@ -4867,7 +5218,7 @@ class Runtime(MergeSubmitMixin, FixedTopologyMixin, SupervisorMixin):
         pool_pressure = (
             _clamp01((total_agents - 1) / max(1, self.config.max_agents - 1))
             if self.config.max_agents > 1
-            else (1.0 if total_agents > 1 else 0.0)
+            else (0.0 if self.config.max_agents <= 0 else (1.0 if total_agents > 1 else 0.0))
         )
         topology_pressure = max(
             child_pressure,
@@ -4875,7 +5226,7 @@ class Runtime(MergeSubmitMixin, FixedTopologyMixin, SupervisorMixin):
             pool_pressure,
             0.35 if agent.parent else 0.0,
         )
-        depth_pressure = _clamp01(agent.depth / self.config.max_depth) if self.config.max_depth > 0 else 1.0
+        depth_pressure = _clamp01(agent.depth / self.config.max_depth) if self.config.max_depth > 0 else 0.0
         resource_pressure = self._resource_pressure(agent)
         stagnation_pressure = _clamp01(agent._no_tool_turns / 3.0)
         delivery_pressure, delivery_phase = self._compute_delivery_pressure(
@@ -5761,614 +6112,6 @@ class Runtime(MergeSubmitMixin, FixedTopologyMixin, SupervisorMixin):
             or activity.reconcile_after_web_loop
         ):
             self._emit(agent.id, "shell_activity", activity.as_event())
-
-    def _web_search_failover_guidance(
-        self,
-        agent: Agent,
-        command: str,
-        result: Any,
-    ) -> str:
-        if (
-            not self.config.web_search_failover_after_low_signal
-            or classify_shell_capability(command) != "web"
-            or not _is_search_domain(_web_command_domain(command))
-            or not _web_result_low_signal(result)
-        ):
-            return ""
-        signature = _web_command_signature(command)
-        key = f"web_search_failover_guidance:{signature or _web_command_domain(command)}"
-        if key in agent._notified_thresholds:
-            return ""
-        agent._notified_thresholds.add(key)
-        return (
-            "The public HTML search returned no usable evidence. Do not repeat this exact query. "
-            "Runtime will attach a structured fallback search when available. Follow its direct links, or use "
-            "a direct site/document URL or ordinary public API. Use a materially different query and do not "
-            "search benchmark datasets or answer dumps."
-        )
-
-    def _web_failure_fuse_guidance(
-        self,
-        agent: Agent,
-        command: str,
-        result: Any,
-    ) -> str:
-        if (
-            not self.config.web_search_failover_after_low_signal
-            or classify_shell_capability(command) != "web"
-            or not _web_result_hard_block(result)
-        ):
-            return ""
-        signature = _web_command_signature(command)
-        key = f"web_failure_fuse_guidance:{signature}"
-        if not signature or key in agent._notified_thresholds:
-            return ""
-        agent._notified_thresholds.add(key)
-        return (
-            "This exact URL returned an explicit 403/429 denial or human-verification challenge and is now "
-            "fused. Do not fetch it again or keep parsing its challenge page. Switch to another independent "
-            "source; if the task asks you to execute or verify a named deterministic procedure, perform a local "
-            "deterministic reproduction and report the remote-source limitation with the local evidence."
-        )
-
-    def _direct_web_no_gain_guidance(self, agent: Agent, command: str) -> str:
-        if (
-            not self.config.web_search_failover_after_low_signal
-            or classify_shell_capability(command) != "web"
-            or (
-                _web_command_writes_download(command)
-                and not _web_command_writes_html_download(command)
-            )
-            or agent._shell_activity.consecutive_web_no_gain <= 0
-        ):
-            return ""
-        domain = _web_command_domain(command)
-        signature = _web_command_signature(command)
-        if not domain or _is_search_domain(domain) or not signature:
-            return ""
-        if signature != agent._shell_activity.last_web_signature:
-            return ""
-        if signature in agent._shell_activity.hard_blocked_web_signatures:
-            return ""
-        key = f"direct_web_no_gain_guidance:{signature}"
-        if key in agent._notified_thresholds:
-            return ""
-        agent._notified_thresholds.add(key)
-        return (
-            "This direct fetch produced no task-aligned evidence. Treat the mismatch as negative evidence and "
-            "do not fetch or grep the same URL again. Revisit the strongest named candidate already retrieved, "
-            "or change the source or assumption. For a versioned repository, inspect the record's version "
-            "history instead of inferring the relevant date from its identifier."
-        )
-
-    @staticmethod
-    def _is_broad_arxiv_historical_search(command: str) -> bool:
-        for raw_url in _extract_web_urls(command):
-            try:
-                parsed = urlparse(raw_url)
-                domain = (parsed.netloc or "").lower()
-            except Exception:
-                continue
-            if not domain.endswith("arxiv.org") or not parsed.path.rstrip("/").endswith("/search"):
-                continue
-            return True
-        return False
-
-    @staticmethod
-    def _requires_constrained_arxiv_search(agent: Agent) -> bool:
-        task = str(agent.task or "").lower()
-        return (
-            "runtime inherited research protocol" in task
-            and "arxiv" in task
-            and ("advanced html" in task or "title field" in task)
-        )
-
-    def _arxiv_broad_search_guidance(self, agent: Agent, command: str) -> str:
-        if (
-            not self.config.web_search_failover_after_low_signal
-            or not self._requires_constrained_arxiv_search(agent)
-            or not self._is_broad_arxiv_historical_search(command)
-        ):
-            return ""
-        key = "arxiv_broad_search_guidance"
-        if key in agent._notified_thresholds:
-            return ""
-        agent._notified_thresholds.add(key)
-        return (
-            "This basic arXiv search page is sorted newest-first, so changing its query text or grep/head filters "
-            "cannot reliably find a historical paper or verify its title and version date. Do not repeat another "
-            "basic search-page variant. Use one arXiv advanced HTML query with separate author and title fields; "
-            "the required parameter shape is advanced=&terms-0-term=<URLENCODED_AUTHOR>&terms-0-field=author&"
-            "terms-1-term=<URLENCODED_TITLE>&terms-1-field=title. Parse the returned IDs structurally, then "
-            "inspect candidate version metadata. If empty, switch to named bibliography candidates instead of "
-            "changing the local grep expression."
-        )
-
-    def _arxiv_broad_search_block_reason(self, agent: Agent, command: str) -> str:
-        if (
-            "arxiv_broad_search_guidance" not in agent._notified_thresholds
-            or not self._requires_constrained_arxiv_search(agent)
-            or not self._is_broad_arxiv_historical_search(command)
-        ):
-            return ""
-        return (
-            "Repeated basic arXiv newest-first search blocked. Use advanced search with separate author and title "
-            "fields, then verify candidate version dates; do not retry a basic search page with another query or grep."
-        )
-
-    @staticmethod
-    def _is_malformed_arxiv_advanced_search(command: str) -> bool:
-        command_field_pairs = {
-            (index, field.lower())
-            for index, field in re.findall(
-                r"terms-(\d+)-field\s*=\s*(author|title)",
-                command,
-                flags=re.IGNORECASE,
-            )
-        }
-        command_term_indexes = set(
-            re.findall(r"terms-(\d+)-term\s*=", command, flags=re.IGNORECASE)
-        )
-        for raw_url in _extract_web_urls(command):
-            try:
-                parsed = urlparse(raw_url)
-                domain = (parsed.netloc or "").lower()
-                query_items = parse_qsl(parsed.query, keep_blank_values=True)
-            except Exception:
-                continue
-            if (
-                not domain.endswith("arxiv.org")
-                or not parsed.path.rstrip("/").endswith("/search/advanced")
-            ):
-                continue
-            fields = {
-                str(value or "").lower()
-                for key, value in query_items
-                if str(key).lower().endswith("-field")
-            }
-            keys = {str(key or "").lower() for key, _ in query_items}
-            # Python often builds this URL from adjacent f-string fragments, so
-            # the URL extractor sees only the first literal ending at advanced=&.
-            if keys == {"advanced"}:
-                fields.update(
-                    field
-                    for index, field in command_field_pairs
-                    if index in command_term_indexes
-                )
-            return (
-                domain not in {"arxiv.org", "www.arxiv.org"}
-                or "advanced" not in keys
-                or not {"author", "title"}.issubset(fields)
-            )
-        return False
-
-    def _arxiv_malformed_advanced_search_block_reason(self, agent: Agent, command: str) -> str:
-        if (
-            not self._requires_constrained_arxiv_search(agent)
-            or not self._is_malformed_arxiv_advanced_search(command)
-        ):
-            return ""
-        return (
-            "Malformed arXiv advanced-search URL blocked. The advanced endpoint does not accept an opaque terms= "
-            "expression, belongs on arxiv.org rather than export.arxiv.org, and only displays the form when the "
-            "hidden advanced= parameter is absent. Use https://arxiv.org/search/advanced?advanced=&terms-0-term="
-            "<URLENCODED_AUTHOR>&terms-0-field=author&terms-1-term="
-            "<URLENCODED_TITLE>&terms-1-field=title, with separate operator parameters if needed; parse result "
-            "IDs before checking version metadata."
-        )
-
-    def _arxiv_outdated_advanced_selector_block_reason(self, agent: Agent, command: str) -> str:
-        task = str(agent.task or "").lower()
-        value = str(command or "").lower()
-        if (
-            "runtime inherited research protocol" not in task
-            or "/search/advanced" not in value
-            or not re.search(
-                r"select(?:_one)?\s*\(\s*[\"'][^\"']*\.list-result",
-                value,
-            )
-        ):
-            return ""
-        return (
-            "Outdated arXiv advanced-search selector blocked. Current result records use "
-            "li.arxiv-result, with the identifier link under p.list-title a[href*='/abs/']; "
-            ".list-result returns an empty list even when the downloaded HTML contains results."
-        )
-
-    def _arxiv_wrong_fulltext_html_source_block_reason(self, agent: Agent, command: str) -> str:
-        task = str(agent.task or "").lower()
-        value = str(command or "").lower()
-        if (
-            "runtime inherited research protocol" not in task
-            or "ar5iv" not in task
-            or not re.search(r"https?://(?:www\.)?arxiv\.org/html/\d{4}\.\d+", value)
-        ):
-            return ""
-        return (
-            "Wrong full-text HTML source blocked. This inherited protocol requires the converted full paper at "
-            "https://ar5iv.labs.arxiv.org/html/<ARXIV_ID>; arxiv.org/html/<ARXIV_ID> can return a short fallback "
-            "page without the bibliography or figures."
-        )
-
-    def _arxiv_saved_advanced_html_guidance(
-        self,
-        agent: Agent,
-        command: str,
-        result: Any,
-    ) -> str:
-        task = str(agent.task or "").lower()
-        value = str(command or "").lower()
-        stdout = str(result.get("stdout") or "") if isinstance(result, dict) else ""
-        if (
-            "runtime inherited research protocol" not in task
-            or "arxiv.org/search/advanced" not in value
-            or not re.search(r"(?:^|\s)(?:-o|--output)\s+[^\s;&|]+", value)
-            or not re.search(r"(?:^|\D)200(?:\D|$)", stdout)
-        ):
-            return ""
-        key = "arxiv_saved_advanced_html_guidance"
-        if key in agent._notified_thresholds:
-            return ""
-        agent._notified_thresholds.add(key)
-        return (
-            "The arXiv advanced HTML download succeeded with HTTP 200 and was saved locally. Do not classify "
-            "this as rate limiting, retry the network request, or deliver an incomplete search report. Parse "
-            "the saved file now with BeautifulSoup using li.arxiv-result and extract each identifier from "
-            "p.list-title a[href*='/abs/']; then inspect candidate version histories."
-        )
-
-    def _arxiv_advanced_batch_timeout_guidance(
-        self,
-        agent: Agent,
-        command: str,
-        result: Any,
-    ) -> str:
-        task = str(agent.task or "").lower()
-        value = str(command or "").lower()
-        stderr = str(result.get("stderr") or "") if isinstance(result, dict) else ""
-        exit_code = result.get("exit_code") if isinstance(result, dict) else None
-        if (
-            "runtime inherited research protocol" not in task
-            or "arxiv.org/search/advanced" not in value
-            or not (exit_code == -1 or "timeout" in stderr.lower())
-        ):
-            return ""
-        key = "arxiv_advanced_batch_timeout_guidance"
-        if key in agent._notified_thresholds:
-            return ""
-        agent._notified_thresholds.add(key)
-        return (
-            "The batched arXiv request timed out, but earlier loop iterations may already have saved valid HTML. "
-            "Do not discard them or rerun the full batch. First list the saved search HTML files and parse every "
-            "nonempty file locally with li.arxiv-result; only then fetch missing authors, preferably concurrently "
-            "with bounded per-request timeouts and flushed progress output."
-        )
-
-    def _arxiv_version_history_guidance(
-        self,
-        agent: Agent,
-        command: str,
-        result: Any,
-    ) -> str:
-        task = str(agent.task or "").lower()
-        value = str(command or "").lower()
-        output = "\n".join(
-            str(result.get(key) or "") for key in ("stdout", "stderr")
-        ) if isinstance(result, dict) else str(result or "")
-        if (
-            "runtime inherited research protocol" not in task
-            or "initial or revised arxiv version" not in task
-            or "/search/advanced" not in value
-            or not re.search(r"arxiv\.org/abs/\d{4}\.\d+", output, flags=re.IGNORECASE)
-        ):
-            return ""
-        key = "arxiv_version_history_guidance"
-        if key in agent._notified_thresholds:
-            return ""
-        agent._notified_thresholds.add(key)
-        return (
-            "The returned arXiv identifier prefix records only the initial submission month (v1), not every "
-            "revision month. Do not prioritize or reject candidates by a YYMM-looking identifier. Inspect the "
-            "submission/version history for every promising title-and-author candidate before applying the target "
-            "month; candidates repeated under several independently searched authors or already named in the "
-            "bibliography should be checked before a merely month-matching identifier."
-        )
-
-    @staticmethod
-    def _is_linewise_bibliography_filter(agent: Agent, command: str) -> bool:
-        task = str(agent.task or "").lower()
-        value = str(command or "").lower()
-        return bool(
-            "runtime inherited research protocol" in task
-            and "bibliography items structurally" in task
-            and ("split('\\n')" in value or 'split("\\n")' in value or ".splitlines(" in value)
-            and re.search(r"\bfor\b[^\n]{0,100}\bline\b", value)
-            and "2020" in value
-            and any(marker in value for marker in ("frb", "fast radio", "180916", "burst"))
-        )
-
-    def _bibliography_line_filter_guidance(self, agent: Agent, command: str) -> str:
-        if not self._is_linewise_bibliography_filter(agent, command):
-            return ""
-        key = "bibliography_line_filter_guidance"
-        if key in agent._notified_thresholds:
-            return ""
-        agent._notified_thresholds.add(key)
-        return (
-            "This filter applies year/topic predicates to individual PDF text lines, but numbered citations often "
-            "wrap across several lines. It can silently drop the relevant record. Do not repeat a line-oriented "
-            "filter. Segment the normalized bibliography by numbered citation boundaries, join each record's "
-            "continuation lines, then apply all predicates to the complete record and resolve any et al. author list "
-            "through source metadata."
-        )
-
-    def _bibliography_line_filter_block_reason(self, agent: Agent, command: str) -> str:
-        if (
-            "bibliography_line_filter_guidance" not in agent._notified_thresholds
-            or not self._is_linewise_bibliography_filter(agent, command)
-        ):
-            return ""
-        return (
-            "Repeated line-oriented bibliography filter blocked. Merge wrapped lines into complete numbered "
-            "citation records before filtering by year, topic, or author."
-        )
-
-    @staticmethod
-    def _partial_bibliography_scope_block_reason(agent: Agent, command: str) -> str:
-        task = str(agent.task or "").lower()
-        value = str(command or "").lower()
-        if (
-            "parse all bibliography items structurally" not in task
-            or "fitz" not in value
-            or not any(marker in value for marker in ("bibliography", "reference"))
-        ):
-            return ""
-        assumes_suffix = bool(
-            "last few pages" in value
-            or "likely have references" in value
-            or re.search(r"range\(\s*len\([^)]*\)\s*-\s*\d+", value)
-        )
-        if not assumes_suffix:
-            return ""
-        return (
-            "Partial-bibliography shortcut blocked. The protocol requires all bibliography items, so do not "
-            "assume an arbitrary last-N-page suffix contains the complete references. Scan page text once to "
-            "locate the References/Bibliography heading, include that page and every following page, segment "
-            "complete numbered records, and verify that the first parsed citation number is near the start."
-        )
-
-    @staticmethod
-    def _pdf_full_page_dump_block_reason(agent: Agent, command: str) -> str:
-        task = str(agent.task or "").lower()
-        value = str(command or "").lower()
-        if (
-            "print only candidate captions and axis labels, not entire page text" not in task
-            or "fitz" not in value
-            or "get_text(" not in value
-        ):
-            return ""
-        text_variables = set(re.findall(
-            r"\b([a-z_]\w*)\s*=\s*(?:[a-z_]\w*\.)?get_text\(",
-            value,
-        ))
-        dumps_page = any(
-            re.search(rf"\bprint\(\s*{re.escape(variable)}\s*\)", value)
-            for variable in text_variables
-        ) or bool(re.search(r"\bprint\(\s*(?:[a-z_]\w*\.)?get_text\(\)\s*\)", value))
-        if not dumps_page:
-            return ""
-        return (
-            "Full-page PDF text dump blocked. The inherited protocol requires only bounded candidate captions "
-            "and axis labels, and a whole page adds noise without proving plotted endpoints. Extract a short "
-            "caption/label window from the already matched page, then render that page or figure crop and inspect "
-            "the plot-frame borders plus tick spacing."
-        )
-
-    @staticmethod
-    def _arxiv_identifier_month_assumption_block_reason(agent: Agent, command: str) -> str:
-        task = str(agent.task or "").lower()
-        value = str(command or "").lower()
-        if (
-            "runtime inherited research protocol" not in task
-            or not (
-                "arxiv" in task
-                and "initial or revised" in task
-                and "version" in task
-            )
-        ):
-            return ""
-        searches_identifier_prefix = bool(
-            re.search(r"[\"']arxiv:20\d{2}[\"']\s+in\b", value)
-            or re.search(r"\bgrep\b[^\n]{0,100}arxiv[:./]?20\d{2}", value)
-            or re.search(r"\.\s*startswith\s*\(\s*[rubf]*[\"']20\d{2}", value)
-            or re.search(
-                r"\[\s*(?:0\s*)?:\s*4\s*\]\s*(?:==|!=)\s*[rubf]*[\"']20\d{2}",
-                value,
-            )
-            or re.search(
-                r"\bre\.(?:match|search|findall|finditer)\s*\(\s*[rubf]*[\"']"
-                r"[^\"'\r\n]{0,40}20\d{2}",
-                value,
-            )
-        )
-        if not searches_identifier_prefix:
-            return ""
-        return (
-            "arXiv identifier-month inference blocked. An identifier encodes the initial submission month, "
-            "while the task explicitly allows a later revision date. Shortlist papers by title/authors/subject, "
-            "then inspect every candidate's version history; do not search bibliography text for a YYMM prefix."
-        )
-
-    def _arxiv_exact_title_api_block_reason(self, agent: Agent, command: str) -> str:
-        task = str(agent.task or "").lower()
-        value = unquote(str(command or "")).lower()
-        protocol_blocks_title_api = (
-            "do not add exact 'ti:frb' api filters" in task
-            or (
-                "advanced html" in task
-                and bool(re.search(
-                    r"\bdo not\b[^.\r\n]{0,160}(?:exact-title|search_query|\bti\s*:)",
-                    task,
-                ))
-            )
-        )
-        if (
-            not self._requires_constrained_arxiv_search(agent)
-            or not protocol_blocks_title_api
-            or "export.arxiv.org/api/query" not in value
-        ):
-            return ""
-        exact_title_query = False
-        for match in re.finditer(
-            r"export\.arxiv\.org/api/query[^\r\n]*",
-            value,
-        ):
-            query_line = match.group(0)
-            if "search_query=" not in query_line:
-                continue
-            if re.search(r"\bti\s*:", query_line):
-                exact_title_query = True
-                break
-            variable_refs = re.findall(
-                r"search_query=(?:\{([a-z_]\w*)\}|\$\{?([a-z_]\w*)\}?)",
-                query_line,
-            )
-            for groups in variable_refs:
-                variable = next((name for name in groups if name), "")
-                if variable and re.search(
-                    rf"\b{re.escape(variable)}\s*=\s*f?[\"'][^\r\n]*\bti\s*:",
-                    value,
-                ):
-                    exact_title_query = True
-                    break
-            if exact_title_query:
-                break
-        if not exact_title_query:
-            return ""
-        return (
-            "Exact-title arXiv Atom API query blocked by the inherited research protocol. Use arXiv advanced "
-            "HTML with separate author and title fields, or inspect ordinary metadata for a named candidate; "
-            "do not retry the API with a different ti: token."
-        )
-
-    def _arxiv_atom_feed_header_parse_block_reason(self, agent: Agent, command: str) -> str:
-        value = str(command or "").lower()
-        if (
-            not self._requires_constrained_arxiv_search(agent)
-            or "export.arxiv.org/api/query" not in value
-            or "id_list" not in value
-        ):
-            return ""
-        takes_first_title = "<title>" in value and bool(
-            re.search(r"\b(?:titles?|title_matches)\s*\[\s*0\s*\]", value)
-        )
-        takes_first_updated = "<updated>" in value and bool(
-            re.search(r"\b(?:updated|updates?|updated_matches)\s*\[\s*0\s*\]", value)
-        )
-        if not (takes_first_title or takes_first_updated):
-            return ""
-        return (
-            "Atom feed-header parse blocked. Both the feed and its paper entry contain title/updated fields, so "
-            "the first regex match is query metadata rather than paper metadata. Parse the XML and select the Atom "
-            "entry element first, then read that entry's title, published, updated, and author/name children. Use "
-            "the paper's submission history when every version date is required; never use the feed-level updated "
-            "timestamp as a paper revision date."
-        )
-
-    @staticmethod
-    def _pdf_cli_fallback_guidance(command: str, result: Any) -> str:
-        if "pdftotext" not in str(command or "").lower():
-            return ""
-        if isinstance(result, dict):
-            result_text = "\n".join(
-                str(result.get(key) or "")
-                for key in ("stdout", "stderr", "error")
-            )
-        else:
-            result_text = str(result or "")
-        if not re.search(
-            r"(?:pdftotext[^\n]*(?:not found|no such file)|command not found)",
-            result_text,
-            flags=re.IGNORECASE,
-        ):
-            return ""
-        return (
-            "The pdftotext executable is unavailable. Do not install packages or retry that CLI. Use the "
-            "already available Python PDF libraries immediately: run Python with `import fitz`, open the local "
-            "PDF via `fitz.open(...)`, and iterate `page.get_text()`; use PyPDF2 only if importing fitz fails."
-        )
-
-    def _figure_panel_disambiguation_guidance(
-        self,
-        agent: Agent,
-        command: str,
-        result: Any,
-    ) -> str:
-        scope_text = f"{agent.task}\n{self.config.system_extra_instructions}"
-        if (
-            agent.parent is None
-            or classify_shell_capability(command) != "python"
-            or not re.search(r"\b(?:bottom|lower)\s+panels?\b", scope_text, flags=re.IGNORECASE)
-            or not isinstance(result, dict)
-        ):
-            return ""
-        output = "\n".join(str(result.get(key) or "") for key in ("stdout", "stderr"))
-        page_mentions = set(re.findall(r"\bpage\s+(\d+)\b", output, flags=re.IGNORECASE))
-        if (
-            len(page_mentions) < 2
-            or "figure" not in output.lower()
-            or "panel" not in output.lower()
-        ):
-            return ""
-        key = "figure_panel_disambiguation_guidance"
-        if key in agent._notified_thresholds:
-            return ""
-        agent._notified_thresholds.add(key)
-        return (
-            "The PDF scan found several figure/page mentions for the target. Do not select the first figure that "
-            "mentions the item. Extract every matching figure caption as a complete block, then choose only the "
-            "caption that satisfies all wording qualifiers from the task, especially the named item and an explicit "
-            "lower/bottom panel. Treat nearby prose and a caption describing several items as ambiguous until the "
-            "exact panel label is verified; render that matched page only."
-        )
-
-    def _html_regex_parser_guidance(
-        self,
-        agent: Agent,
-        command: str,
-        result: Any,
-    ) -> str:
-        task = str(agent.task or "").lower()
-        value = str(command or "").lower()
-        if (
-            agent.parent is None
-            or classify_shell_capability(command) != "python"
-            or "bibliography" not in task
-            or "structurally" not in task
-            or ".html" not in value
-            or not re.search(r"\bre\.(?:findall|search|finditer)\b", value)
-            or not isinstance(result, dict)
-        ):
-            return ""
-        output = "\n".join(str(result.get(key) or "") for key in ("stdout", "stderr"))
-        if not re.search(
-            r"(?:found\s+0\s+(?:bib|reference)|"
-            r"(?:total\s+)?(?:bib(?:liography)?(?:\s+items?)?|refs?|references?)\s*:\s*0\b|"
-            r"no\s+bibliography|no\s+references)",
-            output,
-            flags=re.IGNORECASE,
-        ):
-            return ""
-        key = "html_regex_parser_guidance"
-        if key in agent._notified_thresholds:
-            return ""
-        agent._notified_thresholds.add(key)
-        return (
-            "The tag-specific HTML regex returned zero bibliography records. Do not try another div/ol/li regex "
-            "or dump every class name. Parse the saved HTML with BeautifulSoup and select the known CSS class "
-            "independently of tag name (for ar5iv, `soup.select('.ltx_bibitem')`), then use each node's complete "
-            "text and id/label. Inspect one selected node only if the selector itself is empty."
-        )
 
     @staticmethod
     def _local_structured_candidate_count(result: Any) -> int:
@@ -8011,9 +7754,9 @@ class Runtime(MergeSubmitMixin, FixedTopologyMixin, SupervisorMixin):
     def _spawn_unavailable_reason(self, agent: Agent) -> str | None:
         if "spawn" in self.config.disabled_tools:
             return "spawn disabled"
-        if agent.depth + 1 > self.config.max_depth:
+        if self.config.max_depth > 0 and agent.depth + 1 > self.config.max_depth:
             return f"max depth {self.config.max_depth} reached"
-        if len(self.agents) >= self.config.max_agents:
+        if self.config.max_agents > 0 and len(self.agents) >= self.config.max_agents:
             return f"max agents {self.config.max_agents} reached"
         return None
 
@@ -8157,10 +7900,21 @@ class Runtime(MergeSubmitMixin, FixedTopologyMixin, SupervisorMixin):
         proposal: str,
         extra: list[tuple[str, str]] | None = None,
     ) -> str:
+        """Reject an exact-ish clone of this agent or of the current batch.
+
+        Comparing against the whole ancestor/sibling lineage was collapsing
+        multi-level expansion: a child proposing a distinct sub-piece of its
+        own work looked like a duplicate of the parent or of itself. The 8/2
+        EdgeBench baseline (June runtime) had no lineage veto; keep only the
+        clone check that still earns its keep.
+        """
         proposed_terms = self._spawn_task_terms(proposal)
         if len(proposed_terms) < 4:
             return ""
-        for label, existing in [*self._spawn_lineage_entries(agent), *(extra or [])]:
+        own: list[tuple[str, str]] = []
+        if agent.parent is not None:
+            own.append((agent.id, str(agent.task or "")))
+        for label, existing in [*own, *(extra or [])]:
             existing_terms = self._spawn_task_terms(existing)
             if len(existing_terms) < 4:
                 continue
@@ -8200,14 +7954,20 @@ class Runtime(MergeSubmitMixin, FixedTopologyMixin, SupervisorMixin):
         if self._is_review_only(agent):
             self._emit(agent.id, "spawn_judge_skipped", {"reason": "review_only"})
             return False
-        remaining_slots = max(0, self.config.max_agents - len(self.agents))
-        if remaining_slots <= 0:
+        unbounded_agents = self.config.max_agents <= 0
+        remaining_slots = (
+            None
+            if unbounded_agents
+            else max(0, self.config.max_agents - len(self.agents))
+        )
+        if remaining_slots is not None and remaining_slots <= 0:
             return False
         # Hard runtime constraint: benchmark work runs in this container's memory
         # cgroup, so bound the fan-out regardless of what the judge wants.
         cap = self._max_parallel_children()
         if cap is not None:
-            remaining_slots = min(remaining_slots, max(0, cap - self._active_children_total()))
+            available = max(0, cap - self._active_children_total())
+            remaining_slots = available if remaining_slots is None else min(remaining_slots, available)
             if remaining_slots <= 0:
                 self._emit(agent.id, "spawn_judge_skipped", {
                     "reason": "memory_capacity",
@@ -8224,22 +7984,28 @@ class Runtime(MergeSubmitMixin, FixedTopologyMixin, SupervisorMixin):
         ]
         if active_children:
             return False
-        previous_delivery_count = getattr(agent, "_spawn_judge_last_delivery_count", None)
-        current_delivery_count = len(self._candidate_delivery_records(agent))
-        if (
-            previous_delivery_count is not None
-            and current_delivery_count <= int(previous_delivery_count)
-        ):
-            self._emit(agent.id, "spawn_judge_skipped", {
-                "reason": "no_new_evidence_since_previous_expansion",
-                "delivery_count": current_delivery_count,
-            })
-            return False
         judge_model = self._spawn_judge_model(agent)
         if not judge_model:
             return False
 
         context_text = self._render_history_for_judge(agent)
+        objective_context = self._online_objective_summary()
+        if objective_context:
+            context_text += "\n" + objective_context
+        candidate_records = self._candidate_delivery_records(agent)
+        if candidate_records:
+            candidate_state = "\n".join(
+                "- agent={agent}; confidence={confidence:.2f}; artifact={artifact}; duplicate_of={duplicate}; method={method}".format(
+                    agent=str(record.get("agent_id") or "unknown"),
+                    confidence=float(record.get("confidence") or 0.0),
+                    artifact=(str(record.get("artifact_sha256") or "none")[:16]),
+                    duplicate=(record.get("duplicate_artifact_of_seq") or "none"),
+                    method=str(record.get("method") or "unspecified")[:120],
+                )
+                for record in candidate_records[-12:]
+            )
+        else:
+            candidate_state = "(no completed candidate deliveries yet)"
         custom_policy = self._spawn_judge_custom_policy()
         policy_section = (
             "\nRuntime-specific spawn policy (authoritative):\n"
@@ -8267,13 +8033,15 @@ class Runtime(MergeSubmitMixin, FixedTopologyMixin, SupervisorMixin):
             "Every child already receives its OWN private copy of the task directory and the "
             "runtime folds each child's changes back safely, so children never collide — you "
             "do not need to tell them to copy files or avoid each other.\n"
-            "This decision is LOCAL to the current assignment. A child having planning ability "
-            "does not by itself justify descendants. Decline when an ancestor, sibling, or prior "
-            "child already covers the proposed work; recursively adding another solver/verifier "
-            "for the same derivation is duplication, not useful verification. Spawn only when the "
-            "next phase contains a materially independent subproblem, method, or newly evidenced "
-            "uncertainty that is absent from the lineage. Do NOT reason about token cost, money, "
-            "or a fixed depth limit. Reply with STRICT JSON only, no prose."
+            "There is no fixed agent-count or depth target. Spawn only when each proposed "
+            "branch has a distinct, falsifiable hypothesis, independent verification method, "
+            "or non-overlapping artifact contribution that is not already represented by a "
+            "completed candidate. Once a validated candidate and adequate independent evidence "
+            "exist, decline further fan-out unless a concrete failing check identifies a new "
+            "uncertainty. A child may itself expand a genuinely distinct subproblem; repeated "
+            "waves or identical artifact digests are convergence signals, not reasons to create "
+            "more agents. Do NOT optimize for a fixed depth or agent count. Reply with "
+            "STRICT JSON only, no prose."
             + policy_section
         )
         user_msg = (
@@ -8281,11 +8049,19 @@ class Runtime(MergeSubmitMixin, FixedTopologyMixin, SupervisorMixin):
             f"Parent agent id (children query this): {agent.id}\n\n"
             "Parent's current working context (this is exactly what the parent sees):\n"
             f"{context_text}\n\n"
-            "Assignments already represented in this branch (do not duplicate them):\n"
+            "Assignments already represented in this branch (context only; "
+            "a child may still expand a distinct subproblem):\n"
             f"{self._render_spawn_lineage(agent)}\n\n"
+            "Completed candidate state (use this to judge marginal information gain):\n"
+            f"{candidate_state}\n\n"
             + (f"The parent is about to plan this next: {plan_hint}\n\n" if plan_hint else "")
-            + f"You may spawn up to {remaining_slots} parallel children.\n\n"
-            "Return JSON exactly like:\n"
+            + (
+                "There is no framework agent-count cap. Spawn only distinct, useful "
+                "parallel children.\n\n"
+                if unbounded_agents
+                else f"You may spawn up to {remaining_slots} parallel children.\n\n"
+            )
+            + "Return JSON exactly like:\n"
             '{"spawn": true|false, "reasoning": "<one sentence>", '
             '"subagents": [{"subject": "<short label>", "role": "solver|verifier|explorer|worker", '
             '"task": "<objective + what to query from the parent>"}]}\n'
@@ -8329,7 +8105,7 @@ class Runtime(MergeSubmitMixin, FixedTopologyMixin, SupervisorMixin):
                 continue
             subs.append(sub)
             accepted_tasks.append((f"proposal-{len(subs)}", str(sub.get("task") or "")))
-            if len(subs) >= remaining_slots:
+            if remaining_slots is not None and len(subs) >= remaining_slots:
                 break
         if filtered:
             self._emit(agent.id, "spawn_judge_duplicate_filtered", {
@@ -8357,6 +8133,9 @@ class Runtime(MergeSubmitMixin, FixedTopologyMixin, SupervisorMixin):
                 f'query(agent_id="{agent.id}", messages=-1) to read them (or messages=N '
                 f"for the last N). Pull what you need instead of restating."
             )
+            artifact_contract = self._delivery_contract_instructions(child=True)
+            if artifact_contract:
+                child_task += f"\n\n{artifact_contract}"
             try:
                 result = await self._invoke_meta_spawn(
                     {"task": child_task, "model": judge_model},
@@ -8369,8 +8148,6 @@ class Runtime(MergeSubmitMixin, FixedTopologyMixin, SupervisorMixin):
                 self._emit(agent.id, "spawn_judge_error", {"stage": "spawn", "detail": str(result)[:300]})
                 break
             spawned_any = True
-        if spawned_any:
-            agent._spawn_judge_last_delivery_count = current_delivery_count
         return spawned_any
 
     def _delivery_orchestration_report(self, parent: Agent, delivered: Agent) -> str:
@@ -8455,13 +8232,17 @@ class Runtime(MergeSubmitMixin, FixedTopologyMixin, SupervisorMixin):
                 "stage": "delivery", "reason": "verifier_already_running",
             })
             return False
-        remaining_slots = max(0, self.config.max_agents - len(self.agents))
+        unbounded_agents = self.config.max_agents <= 0
+        remaining_slots = (
+            None
+            if unbounded_agents
+            else max(0, self.config.max_agents - len(self.agents))
+        )
         cap = self._max_parallel_children()
         if cap is not None:
-            remaining_slots = min(
-                remaining_slots, max(0, cap - self._active_children_total())
-            )
-        if remaining_slots <= 0:
+            available = max(0, cap - self._active_children_total())
+            remaining_slots = available if remaining_slots is None else min(remaining_slots, available)
+        if remaining_slots is not None and remaining_slots <= 0:
             self._emit(delivered.id, "spawn_judge_skipped", {
                 "stage": "delivery", "reason": "capacity",
                 "active_children": self._active_children_total(), "cap": cap,
@@ -8510,8 +8291,13 @@ class Runtime(MergeSubmitMixin, FixedTopologyMixin, SupervisorMixin):
             f"Verification output from the merged state:\n"
             f"{str(delivery.get('verification_output') or '(none)')[:1500]}\n\n"
             f"{report}\n\n"
-            f"You may spawn up to {remaining_slots} agent(s); one is usually enough.\n\n"
-            "Return JSON exactly like:\n"
+            + (
+                "There is no framework agent-count cap; spawn only the useful "
+                "cross-checker(s).\n\n"
+                if unbounded_agents
+                else f"You may spawn up to {remaining_slots} agent(s); one is usually enough.\n\n"
+            )
+            + "Return JSON exactly like:\n"
             '{"spawn": true|false, "reasoning": "<one sentence>", '
             '"subagents": [{"subject": "<short label>", "role": "verifier", '
             '"task": "<what to check, against what, and what to query from whom>"}]}\n'
@@ -8532,7 +8318,9 @@ class Runtime(MergeSubmitMixin, FixedTopologyMixin, SupervisorMixin):
             })
         if not decision:
             return False
-        subs = (decision["subagents"] if decision["spawn"] else [])[:remaining_slots]
+        subs = decision["subagents"] if decision["spawn"] else []
+        if remaining_slots is not None:
+            subs = subs[:remaining_slots]
         self._emit(delivered.id, "spawn_judge_decision", {
             "stage": "delivery",
             "model": judge_model,
@@ -8897,6 +8685,9 @@ class Runtime(MergeSubmitMixin, FixedTopologyMixin, SupervisorMixin):
         if margin is None:
             return None
         sign = 1 if self._ledger_higher_is_better() else -1
+        if self._online_objective is not None and source == "verify":
+            spec = self._authoritative_spec() or {}
+            sign = 1 if spec.get("higher_is_better", True) else -1
         return sign * (there - here) > margin
 
     def _verify_state_path(self) -> Path:
@@ -9007,6 +8798,10 @@ class Runtime(MergeSubmitMixin, FixedTopologyMixin, SupervisorMixin):
         """
         if not self._merge_active() or not self._is_submission_call(name, args):
             return
+        if self._online_objective is not None and name == "shell" and re.search(
+            r"(?:^|\s)(?:--list|-l)(?:\s|$)", str((args or {}).get("command", "")),
+        ):
+            return
         target = self._merge_target()
         if target is None:
             return
@@ -9020,16 +8815,69 @@ class Runtime(MergeSubmitMixin, FixedTopologyMixin, SupervisorMixin):
             return
         if not self._is_submission_call(name, args):
             return
+        if self._online_objective is not None and name == "shell" and re.search(
+            r"(?:^|\s)(?:--list|-l)(?:\s|$)", str((args or {}).get("command", "")),
+        ):
+            return
         text = "\n".join(
             str(result.get(key) or "")
             for key in ("stdout", "output", "submission", "stderr")
         )
         try:
-            await self._calibrate_with_official(agent, text)
+            if self._online_objective is not None:
+                official = await self._calibrate_with_official(
+                    agent, text, observation=online_objective.from_result(result),
+                )
+            else:
+                official = await self._calibrate_with_official(agent, text)
+            if self._online_objective is not None and official is not None:
+                result["objective_feedback"] = {
+                    "valid": official["valid"], "pass_rate": official["pass_rate"],
+                    "score": official["score"],
+                    "direction": self._online_objective["direction"],
+                    "summary": self._online_objective_summary(),
+                }
         except Exception as exc:
             self._emit(agent.id, "official_calibration_error", {"detail": str(exc)[:200]})
 
-    async def _calibrate_with_official(self, agent: Agent, text: str) -> dict | None:
+    def _online_objective_summary(self) -> str:
+        if self._online_objective is None or not self._merge_active():
+            return ""
+        return online_objective.summarize(self._ledger_entries(), self._online_objective)
+
+    async def _record_online_objective(self, agent: Agent, official: dict, signature) -> None:
+        spec = self._online_objective
+        digest = self._ledger_digest(signature)
+        # Tool results can be handled twice; one returned round is one observation.
+        duplicate = official.get("round") and any(
+            row.get("source") == "official" and row.get("round") == official["round"]
+            and row.get("state") == digest and row.get("metric_id") == spec["metric_id"]
+            for row in self._ledger_entries()
+        )
+        if not duplicate:
+            self._ledger_note(
+                "official", official["score"], signature=signature, agent_id=agent.id,
+                counts=signature is not None,
+                extra={**{key: spec[key] for key in ("metric_id", "direction", "selection")},
+                       **{key: official.get(key) for key in ("round", "pass_rate", "valid", "failed")}},
+            )
+        summary = self._online_objective_summary()
+        # Share with the producing node and ancestors without waking finished work.
+        peer = agent
+        visited = set()
+        while peer is not None and peer.id not in visited:
+            visited.add(peer.id)
+            if (summary and peer.status not in {"done", "failed", "killed"}
+                    and self._objective_notice_seen.get(peer.id) != summary):
+                self._objective_notice_seen[peer.id] = summary
+                peer._steer_inbox.put_nowait(Envelope(
+                    from_id="system", to_id=peer.id, content=summary,
+                    tokens=estimate_tokens(summary), timestamp=time.time(), mode="steer",
+                ))
+                self._emit(peer.id, "online_objective_feedback", {"summary": summary})
+            peer = self.agents.get(peer.parent) if peer.parent else None
+
+    async def _calibrate_with_official(self, agent: Agent, text: str, *, observation: dict | None = None) -> dict | None:
         """Check the local instrument against the judge's verdict on the same state.
 
         The local check is the gate; this is the occasional calibration of it. A
@@ -9040,7 +8888,8 @@ class Runtime(MergeSubmitMixin, FixedTopologyMixin, SupervisorMixin):
         """
         if not self._merge_active():
             return None
-        official = self._official_parse(text)
+        official = ((observation or online_objective.parse_feedback(text)) if self._online_objective is not None
+                    else self._official_parse(text))
         if official is None:
             return None
         self._official_last = official
@@ -9050,7 +8899,15 @@ class Runtime(MergeSubmitMixin, FixedTopologyMixin, SupervisorMixin):
         signature = self._submitted_signature.pop(agent.id, None)
         if signature is None:
             target = self._merge_target()
-            signature = self._merge_scope_signature(target) if target else None
+            signature = (self._merge_scope_signature(target)
+                         if target and self._online_objective is None else None)
+        if self._online_objective is not None:
+            await self._record_online_objective(agent, official, signature)
+            # A feasibility check need not predict a continuous objective. A low
+            # score neither invalidates that check nor licenses skipping delivery.
+            self._emit(agent.id, "official_verdict", {**official, "objective_mode": True})
+            if official["valid"]:
+                return official
         judged_ok = bool(official["valid"]) and (official["pass_rate"] or 0.0) >= 1.0
         # Only comparable when the local check actually passed this same state.
         local_ok = (
@@ -9075,18 +8932,19 @@ class Runtime(MergeSubmitMixin, FixedTopologyMixin, SupervisorMixin):
         passed_something = (
             official["pass_rate"] is None or float(official["pass_rate"]) > 0
         )
-        self._ledger_note(
-            "official",
-            official["score"],
-            signature=signature,
-            agent_id=agent.id,
-            counts=bool(official["valid"]) and passed_something,
-            extra={
-                "round": official["round"],
-                "pass_rate": official["pass_rate"],
-                "valid": bool(official["valid"]),
-            },
-        )
+        if self._online_objective is None:
+            self._ledger_note(
+                "official",
+                official["score"],
+                signature=signature,
+                agent_id=agent.id,
+                counts=bool(official["valid"]) and passed_something,
+                extra={
+                    "round": official["round"],
+                    "pass_rate": official["pass_rate"],
+                    "valid": bool(official["valid"]),
+                },
+            )
         spec = self._authoritative_spec()
         if not local_ok or judged_ok or spec is None:
             if local_ok and judged_ok and spec is not None:
@@ -9217,7 +9075,7 @@ class Runtime(MergeSubmitMixin, FixedTopologyMixin, SupervisorMixin):
         """
         if len(self._verify_metric_seen.get(spec.get("command", ""), [])) < 2:
             return False
-        tracks = self._verify_metric_tracks_authority()
+        tracks = self._verify_metric_tracks_authority(spec)
         if tracks is False:
             self._emit("root", "verify_metric_withdrawn", {
                 "check": spec.get("name") or spec.get("command", "")[:80],
@@ -9226,7 +9084,7 @@ class Runtime(MergeSubmitMixin, FixedTopologyMixin, SupervisorMixin):
             return False
         return True
 
-    def _verify_metric_tracks_authority(self) -> bool | None:
+    def _verify_metric_tracks_authority(self, spec: dict | None = None) -> bool | None:
         """Whether the local check ranks states the way the judge does.
 
         Returns None while fewer than two states have been measured by both, so
@@ -9241,6 +9099,11 @@ class Runtime(MergeSubmitMixin, FixedTopologyMixin, SupervisorMixin):
             )
             if state is None or not isinstance(metric, (int, float)):
                 continue
+            if self._online_objective is not None:
+                if source == "official" and online_objective.rank(entry, self._online_objective) is None:
+                    continue
+                if source == "verify" and (spec is None or entry.get("check") != spec.get("command")):
+                    continue
             if source in ("official", "verify"):
                 # Latest measurement of this state on this channel.
                 by_state.setdefault(state, {})[source] = float(metric)
@@ -9249,11 +9112,14 @@ class Runtime(MergeSubmitMixin, FixedTopologyMixin, SupervisorMixin):
         if len(paired) < 2:
             return None
         sign = 1 if self._ledger_higher_is_better() else -1
+        local_sign = 1
+        if self._online_objective is not None:
+            local_sign = 1 if (spec or {}).get("higher_is_better", True) else -1
         agree = disagree = 0
         for i, a in enumerate(paired):
             for b in paired[i + 1:]:
                 official = sign * (a["official"] - b["official"])
-                local = a["verify"] - b["verify"]
+                local = local_sign * (a["verify"] - b["verify"])
                 if official == 0 or local == 0:
                     continue  # a tie on either side ranks nothing
                 if (official > 0) == (local > 0):
@@ -10075,6 +9941,18 @@ class Runtime(MergeSubmitMixin, FixedTopologyMixin, SupervisorMixin):
                     "write the final artifact with ws_create_file and call set_status(done, result=...)."
                 ),
             }
+        if (
+            tc.name == "shell"
+            and self._is_review_only(agent)
+            and bool(getattr(agent, "_final_review_execution_complete", False))
+        ):
+            return {
+                "error": "the bounded final-review execution phase is already complete",
+                "required_behavior": (
+                    "Use the recorded command and observation in verification_checks, "
+                    "then call deliver_to_parent now."
+                ),
+            }
         malformed_write_block = self._malformed_write_recovery_block_reason(agent, tc)
         if malformed_write_block:
             self._emit(agent.id, "malformed_write_recovery_block", {
@@ -10778,6 +10656,20 @@ class Runtime(MergeSubmitMixin, FixedTopologyMixin, SupervisorMixin):
                     )
                 if root_lake_build:
                     self._fixed_source_writes_frozen = False
+                if (
+                    tc.name == "shell"
+                    and self._is_review_only(agent)
+                    and isinstance(result, dict)
+                    and not result.get("blocked")
+                    and not result.get("timed_out")
+                    and not result.get("error")
+                    and "syntax error" not in str(result.get("stderr") or "").lower()
+                    and "unexpected token" not in str(result.get("stderr") or "").lower()
+                ):
+                    setattr(agent, "_final_review_execution_complete", True)
+                    self._emit(agent.id, "final_candidate_review_execution_complete", {
+                        "exit_code": result.get("exit_code"),
+                    })
                 if self._malformed_write_recovery_completed(agent, tc, result):
                     self._emit(agent.id, "malformed_write_recovered", {
                         "tool": tc.name,
@@ -10992,9 +10884,9 @@ class Runtime(MergeSubmitMixin, FixedTopologyMixin, SupervisorMixin):
 - Peers working in parallel: {parent_context['siblings'] or 'none yet'}
 - Depth: {parent_context['depth']}
 - On your first response, perform the assigned work with one concrete tool call. Do not spend a full turn on prose-only planning; keep any text before the tool call under 40 words.
-- When your evidence supports an answer, call deliver_to_parent(answer=..., evidence=..., confidence=..., method=...) exactly once, then call set_status("done", result=<same answer>).
+- When your evidence supports an answer, call deliver_to_parent(answer=..., evidence=..., confidence=..., method=..., artifact_path=<complete private candidate tree when you produced files>) exactly once, then call set_status("done", result=<same answer>).
 - Do not use query or send for final result delivery. If evidence is incomplete, deliver your best concise candidate with lower confidence instead of returning an empty result.
-- The root owns final files in the shared workspace. Do not create or overwrite a shared final artifact named by the parent task; keep research notes private and use deliver_to_parent for your handoff.
+- The root owns final files in the shared workspace. Do not create or overwrite the official shared target. You may and should create a complete runnable candidate in your private workspace, then hand off its frozen artifact path through deliver_to_parent.
 {review_line}
 {web_search_line}
 {capsule_section}
@@ -11017,15 +10909,15 @@ class Runtime(MergeSubmitMixin, FixedTopologyMixin, SupervisorMixin):
 
         delivery_section = ""
         contract = self.config.delivery_contract
-        if contract is not None and not parent_context:
-            required = ", ".join(str(path) for path in contract.required_targets())
+        if contract is not None:
+            contract_instructions = self._delivery_contract_instructions(
+                child=bool(parent_context)
+            )
             delivery_section = f"""
 ## Runtime Delivery Contract
-- Required final outputs: {required}
-- `submit` accepts a file or a complete directory tree. The runtime preserves the
-  surrounding tree and atomically publishes it to the required destination.
-- `set_status(done)` is refused while a required output is missing or empty. A
-  failed submit is not completion; fix the path or submit the complete tree.
+{contract_instructions}
+- `submit` accepts a file or a complete directory tree. The runtime preserves the surrounding tree.
+- A root's `set_status(done)` is refused while a required output is missing, empty, or invalid.
 """
 
         return f"""You are agent "{agent_id}" in a multi-agent system.

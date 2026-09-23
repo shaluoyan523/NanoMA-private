@@ -78,7 +78,7 @@ def process_group_rss_bytes(pgid: int) -> int:
     return total
 
 
-async def _sample_peak_rss(pgid: int, into: dict[str, int]) -> None:
+async def _sample_peak_rss(pgid: int, into: dict[str, int], on_sample=None) -> None:
     """Track the largest resident total this command's tree is seen holding."""
     while True:
         try:
@@ -87,6 +87,8 @@ async def _sample_peak_rss(pgid: int, into: dict[str, int]) -> None:
             return
         if current > into.get("peak_rss_bytes", 0):
             into["peak_rss_bytes"] = current
+        if on_sample is not None:
+            on_sample(current)
         await asyncio.sleep(_RSS_SAMPLE_SECONDS)
 
 
@@ -95,6 +97,7 @@ async def shell_exec(
     workspace: Path,
     shared_dir: Path,
     timeout: int = 30,
+    *, on_start=None, on_sample=None,
 ) -> dict[str, Any]:
     """Execute a shell command in the workspace directory.
 
@@ -146,7 +149,9 @@ async def shell_exec(
             env=env,
             start_new_session=True,
         )
-        sampler = asyncio.create_task(_sample_peak_rss(proc.pid, observed))
+        if on_start is not None:
+            on_start(proc.pid)
+        sampler = asyncio.create_task(_sample_peak_rss(proc.pid, observed, on_sample))
         readers = [
             asyncio.create_task(_drain(proc.stdout, out)),
             asyncio.create_task(_drain(proc.stderr, err)),
@@ -167,6 +172,14 @@ async def shell_exec(
         except asyncio.TimeoutError:
             await _terminate_process_tree(proc)
         return decoded(timed_out=False)
+    except asyncio.CancelledError:
+        if on_start is not None:
+            for task in readers:
+                task.cancel()
+            if sampler is not None:
+                sampler.cancel()
+            await _terminate_process_tree(proc)
+        raise
     except Exception as e:
         for task in readers:
             task.cancel()

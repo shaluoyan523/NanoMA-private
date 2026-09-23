@@ -157,7 +157,9 @@ async def tool_shell(args: dict[str, Any], workspace: Path, ctx: "ToolContext") 
     # Memory is claimed here rather than assumed at spawn time. The per-child cap
     # budgets agent processes; what exhausts a container is what those agents run.
     memory = shell_memory.arbiter()
-    ticket = await memory.acquire(cmd, timeout=float(timeout))
+    strict_memory = getattr(ctx, "shell_memory_strict_admission", False)
+    ticket = (await memory.acquire(cmd, timeout=float(timeout), strict=True)
+              if strict_memory else await memory.acquire(cmd, timeout=float(timeout)))
     if not ticket["granted"]:
         wanted_mb = (ticket.get("wanted") or 0) / (1024 * 1024)
         held_mb = (ticket.get("held") or 0) / (1024 * 1024)
@@ -179,10 +181,25 @@ async def tool_shell(args: dict[str, Any], workspace: Path, ctx: "ToolContext") 
             ),
         }
     result: dict[str, Any] = {}
+    process = {}
     try:
-        result = await shell_exec(cmd, workspace, ctx.shared_dir, timeout)
+        if strict_memory:
+            result = await shell_exec(
+                cmd, workspace, ctx.shared_dir, timeout,
+                on_start=lambda pgid: process.update(pgid=pgid),
+                on_sample=lambda rss: ticket.update(rss=rss),
+            )
+        else:
+            result = await shell_exec(cmd, workspace, ctx.shared_dir, timeout)
     finally:
-        await memory.release(cmd, ticket, result.get("peak_rss_bytes"))
+        if strict_memory and process.get("pgid"):
+            from nanoma.sandbox import process_group_rss_bytes
+            if process_group_rss_bytes(process["pgid"]) > 0:
+                memory.release_after_process(cmd, ticket, process["pgid"], result.get("peak_rss_bytes", 0))
+            else:
+                await memory.release(cmd, ticket, result.get("peak_rss_bytes"))
+        else:
+            await memory.release(cmd, ticket, result.get("peak_rss_bytes"))
     if ticket.get("waited", 0) >= 1.0:
         result["memory_waited_seconds"] = round(ticket["waited"], 1)
 
