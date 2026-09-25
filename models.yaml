@@ -1,0 +1,63 @@
+models:
+  deepseek-v4-pro:
+    provider: deepseek
+    context_limit: 1048576
+    pricing:
+      input: 2.00
+      cached_input: 0.50
+      output: 8.00
+    tier: strong
+
+  deepseek/deepseek-v4-pro:nitro:
+    provider: deepseek
+    context_limit: 128000
+    pricing:
+      input: 2.00
+      cached_input: 0.50
+      output: 8.00
+    tier: strong
+
+  deepseek/deepseek-v4-flash:nitro:
+    provider: deepseek
+    context_limit: 128000
+    pricing:
+      input: 0.14
+      cached_input: 0.028
+      output: 0.28
+    tier: cheap
+
+  gpt-4o-mini:
+    provider: openai
+    context_limit: 128000
+    pricing:
+      input: 0.15
+      cached_input: 0.075
+      output: 0.60
+    tier: cheap
+
+  claude-haiku-4-5-20251001:
+    provider: anthropic
+    context_limit: 200000
+    pricing:
+      input: 0.80
+      cached_input: 0.08
+      output: 4.0
+    tier: mid
+
+  claude-sonnet-4-6:
+    provider: anthropic
+    context_limit: 200000
+    pricing:
+      input: 3.0
+      cached_input: 0.30
+      output: 15.0
+    tier: strong
+
+  claude-opus-4-8:
+    provider: anthropic
+    context_limit: 200000
+    pricing:
+      input: 15.0
+      cached_input: 1.50
+      output: 75.0
+    tier: strong

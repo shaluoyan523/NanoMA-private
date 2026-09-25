@@ -1,0 +1,269 @@
+{
+  "schema_version": 2,
+  "source": "edgebench_multiagent_topology_simulator.html",
+  "task": {
+    "id": "combinatorial_games_formalization",
+    "objective": "Preserve the verified 179-declaration seed, then add only Runtime-validated proof batches selected from the seeded tree's remaining declarations.",
+    "gates": [
+      "Runtime executes lake build directly without a shell pipeline",
+      "Root and coordinators cannot edit benchmark source files",
+      "Only one source writer is active or awaiting validation at a time",
+      "Dependency findings are handed to downstream nodes with explicit file ownership",
+      "A failed writer or build restores the previous verified green snapshot"
+    ]
+  },
+  "runtime": {
+    "budget_minutes": 120,
+    "root_role": "Read-only Green Branch Manager",
+    "root_source_writes": 0,
+    "max_live_agents": 8,
+    "max_concurrent_llm": 5,
+    "task_repo": "/home/workspace/se-bmk-intern/combinatorial-games",
+    "completion_checkpoint": "spawn-final-auditor",
+    "services": {
+      "build_gate": {
+        "owner": "runtime",
+        "argv": [
+          "lake",
+          "build"
+        ],
+        "shell": false,
+        "accept_exit_codes": [
+          0
+        ],
+        "reject_pipelines": true
+      }
+    },
+    "nodes": [
+      {
+        "id": "baseline-mapper",
+        "role": "Seed-aware Baseline Mapper",
+        "assignment": "Inspect the seeded green tree. Confirm Player.lean, Functor.lean, and Mathlib/Small.lean are already solved; then rank remaining declarations in Tactic/GameCmp.lean, Game/Small.lean, Game/Graph.lean, and Game/Specific/Domineering.lean. Report exact names, local dependencies, and focused build targets without editing.",
+        "guide": "Do not assign work back to the three seed-complete files. Put seven GameCmp simp-shaped declarations first, four lawnmower declarations second, and identify the safest adjacent Graph declarations.",
+        "spawn_parent": "root",
+        "depends_on": [],
+        "start_minute": 0,
+        "end_minute": 8,
+        "mode": "progress",
+        "progress_logic": "all",
+        "min_parent_turns": 0,
+        "min_parent_tool_calls": 0,
+        "min_parent_age_seconds": 0,
+        "read_only": true,
+        "allowed_paths": [],
+        "spawn_executor": "parent_agent",
+        "spawn_tool": "nanoma"
+      },
+      {
+        "id": "proof-lead",
+        "role": "Ownership-aware Proof Wave Lead",
+        "assignment": "Coordinate the Runtime-spawned scouts and serial writers. Relay each scout result only to a writer that owns the target file, wait for Runtime candidate validation, and stop rejected routes. Never edit source, never ask a child to edit outside its access contract, and never submit.",
+        "guide": "Treat Runtime dependency handoffs and access-contract notifications as authoritative. Player.lean, Functor.lean, and Mathlib/Small.lean are seed-complete and must not consume another writer.",
+        "spawn_parent": "root",
+        "depends_on": [
+          "spawn-baseline-mapper"
+        ],
+        "start_minute": 2,
+        "end_minute": 100,
+        "mode": "settled",
+        "progress_logic": "all",
+        "min_parent_turns": 0,
+        "min_parent_tool_calls": 0,
+        "min_parent_age_seconds": 0,
+        "read_only": true,
+        "allowed_paths": [],
+        "spawn_executor": "parent_agent",
+        "spawn_tool": "nanoma"
+      },
+      {
+        "id": "gamecmp-quickwin-writer",
+        "role": "GameCmp Seven-proof Writer",
+        "assignment": "Repair exactly the seven remaining declarations in CombinatorialGames/Tactic/GameCmp.lean: Set.exists_mem_empty, Set.forall_singleton, Set.exists_singleton, forall_lt_zero, exists_lt_zero, forall_lt_one, and exists_lt_one. Test the minimal `simp` proof for each, run a focused module build, and finish so Runtime can run the authoritative full build.",
+        "guide": "Own only GameCmp.lean. Use structured workspace edits, preserve signatures and attributes, and do not change the game_cmp macro or imports. If `simp` fails for one declaration, keep the successful adjacent proofs and report the exact remaining goal.",
+        "spawn_parent": "proof-lead",
+        "depends_on": [
+          "spawn-baseline-mapper",
+          "spawn-proof-lead"
+        ],
+        "start_minute": 3,
+        "end_minute": 15,
+        "mode": "progress",
+        "progress_logic": "all",
+        "min_parent_turns": 1,
+        "min_parent_tool_calls": 1,
+        "min_parent_age_seconds": 20,
+        "read_only": false,
+        "allowed_paths": [
+          "CombinatorialGames/Tactic/GameCmp.lean"
+        ],
+        "spawn_executor": "parent_agent",
+        "spawn_tool": "nanoma"
+      },
+      {
+        "id": "small-dicotic-scout",
+        "role": "Dicotic Lawnmower Proof Scout",
+        "assignment": "Read Game/Small.lean and its imported Dicotic, Numeric, order, and infinitesimal lemmas. Derive proof skeletons for IGame.Dicotic.lt_of_numeric_of_pos and lt_of_numeric_of_neg. Send exact candidate terms and required instance paths without editing.",
+        "guide": "Explore one route through existing order/number lemmas and one route through game comparison. State compiler-checkable snippets, not general advice.",
+        "spawn_parent": "proof-lead",
+        "depends_on": [
+          "spawn-baseline-mapper",
+          "spawn-proof-lead"
+        ],
+        "start_minute": 3,
+        "end_minute": 22,
+        "mode": "progress",
+        "progress_logic": "any",
+        "min_parent_turns": 1,
+        "min_parent_tool_calls": 1,
+        "min_parent_age_seconds": 20,
+        "read_only": true,
+        "allowed_paths": [],
+        "spawn_executor": "parent_agent",
+        "spawn_tool": "nanoma"
+      },
+      {
+        "id": "small-impartial-scout",
+        "role": "Impartial Lawnmower Proof Scout",
+        "assignment": "Independently derive proof skeletons for IGame.Impartial.lt_of_numeric_of_pos and lt_of_numeric_of_neg in Game/Small.lean. Check whether Impartial supplies Dicotic and whether the two declarations should delegate to the Dicotic theorems. Report exact Lean terms without editing.",
+        "guide": "Verify namespace qualification, instance synthesis, and argument order. Prefer a short delegation proof over reproducing the hard theorem.",
+        "spawn_parent": "proof-lead",
+        "depends_on": [
+          "spawn-baseline-mapper",
+          "spawn-proof-lead"
+        ],
+        "start_minute": 3,
+        "end_minute": 22,
+        "mode": "progress",
+        "progress_logic": "any",
+        "min_parent_turns": 1,
+        "min_parent_tool_calls": 1,
+        "min_parent_age_seconds": 20,
+        "read_only": true,
+        "allowed_paths": [],
+        "spawn_executor": "parent_agent",
+        "spawn_tool": "nanoma"
+      },
+      {
+        "id": "graph-scout",
+        "role": "GameGraph Low-risk Proof Scout",
+        "assignment": "Rank the fourteen remaining sorries in Game/Graph.lean by proof risk. Produce exact proof sketches for the definitional image/membership lemmas first, including moves_toLGame, toLGame_def', toLGame_def, mem_moves_toLGame_of_mem, moveRecOn_eq, and their toIGame analogues. Do not edit.",
+        "guide": "Use definitions and existing corec/fix simp lemmas. Separate compiler-supported short candidates from speculative recursive proofs so the writer can stop before risky edits.",
+        "spawn_parent": "proof-lead",
+        "depends_on": [
+          "spawn-baseline-mapper",
+          "spawn-proof-lead"
+        ],
+        "start_minute": 4,
+        "end_minute": 32,
+        "mode": "progress",
+        "progress_logic": "any",
+        "min_parent_turns": 1,
+        "min_parent_tool_calls": 1,
+        "min_parent_age_seconds": 30,
+        "read_only": true,
+        "allowed_paths": [],
+        "spawn_executor": "parent_agent",
+        "spawn_tool": "nanoma"
+      },
+      {
+        "id": "game-small-integrator",
+        "role": "Game Small Proof Integrator",
+        "assignment": "Use both Runtime-delivered scout reports to repair the four remaining lawnmower declarations in CombinatorialGames/Game/Small.lean. Work one theorem or dependency pair at a time, keep only focused-build successes, and finish for Runtime full-build validation.",
+        "guide": "Own only Game/Small.lean. Try the two Dicotic declarations before delegating the Impartial declarations. Do not touch the already completed Mathlib/Small.lean.",
+        "spawn_parent": "proof-lead",
+        "depends_on": [
+          "spawn-gamecmp-quickwin-writer",
+          "spawn-small-dicotic-scout",
+          "spawn-small-impartial-scout"
+        ],
+        "start_minute": 15,
+        "end_minute": 42,
+        "mode": "settled",
+        "progress_logic": "all",
+        "min_parent_turns": 0,
+        "min_parent_tool_calls": 0,
+        "min_parent_age_seconds": 0,
+        "read_only": false,
+        "allowed_paths": [
+          "CombinatorialGames/Game/Small.lean"
+        ],
+        "spawn_executor": "parent_agent",
+        "spawn_tool": "nanoma"
+      },
+      {
+        "id": "graph-integrator",
+        "role": "GameGraph Conservative Integrator",
+        "assignment": "Use the Runtime-delivered Graph scout report to repair a conservative adjacent batch in CombinatorialGames/Game/Graph.lean. Start with definitional and membership lemmas, run a focused build after each small batch, and stop before speculative recursive or negation proofs if evidence is weak.",
+        "guide": "Own only Game/Graph.lean. Preserve public signatures and universe levels. A smaller accepted batch is better than a broad rejected edit.",
+        "spawn_parent": "proof-lead",
+        "depends_on": [
+          "spawn-game-small-integrator",
+          "spawn-graph-scout"
+        ],
+        "start_minute": 42,
+        "end_minute": 72,
+        "mode": "settled",
+        "progress_logic": "all",
+        "min_parent_turns": 0,
+        "min_parent_tool_calls": 0,
+        "min_parent_age_seconds": 0,
+        "read_only": false,
+        "allowed_paths": [
+          "CombinatorialGames/Game/Graph.lean"
+        ],
+        "spawn_executor": "parent_agent",
+        "spawn_tool": "nanoma"
+      },
+      {
+        "id": "domineering-regression-writer",
+        "role": "Domineering Regression and Quick-win Writer",
+        "assignment": "Inspect the single official new_bad declaration IGame.Domineering.instRepr and nearby remaining sorries in CombinatorialGames/Game/Specific/Domineering.lean. First seek a signature-preserving way to eliminate the regression; then attempt only locally supported short proofs. If the regression is transitive or no safe edit is justified, make no speculative change and report the evidence.",
+        "guide": "Own only Domineering.lean. Do not change public declaration types, add axioms, or broaden into Graph, IGame, Classes, or Player. Keep only focused-build successes.",
+        "spawn_parent": "proof-lead",
+        "depends_on": [
+          "spawn-graph-integrator"
+        ],
+        "start_minute": 72,
+        "end_minute": 88,
+        "mode": "settled",
+        "progress_logic": "all",
+        "min_parent_turns": 0,
+        "min_parent_tool_calls": 0,
+        "min_parent_age_seconds": 0,
+        "read_only": false,
+        "allowed_paths": [
+          "CombinatorialGames/Game/Specific/Domineering.lean"
+        ],
+        "spawn_executor": "parent_agent",
+        "spawn_tool": "nanoma"
+      },
+      {
+        "id": "final-auditor",
+        "role": "Final Green-state Auditor",
+        "assignment": "After every writer is terminal and Runtime has accepted or restored each batch, run a read-only full build and inspect git diff for out-of-scope changes. Confirm the tree matches the last Runtime-verified green checkpoint and report exact commands, exit codes, changed files, and unresolved declaration risk.",
+        "guide": "Do not edit and do not submit. Treat Runtime candidate-validation events as authoritative; flag any source change not owned by one of the four writers.",
+        "spawn_parent": "root",
+        "depends_on": [
+          "spawn-gamecmp-quickwin-writer",
+          "spawn-game-small-integrator",
+          "spawn-graph-integrator",
+          "spawn-domineering-regression-writer"
+        ],
+        "start_minute": 88,
+        "end_minute": 100,
+        "mode": "settled",
+        "progress_logic": "all",
+        "min_parent_turns": 0,
+        "min_parent_tool_calls": 0,
+        "min_parent_age_seconds": 0,
+        "read_only": true,
+        "allowed_paths": [],
+        "spawn_executor": "parent_agent",
+        "spawn_tool": "nanoma"
+      }
+    ],
+    "checkpoint_action": "steer_parent_spawn_tool",
+    "spawn_execution": "parent_agent_via_nanoma_tool",
+    "runtime_creates_agents": false
+  }
+}

@@ -1,0 +1,151 @@
+{
+  "schema_version": 2,
+  "source": "edgebench_multiagent_topology_simulator.html",
+  "task": {
+    "id": "graph_node_classification",
+    "title": "Graph Node Classification",
+    "category": "Scientific Problems & ML",
+    "plan": "P5",
+    "objective": "最多三个高差异候选，防止并行训练成本超过可获得的边际收益。",
+    "streams": [
+      "现有 MLP/邻域特征强 baseline",
+      "轻量 GNN 或标签传播变体",
+      "特征增强与校准路线",
+      "固定 split、泄漏审计与模型选择"
+    ],
+    "gates": [
+      "严格沿用固定数据 split",
+      "候选优于 62.17 才替换",
+      "总训练并发不超过资源预算"
+    ],
+    "risk_flags": [
+      "M"
+    ],
+    "edgebench_cwd": "/home/workspace/045_graph_node_classification",
+    "submit_paths": [
+      "solution/solution.py"
+    ]
+  },
+  "runtime": {
+    "budget_minutes": 120,
+    "root_role": "Experiment Manager",
+    "root_source_writes": 0,
+    "max_live_agents": 5,
+    "max_concurrent_llm": 5,
+    "task_repo": "",
+    "source_isolation": "shared-tree-serial",
+    "merge_policy": "runtime-judge-gated",
+    "build_gate": "official-sforge-submit",
+    "best_green_gate": "judge-valid && score>=best",
+    "snapshot_enabled": true,
+    "snapshot_paths": [
+      "solution/solution.py"
+    ],
+    "services": {
+      "verification_gate": {
+        "owner": "runtime",
+        "argv": [
+          "sforge-submit"
+        ],
+        "shell": false,
+        "timeout_seconds": 1980,
+        "acceptance": "judge-valid-nondecreasing",
+        "score_direction": "maximize",
+        "always_run": true
+      }
+    },
+    "completion_checkpoint": "",
+    "nodes": [
+      {
+        "id": "model-a",
+        "role": "Model Worker A",
+        "assignment": "现有 MLP/邻域特征强 baseline",
+        "guide": "只拥有当前工作流，在隔离环境中交付可验证结果。",
+        "spawn_parent": "root",
+        "depends_on": [],
+        "start_minute": 7,
+        "end_minute": 78,
+        "mode": "progress",
+        "progress_logic": "all",
+        "min_parent_turns": 2,
+        "min_parent_tool_calls": 3,
+        "min_parent_age_seconds": 90,
+        "read_only": false,
+        "allowed_paths": [
+          "*"
+        ],
+        "spawn_executor": "parent_agent",
+        "spawn_tool": "nanoma"
+      },
+      {
+        "id": "model-b",
+        "role": "Model Worker B",
+        "assignment": "轻量 GNN 或标签传播变体",
+        "guide": "只拥有当前工作流，在隔离环境中交付可验证结果。",
+        "spawn_parent": "root",
+        "depends_on": [],
+        "start_minute": 7,
+        "end_minute": 82,
+        "mode": "progress",
+        "progress_logic": "all",
+        "min_parent_turns": 2,
+        "min_parent_tool_calls": 3,
+        "min_parent_age_seconds": 90,
+        "read_only": false,
+        "allowed_paths": [
+          "*"
+        ],
+        "spawn_executor": "parent_agent",
+        "spawn_tool": "nanoma"
+      },
+      {
+        "id": "auditor",
+        "role": "Data / Numerics Auditor",
+        "assignment": "特征增强与校准路线",
+        "guide": "只拥有当前工作流，在隔离环境中交付可验证结果。",
+        "spawn_parent": "root",
+        "depends_on": [],
+        "start_minute": 7,
+        "end_minute": 100,
+        "mode": "progress",
+        "progress_logic": "all",
+        "min_parent_turns": 2,
+        "min_parent_tool_calls": 3,
+        "min_parent_age_seconds": 90,
+        "read_only": false,
+        "allowed_paths": [
+          "*"
+        ],
+        "spawn_executor": "parent_agent",
+        "spawn_tool": "nanoma"
+      },
+      {
+        "id": "selector",
+        "role": "Checkpoint Selector",
+        "assignment": "固定 split、泄漏审计与模型选择",
+        "guide": "只拥有当前工作流，在隔离环境中交付可验证结果。",
+        "spawn_parent": "root",
+        "depends_on": [
+          "spawn-model-a",
+          "spawn-model-b"
+        ],
+        "start_minute": 54,
+        "end_minute": 118,
+        "mode": "settled",
+        "progress_logic": "all",
+        "min_parent_turns": 2,
+        "min_parent_tool_calls": 3,
+        "min_parent_age_seconds": 90,
+        "read_only": false,
+        "allowed_paths": [
+          "*"
+        ],
+        "spawn_executor": "parent_agent",
+        "spawn_tool": "nanoma"
+      }
+    ],
+    "checkpoint_action": "steer_parent_spawn_tool",
+    "spawn_execution": "parent_agent_via_nanoma_tool",
+    "runtime_creates_agents": false
+  }
+}

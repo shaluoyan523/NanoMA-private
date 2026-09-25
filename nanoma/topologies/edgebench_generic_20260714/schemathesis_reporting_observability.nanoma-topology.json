@@ -1,0 +1,192 @@
+{
+  "schema_version": 2,
+  "source": "edgebench_multiagent_topology_simulator.html",
+  "task": {
+    "id": "schemathesis_reporting_observability",
+    "title": "Schemathesis Reporting Observability",
+    "category": "Systems & Software Engineering",
+    "plan": "P1",
+    "objective": "把事件、输出、持久化和诊断各设独立 Target，先过健康检查再并行。",
+    "streams": [
+      "Event model 与 hooks",
+      "Terminal/CI reporting",
+      "持久化、序列化与 artifacts",
+      "Observability 测试和跨 Target 集成"
+    ],
+    "gates": [
+      "每个 Worker 首轮可读写并运行测试",
+      "Target commit 可独立回滚",
+      "Root 在 child 失败时立即接管一个关键 Target"
+    ],
+    "risk_flags": [
+      "A",
+      "I",
+      "M"
+    ],
+    "edgebench_cwd": "/app",
+    "submit_paths": [
+      "."
+    ]
+  },
+  "runtime": {
+    "budget_minutes": 120,
+    "root_role": "Root / Integrator",
+    "root_source_writes": 0,
+    "max_live_agents": 7,
+    "max_concurrent_llm": 6,
+    "task_repo": "",
+    "source_isolation": "shared-tree-serial",
+    "merge_policy": "runtime-judge-gated",
+    "build_gate": "official-sforge-submit",
+    "best_green_gate": "judge-valid && score>=best",
+    "snapshot_enabled": true,
+    "snapshot_paths": [
+      "."
+    ],
+    "services": {
+      "verification_gate": {
+        "owner": "runtime",
+        "argv": [
+          "sforge-submit"
+        ],
+        "shell": false,
+        "timeout_seconds": 1980,
+        "acceptance": "judge-valid-nondecreasing",
+        "score_direction": "maximize",
+        "always_run": true
+      }
+    },
+    "completion_checkpoint": "spawn-verifier",
+    "nodes": [
+      {
+        "id": "scout",
+        "role": "Requirement Scout",
+        "assignment": "扫描并拆解：Event model 与 hooks / Terminal/CI reporting / 持久化、序列化与 artifacts / Observability 测试和跨 Target 集成",
+        "guide": "只读扫描任务、测试和依赖，尽早形成可执行验收矩阵。",
+        "spawn_parent": "root",
+        "depends_on": [],
+        "start_minute": 0,
+        "end_minute": 12,
+        "mode": "progress",
+        "progress_logic": "all",
+        "min_parent_turns": 0,
+        "min_parent_tool_calls": 0,
+        "min_parent_age_seconds": 0,
+        "read_only": true,
+        "allowed_paths": [],
+        "spawn_executor": "parent_agent",
+        "spawn_tool": "nanoma"
+      },
+      {
+        "id": "lead-a",
+        "role": "Module Lead A",
+        "assignment": "Event model 与 hooks",
+        "guide": "只拥有当前工作流，在隔离环境中交付可验证结果。",
+        "spawn_parent": "root",
+        "depends_on": [],
+        "start_minute": 8,
+        "end_minute": 72,
+        "mode": "progress",
+        "progress_logic": "all",
+        "min_parent_turns": 2,
+        "min_parent_tool_calls": 3,
+        "min_parent_age_seconds": 90,
+        "read_only": false,
+        "allowed_paths": [
+          "*"
+        ],
+        "spawn_executor": "parent_agent",
+        "spawn_tool": "nanoma"
+      },
+      {
+        "id": "lead-b",
+        "role": "Module Lead B",
+        "assignment": "Terminal/CI reporting",
+        "guide": "只拥有当前工作流，在隔离环境中交付可验证结果。",
+        "spawn_parent": "root",
+        "depends_on": [],
+        "start_minute": 8,
+        "end_minute": 72,
+        "mode": "progress",
+        "progress_logic": "all",
+        "min_parent_turns": 2,
+        "min_parent_tool_calls": 3,
+        "min_parent_age_seconds": 90,
+        "read_only": false,
+        "allowed_paths": [
+          "*"
+        ],
+        "spawn_executor": "parent_agent",
+        "spawn_tool": "nanoma"
+      },
+      {
+        "id": "worker-a",
+        "role": "Worker A1",
+        "assignment": "持久化、序列化与 artifacts",
+        "guide": "只拥有当前工作流，在隔离环境中交付可验证结果。",
+        "spawn_parent": "lead-a",
+        "depends_on": [
+          "spawn-lead-a"
+        ],
+        "start_minute": 20,
+        "end_minute": 58,
+        "mode": "progress",
+        "progress_logic": "all",
+        "min_parent_turns": 4,
+        "min_parent_tool_calls": 5,
+        "min_parent_age_seconds": 180,
+        "read_only": false,
+        "allowed_paths": [
+          "*"
+        ],
+        "spawn_executor": "parent_agent",
+        "spawn_tool": "nanoma"
+      },
+      {
+        "id": "worker-b",
+        "role": "Worker B1",
+        "assignment": "Observability 测试和跨 Target 集成",
+        "guide": "只拥有当前工作流，在隔离环境中交付可验证结果。",
+        "spawn_parent": "lead-b",
+        "depends_on": [
+          "spawn-lead-b"
+        ],
+        "start_minute": 20,
+        "end_minute": 58,
+        "mode": "progress",
+        "progress_logic": "all",
+        "min_parent_turns": 4,
+        "min_parent_tool_calls": 5,
+        "min_parent_age_seconds": 180,
+        "read_only": false,
+        "allowed_paths": [
+          "*"
+        ],
+        "spawn_executor": "parent_agent",
+        "spawn_tool": "nanoma"
+      },
+      {
+        "id": "verifier",
+        "role": "Regression Verifier",
+        "assignment": "每个 Worker 首轮可读写并运行测试；Target commit 可独立回滚；Root 在 child 失败时立即接管一个关键 Target",
+        "guide": "独立检查构建、功能、必需产物和 best-green 回归。",
+        "spawn_parent": "root",
+        "depends_on": [],
+        "start_minute": 68,
+        "end_minute": 114,
+        "mode": "settled",
+        "progress_logic": "all",
+        "min_parent_turns": 2,
+        "min_parent_tool_calls": 3,
+        "min_parent_age_seconds": 90,
+        "read_only": true,
+        "allowed_paths": [],
+        "spawn_executor": "parent_agent",
+        "spawn_tool": "nanoma"
+      }
+    ],
+    "checkpoint_action": "steer_parent_spawn_tool",
+    "spawn_execution": "parent_agent_via_nanoma_tool",
+    "runtime_creates_agents": false
+  }
+}

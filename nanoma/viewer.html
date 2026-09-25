@@ -1,0 +1,660 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<script>
+// Ensure base href ends with / for relative fetch() to work behind reverse proxy
+if (!window.location.pathname.endsWith('/')) {
+  window.location.replace(window.location.href + '/');
+}
+</script>
+<title>NanoMA Trace Debugger</title>
+<style>
+:root {
+  --bg-0: #0a0e14; --bg-1: #0f1419; --bg-2: #1a1f26; --bg-3: #242b33;
+  --border: #2d353e; --text: #bfc7d5; --text-dim: #6e7681; --text-bright: #f0f6fc;
+  --blue: #58a6ff; --green: #3fb950; --yellow: #d29922; --red: #f85149;
+  --purple: #bc8cff; --pink: #f778ba; --cyan: #79c0ff; --orange: #d18616;
+}
+* { box-sizing: border-box; margin: 0; padding: 0; }
+body { font-family: 'JetBrains Mono','SF Mono','Fira Code',monospace; background: var(--bg-0); color: var(--text); font-size: 12px; line-height: 1.5; overflow: hidden; height: 100vh; }
+
+.hdr { background: var(--bg-1); border-bottom: 1px solid var(--border); padding: 8px 16px; display: flex; align-items: center; gap: 20px; }
+.hdr h1 { font-size: 14px; color: var(--blue); white-space: nowrap; }
+.pills { display: flex; gap: 10px; flex-wrap: wrap; }
+.pill { background: var(--bg-2); border: 1px solid var(--border); border-radius: 4px; padding: 2px 8px; font-size: 11px; }
+.pill b { color: var(--text-bright); }
+
+.layout { display: grid; grid-template-columns: 280px 1fr; height: calc(100vh - 40px); }
+
+/* Sidebar */
+.sidebar { background: var(--bg-1); border-right: 1px solid var(--border); overflow-y: auto; padding: 8px; }
+.stitle { font-size: 10px; text-transform: uppercase; letter-spacing: 1px; color: var(--text-dim); padding: 6px 8px 4px; }
+.acard { background: var(--bg-0); border: 1px solid var(--border); border-radius: 6px; margin-bottom: 5px; cursor: pointer; transition: border-color .15s; }
+.acard:hover { border-color: #3d4450; }
+.acard.sel { border-color: var(--blue); box-shadow: inset 3px 0 0 var(--blue); }
+.ac-h { padding: 7px 10px 4px; display: flex; justify-content: space-between; align-items: center; }
+.ac-h .n { font-weight: 700; font-size: 12px; }
+.badge { font-size: 9px; padding: 1px 5px; border-radius: 3px; font-weight: 600; text-transform: uppercase; letter-spacing: 0.3px; }
+.b-running { background: #23883520; color: var(--green); border: 1px solid #238835; }
+.b-done { background: #1f6feb20; color: var(--blue); border: 1px solid #1f6feb; }
+.b-failed { background: #f8514920; color: var(--red); border: 1px solid #f85149; }
+.ac-b { padding: 2px 10px 8px; font-size: 10px; color: var(--text-dim); }
+.ac-b .task { color: #7ee787; margin-bottom: 3px; display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; }
+.ac-b .sg { display: grid; grid-template-columns: 1fr 1fr; gap: 1px 6px; }
+.ac-b .sg b { color: var(--text); }
+
+/* Main */
+.main { display: flex; flex-direction: column; overflow: hidden; }
+.toolbar { background: var(--bg-1); border-bottom: 1px solid var(--border); padding: 5px 12px; display: flex; gap: 6px; align-items: center; flex-shrink: 0; }
+.toolbar .lbl { color: var(--text-dim); font-size: 10px; }
+.toolbar select, .toolbar input { background: var(--bg-2); border: 1px solid var(--border); color: var(--text); padding: 2px 6px; border-radius: 3px; font-size: 11px; font-family: inherit; }
+.btn { background: var(--bg-3); border: 1px solid var(--border); color: var(--text); padding: 3px 8px; border-radius: 3px; font-size: 10px; cursor: pointer; font-family: inherit; }
+.btn:hover { background: var(--blue); color: var(--bg-0); }
+.btn.on { background: var(--blue); color: var(--bg-0); border-color: var(--blue); }
+
+.split { display: flex; flex: 1; overflow: hidden; }
+.ev-panel { flex: 1; overflow-y: auto; border-right: 1px solid var(--border); }
+.detail-panel { width: 0; overflow-y: auto; transition: width .2s; background: var(--bg-1); }
+.detail-panel.open { width: 50%; min-width: 400px; }
+
+/* Events */
+.ev { display: grid; grid-template-columns: 58px 72px 82px 1fr; gap: 4px; padding: 3px 10px; border-left: 3px solid transparent; align-items: start; cursor: pointer; }
+.ev:hover { background: var(--bg-2); }
+.ev.active { background: var(--bg-3); border-left-color: var(--yellow) !important; }
+.ev .ts { color: var(--text-dim); font-variant-numeric: tabular-nums; }
+.ev .an { font-weight: 600; font-size: 11px; }
+.ev .et { padding: 0 5px; border-radius: 3px; font-size: 9px; font-weight: 700; text-align: center; }
+.ev .dt { color: var(--text-dim); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; font-size: 11px; }
+.ev .dt b { color: var(--text); font-weight: normal; }
+
+.ev-agent_new { border-left-color: var(--blue); } .ev-agent_new .et { background: #1f6feb30; color: var(--blue); }
+.ev-llm_done { border-left-color: var(--green); } .ev-llm_done .et { background: #23883530; color: var(--green); }
+.ev-tool_call { border-left-color: var(--yellow); } .ev-tool_call .et { background: #9e6a0330; color: var(--yellow); }
+.ev-spawn { border-left-color: var(--purple); background: #8957e508; } .ev-spawn .et { background: #8957e530; color: var(--purple); }
+.ev-send { border-left-color: var(--pink); border-left-width: 4px; background: #f778ba08; } .ev-send .et { background: #f778ba30; color: var(--pink); }
+.ev-interrupt { border-left-color: var(--orange); border-left-width: 4px; background: #d1861608; } .ev-interrupt .et { background: #d1861630; color: var(--orange); }
+.ev-kill { border-left-color: var(--red); } .ev-kill .et { background: #f8514930; color: var(--red); }
+.ev-done { border-left-color: var(--cyan); } .ev-done .et { background: #79c0ff30; color: var(--cyan); }
+.ev-failed { border-left-color: var(--red); } .ev-failed .et { background: #f8514930; color: var(--red); }
+
+/* Agent colors */
+.c0{color:#58a6ff}.c1{color:#3fb950}.c2{color:#d29922}.c3{color:#bc8cff}
+.c4{color:#f778ba}.c5{color:#79c0ff}.c6{color:#d18616}.c7{color:#a5d6ff}
+
+/* Detail panel */
+.dp-hdr { padding: 12px 16px; border-bottom: 1px solid var(--border); display: flex; justify-content: space-between; align-items: center; position: sticky; top: 0; background: var(--bg-1); z-index: 1; }
+.dp-hdr h2 { font-size: 13px; color: var(--blue); }
+.dp-close { cursor: pointer; color: var(--text-dim); font-size: 18px; }
+.dp-close:hover { color: var(--red); }
+.dp-section { border-bottom: 1px solid var(--border); padding: 12px 16px; }
+.dp-section h3 { font-size: 11px; color: var(--text-dim); text-transform: uppercase; letter-spacing: 0.5px; margin-bottom: 8px; }
+.dp-kv { display: grid; grid-template-columns: 100px 1fr; gap: 4px 12px; font-size: 11px; margin-bottom: 4px; }
+.dp-kv .k { color: var(--text-dim); }
+.dp-kv .v { color: var(--text-bright); word-break: break-all; }
+
+.msg-list { display: flex; flex-direction: column; gap: 8px; }
+.msg { border: 1px solid var(--border); border-radius: 6px; overflow: hidden; }
+.msg-hdr { padding: 5px 10px; font-size: 10px; font-weight: 700; text-transform: uppercase; display: flex; justify-content: space-between; }
+.msg-hdr.system { background: #1f6feb15; color: var(--blue); }
+.msg-hdr.user { background: #23883515; color: var(--green); }
+.msg-hdr.assistant { background: #8957e515; color: var(--purple); }
+.msg-hdr.tool { background: #9e6a0315; color: var(--yellow); }
+.msg-body { padding: 8px 10px; font-size: 11px; white-space: pre-wrap; word-break: break-word; max-height: 300px; overflow-y: auto; color: var(--text); line-height: 1.6; }
+.msg-body.collapsed { max-height: 80px; overflow: hidden; position: relative; }
+.msg-body.collapsed::after { content:''; position:absolute; bottom:0; left:0; right:0; height:30px; background: linear-gradient(transparent, var(--bg-1)); }
+.msg-toggle { padding: 3px 10px; font-size: 10px; color: var(--blue); cursor: pointer; background: var(--bg-2); text-align: center; }
+
+.tc-block { background: var(--bg-2); border: 1px solid var(--border); border-radius: 4px; padding: 8px 10px; margin-top: 6px; font-size: 11px; }
+.tc-block .tc-name { color: var(--yellow); font-weight: 700; }
+.tc-block pre { margin-top: 4px; white-space: pre-wrap; color: var(--text-dim); max-height: 200px; overflow-y: auto; }
+
+.resp-content { background: var(--bg-2); border-radius: 4px; padding: 10px; white-space: pre-wrap; word-break: break-word; font-size: 11px; max-height: 400px; overflow-y: auto; line-height: 1.6; }
+.usage-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 8px; }
+.usage-box { background: var(--bg-2); border-radius: 4px; padding: 8px; text-align: center; }
+.usage-box .num { font-size: 16px; font-weight: 700; color: var(--text-bright); }
+.usage-box .lbl { font-size: 9px; color: var(--text-dim); text-transform: uppercase; }
+
+/* Comm Map Overlay */
+.comm-overlay { position:fixed; top:0; left:0; right:0; bottom:0; background:var(--bg-0); z-index:1000; display:none; flex-direction:column; padding:16px; }
+.comm-overlay.show { display:flex; }
+.comm-overlay .close-btn { position:absolute; top:12px; right:20px; font-size:28px; color:var(--text-dim); cursor:pointer; z-index:1001; }
+.comm-overlay .close-btn:hover { color:var(--red); }
+.comm-overlay h2 { color:var(--blue); font-size:16px; margin-bottom:8px; }
+.comm-overlay .legend { font-size:11px; color:var(--text-dim); margin-top:8px; }
+.comm-overlay .stats-row { display:flex; gap:20px; font-size:11px; color:var(--text); margin-top:8px; background:var(--bg-2); padding:8px 16px; border-radius:6px; flex-wrap:wrap; }
+.comm-overlay #commContainer { flex:1; background:var(--bg-1); border-radius:12px; border:1px solid var(--border); overflow:hidden; min-height:0; }
+.comm-overlay #commContainer svg { width:100%; height:100%; }
+</style>
+</head>
+<body>
+<div class="hdr">
+  <h1>&#x1f50d; NanoMA Trace</h1>
+  <div class="pills">
+    <span class="pill">Agents: <b id="s-ag">0</b></span>
+    <span class="pill">Events: <b id="s-ev">0</b></span>
+    <span class="pill">LLM: <b id="s-llm">0</b></span>
+    <span class="pill">Tokens: <b id="s-tok">0</b></span>
+    <span class="pill">Cache: <b id="s-cache">0%</b></span>
+    <span class="pill">Cost: <b id="s-cost">$0</b></span>
+    <span class="pill">Wall: <b id="s-wall">0s</b></span>
+  </div>
+</div>
+<div class="layout">
+<div class="sidebar"><div class="stitle">Agents</div><div id="alist"></div></div>
+<div class="main">
+  <div class="toolbar">
+    <span class="lbl">Type:</span>
+    <button class="btn on" data-f="all" onclick="filt(this)">All</button>
+    <button class="btn" data-f="llm_done" onclick="filt(this)">LLM</button>
+    <button class="btn" data-f="tool_call" onclick="filt(this)">Tools</button>
+    <button class="btn" data-f="spawn,agent_new" onclick="filt(this)">Spawn</button>
+    <button class="btn" data-f="send,interrupt" onclick="filt(this)">Msgs</button>
+    <button class="btn" data-f="done,failed" onclick="filt(this)">End</button>
+    <select id="af" onchange="filterAgent=this.value;render()"><option value="">All agents</option></select>
+    <button class="btn" onclick="document.querySelector('.ev-panel').scrollTop=999999">&#8595;</button>
+    <button class="btn" onclick="showCommMap()" style="margin-left:auto;background:#8957e530;border-color:#8957e5;color:#bc8cff">&#9993; Comm Map</button>
+  </div>
+  <div class="split">
+    <div class="ev-panel" id="evp"></div>
+    <div class="detail-panel" id="dp"></div>
+  </div>
+</div>
+</div>
+<script>
+let events=[],agents={},agOrder=[],lastLen=0,filterType='all',filterAgent='';
+let totTok=0,totCached=0,totCost=0,totLLM=0,llmN=0,wallT=0,startTs=0;
+let llmLogs=[],activeEvIdx=-1;
+
+function $(id){return document.getElementById(id)}
+function esc(s){return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;')}
+function col(id){return 'c'+(agOrder.indexOf(id)%8)}
+function fmtVal(v){return esc(typeof v==='object'?JSON.stringify(v):String(v??''))}
+
+function filt(btn){
+  filterType=btn.dataset.f;
+  document.querySelectorAll('.toolbar .btn').forEach(b=>b.classList.remove('on'));
+  btn.classList.add('on');
+  render();
+}
+
+function selAgent(id){
+  filterAgent=(filterAgent===id)?'':id;
+  $('af').value=filterAgent;
+  document.querySelectorAll('.acard').forEach(c=>c.classList.toggle('sel',c.dataset.id===filterAgent));
+  render();
+}
+
+function renderAgents(){
+  let h='';
+  for(const id of agOrder){
+    const a=agents[id],st=a.status||'running';
+    h+=`<div class="acard${filterAgent===id?' sel':''}" data-id="${id}" onclick="selAgent('${id}')">
+    <div class="ac-h"><span class="n ${col(id)}">${id}</span><span class="badge b-${st}">${st}</span></div>
+    <div class="ac-b"><div class="task">${esc(a.task||'')}</div>
+    <div class="sg"><span>model:<b>${a.model||'?'}</b></span><span>depth:<b>${a.depth||0}</b></span>
+    <span>tok:<b>${(a.tok||0).toLocaleString()}</b></span><span>$:<b>${(a.cost||0).toFixed(4)}</b></span>
+    <span>llm:<b>${a.llmN||0}</b></span><span>tools:<b>${a.tcN||0}</b></span>
+    <span>msg:<b>${a.ms||0}&#8593;${a.mr||0}&#8595;</b></span><span>t:<b>${((a.lt||0)/1000).toFixed(1)}s</b></span></div>
+    ${a.parent?`<span style="color:var(--purple)">&#8598; ${a.parent}</span>`:''}</div></div>`;
+  }
+  $('alist').innerHTML=h;
+  let o='<option value="">All agents</option>';
+  agOrder.forEach(id=>o+=`<option value="${id}">${id}</option>`);
+  $('af').innerHTML=o; $('af').value=filterAgent;
+}
+
+function fmtDt(ev){
+  const d=ev.data;
+  switch(ev.type){
+    case 'agent_new': return `model=<b>${d.model}</b> skill=<b>${d.skill}</b> budget=<b>$${(d.budget||0).toFixed(2)}</b>`;
+    case 'llm_done': return `tok=<b>${d.tokens}</b> cache=<b>${d.cached||0}</b> $<b>${(d.cost||0).toFixed(5)}</b> <b>${(d.elapsed_ms||0).toFixed(0)}ms</b>`;
+    case 'tool_call': return `<b>${d.tool}</b>(${esc(Object.values(d.args||{}).join(', ').slice(0,60))}) ${(d.elapsed_ms||0).toFixed(0)}ms`;
+    case 'spawn': return `&#8594; <b>${d.child}</b> "${esc((d.task||'').slice(0,50))}"`;
+    case 'send': {
+      const msg=(d.message||'').slice(0,50);
+      const from=d.from||ev.agent||'?';
+      const to=d.to||'?';
+      return `<span style="color:#3fb950;font-weight:bold">${esc(from)}</span> <span style="color:#8b949e">-&gt;</span> <span style="color:#58a6ff;font-weight:bold">${esc(to)}</span> (${d.tokens||0}tok) "${esc(msg)}${(d.message||'').length>50?'…':''}"`;
+    }
+    case 'interrupt': {
+      const skipped=(d.skipped_tools||[]).map(t=>t.tool).join(', ');
+      return `mode=<b>${esc(d.mode||'')}</b> skipped=<b>${esc(skipped||'none')}</b>`;
+    }
+    case 'kill': return `&#9760; <b>${d.target}</b>`;
+    case 'done': return `turns=<b>${d.turns}</b> tok=<b>${d.tokens}</b>`;
+    case 'failed': return `turns=<b>${d.turns||'?'}</b>`;
+    default: return esc(JSON.stringify(d).slice(0,80));
+  }
+}
+
+function render(){
+  const types=filterType==='all'?null:filterType.split(',');
+  let h='';
+  for(let i=0;i<events.length;i++){
+    const ev=events[i];
+    if(types&&!types.includes(ev.type))continue;
+    if(filterAgent&&ev.agent!==filterAgent)continue;
+    const act=i===activeEvIdx?' active':'';
+    h+=`<div class="ev ev-${ev.type}${act}" data-i="${i}" onclick="showDetail(${i})">
+      <span class="ts">${ev.rel_ts!==undefined?ev.rel_ts.toFixed(2)+'s':''}</span>
+      <span class="an ${col(ev.agent)}">${ev.agent}</span>
+      <span class="et">${ev.type}</span>
+      <span class="dt">${fmtDt(ev)}</span></div>`;
+  }
+  $('evp').innerHTML=h||'<div style="padding:20px;color:var(--text-dim)">No events</div>';
+}
+
+function updateStats(){
+  $('s-ag').textContent=agOrder.length;
+  $('s-ev').textContent=events.length;
+  $('s-llm').textContent=llmN;
+  $('s-tok').textContent=totTok.toLocaleString();
+  $('s-cache').textContent=totTok?(totCached/totTok*100|0)+'%':'0%';
+  $('s-cost').textContent='$'+totCost.toFixed(4);
+  $('s-wall').textContent=wallT.toFixed(1)+'s';
+}
+
+function processEvent(ev){
+  if(ev.type==='start'){startTs=ev.ts;return}
+  events.push(ev);
+  const a=ev.agent;
+  if(ev.type==='agent_new'){agents[a]={...ev.data,status:'running',tok:0,cost:0,llmN:0,tcN:0,lt:0,ms:0,mr:0};agOrder.push(a)}
+  if(ev.type==='llm_done'&&agents[a]){agents[a].tok+=(ev.data.tokens||0);agents[a].cost+=(ev.data.cost||0);agents[a].llmN++;agents[a].lt+=(ev.data.elapsed_ms||0);totTok+=(ev.data.tokens||0);totCached+=(ev.data.cached||0);totCost+=(ev.data.cost||0);totLLM+=(ev.data.elapsed_ms||0);llmN++}
+  if(ev.type==='tool_call'&&agents[a])agents[a].tcN++;
+  if(ev.type==='send'){if(agents[a])agents[a].ms++;if(ev.data.to&&agents[ev.data.to])agents[ev.data.to].mr++}
+  if(ev.type==='done'&&agents[a])agents[a].status='done';
+  if((ev.type==='failed'||ev.type==='error')&&agents[a])agents[a].status='failed';
+  if(ev.rel_ts!==undefined&&ev.rel_ts>wallT)wallT=ev.rel_ts;
+}
+
+// --- Detail panel: show full LLM log ---
+async function showDetail(idx){
+  activeEvIdx=idx;
+  render(); // highlight
+  const ev=events[idx];
+  const dp=$('dp');
+  dp.classList.add('open');
+
+  if(ev.type==='llm_done'){
+    // Find matching LLM log file by timestamp
+    const evTs=ev.rel_ts;
+    const log=await findLLMLog(ev);
+    if(log) renderLLMDetail(log);
+    else dp.innerHTML=`<div class="dp-hdr"><h2>LLM Call</h2><span class="dp-close" onclick="closeDP()">&#x2715;</span></div><div class="dp-section"><p>Log file not found. Data from event:</p><pre>${esc(JSON.stringify(ev.data,null,2))}</pre></div>`;
+  } else if(ev.type==='send'){
+    const d=ev.data;
+    const args=d.args||{};
+    let h=`<div class="dp-hdr"><h2>&#9993; Send Message</h2><span class="dp-close" onclick="closeDP()">&#x2715;</span></div>`;
+    h+=`<div class="dp-section"><h3>Delivery</h3><div class="dp-kv">
+      <span class="k">from</span><span class="v">${esc(d.from||ev.agent)}</span>
+      <span class="k">to</span><span class="v">${fmtVal(d.to)}</span>
+      <span class="k">requested_to</span><span class="v">${fmtVal(d.requested_to??args.to??d.to)}</span>
+      <span class="k">mode</span><span class="v">${esc(d.mode||args.mode||'queue')}</span>
+      <span class="k">tokens</span><span class="v">${d.tokens||0}</span>
+      <span class="k">delivered_count</span><span class="v">${d.delivered_count||1}</span>
+      <span class="k">message_chars</span><span class="v">${d.message_chars??(d.message||'').length}</span>
+    </div></div>`;
+    h+=`<div class="dp-section"><h3>Parameters</h3><pre style="white-space:pre-wrap;color:var(--text)">${esc(JSON.stringify(args,null,2))}</pre></div>`;
+    h+=`<div class="dp-section"><h3>Message</h3><div class="resp-content">${esc(d.message||args.message||'')}</div></div>`;
+    dp.innerHTML=h;
+  } else if(ev.type==='interrupt'){
+    const d=ev.data;
+    let h=`<div class="dp-hdr"><h2>&#9888; Interrupt</h2><span class="dp-close" onclick="closeDP()">&#x2715;</span></div>`;
+    h+=`<div class="dp-section"><h3>Cause</h3><div class="dp-kv">
+      <span class="k">agent</span><span class="v">${esc(ev.agent)}</span>
+      <span class="k">reason</span><span class="v">${esc(d.reason||'')}</span>
+      <span class="k">mode</span><span class="v">${esc(d.mode||'')}</span>
+      <span class="k">interrupted_after</span><span class="v">${d.interrupted_after??''}</span>
+      <span class="k">skipped_tools</span><span class="v">${(d.skipped_tools||[]).length}</span>
+    </div></div>`;
+    h+=`<div class="dp-section"><h3>Trigger Messages</h3><pre style="white-space:pre-wrap;color:var(--text)">${esc(JSON.stringify(d.messages||[],null,2))}</pre></div>`;
+    h+=`<div class="dp-section"><h3>Skipped Tools</h3><pre style="white-space:pre-wrap;color:var(--yellow)">${esc(JSON.stringify(d.skipped_tools||[],null,2))}</pre></div>`;
+    dp.innerHTML=h;
+  } else if(ev.type==='tool_call'){
+    const d=ev.data;
+    let h=`<div class="dp-hdr"><h2>&#9881; ${esc(d.tool||'')}</h2><span class="dp-close" onclick="closeDP()">&#x2715;</span></div>`;
+    h+=`<div class="dp-section"><h3>Agent</h3><div class="dp-kv"><span class="k">agent</span><span class="v">${esc(ev.agent)}</span><span class="k">elapsed</span><span class="v">${(d.elapsed_ms||0).toFixed(1)}ms</span></div></div>`;
+    h+=`<div class="dp-section"><h3>Arguments</h3><pre style="white-space:pre-wrap;color:var(--text);max-height:300px;overflow:auto">${esc(typeof d.args==='object'?JSON.stringify(d.args,null,2):(d.args||'(none)'))}</pre></div>`;
+    // Try to pretty-print result as JSON
+    let resultStr=d.result||'(none)';
+    try{ const parsed=JSON.parse(resultStr); resultStr=JSON.stringify(parsed,null,2); }catch(e){}
+    h+=`<div class="dp-section"><h3>Result</h3><pre style="white-space:pre-wrap;color:var(--green);max-height:400px;overflow:auto">${esc(resultStr)}</pre></div>`;
+    dp.innerHTML=h;
+  } else {
+    dp.innerHTML=`<div class="dp-hdr"><h2>${ev.type}</h2><span class="dp-close" onclick="closeDP()">&#x2715;</span></div>
+    <div class="dp-section"><h3>Event Data</h3><pre style="white-space:pre-wrap;color:var(--text)">${esc(JSON.stringify(ev.data,null,2))}</pre></div>`;
+  }
+}
+
+function closeDP(){ $('dp').classList.remove('open'); activeEvIdx=-1; render(); }
+
+async function findLLMLog(ev){
+  if(!llmLogs.length){
+    const r=await fetch('./api/llm-logs');
+    const d=await r.json();
+    llmLogs=d.logs||[];
+  }
+  // Match by elapsed_ms in filename timestamp vs event rel_ts
+  // LLM logs are sorted by time. Find the Nth llm_done event to get the Nth log file.
+  let llmIdx=0;
+  for(let i=0;i<events.length;i++){
+    if(events[i]===ev)break;
+    if(events[i].type==='llm_done')llmIdx++;
+  }
+  if(llmIdx<llmLogs.length){
+    const file=llmLogs[llmIdx].file;
+    const r=await fetch('./api/llm-log?file='+encodeURIComponent(file));
+    return await r.json();
+  }
+  return null;
+}
+
+function renderLLMDetail(log){
+  const dp=$('dp');
+  const req=log.request||{};
+  const resp=log.response||{};
+  const msgs=req.messages||[];
+  const tools=req.tools||[];
+  const choice=(resp.choices||[{}])[0];
+  const msg=choice.message||{};
+  const usage=resp.usage||{};
+
+  let h=`<div class="dp-hdr"><h2>LLM Call Detail</h2><span class="dp-close" onclick="closeDP()">&#x2715;</span></div>`;
+
+  // Request params
+  h+=`<div class="dp-section"><h3>Request Parameters</h3><div class="dp-kv">
+    <span class="k">model</span><span class="v">${req.model||''}</span>
+    <span class="k">temperature</span><span class="v">${req.temperature}</span>
+    <span class="k">max_tokens</span><span class="v">${req.max_tokens}</span>
+    <span class="k">tool_choice</span><span class="v">${req.tool_choice||'none'}</span>
+    <span class="k">tools</span><span class="v">${tools.length} tool(s) defined</span>
+    <span class="k">latency</span><span class="v">${(log.elapsed_ms||0).toFixed(0)}ms</span>
+  </div></div>`;
+
+  // Usage
+  h+=`<div class="dp-section"><h3>Token Usage</h3><div class="usage-grid">
+    <div class="usage-box"><div class="num">${usage.prompt_tokens||0}</div><div class="lbl">Input</div></div>
+    <div class="usage-box"><div class="num">${usage.completion_tokens||0}</div><div class="lbl">Output</div></div>
+    <div class="usage-box"><div class="num">${usage.total_tokens||0}</div><div class="lbl">Total</div></div>
+    <div class="usage-box"><div class="num">${usage.prompt_cache_hit_tokens||0}</div><div class="lbl">Cache Hit</div></div>
+    <div class="usage-box"><div class="num">${usage.prompt_cache_miss_tokens||0}</div><div class="lbl">Cache Miss</div></div>
+    <div class="usage-box"><div class="num">${(usage.completion_tokens_details||{}).reasoning_tokens||0}</div><div class="lbl">Reasoning</div></div>
+  </div></div>`;
+
+  // Messages (input)
+  h+=`<div class="dp-section"><h3>Messages (${msgs.length})</h3><div class="msg-list">`;
+  for(const m of msgs){
+    const role=m.role||'unknown';
+    let body=m.content||'';
+    if(typeof body!=='string') body=JSON.stringify(body,null,2);
+    const long=body.length>300;
+    h+=`<div class="msg"><div class="msg-hdr ${role}"><span>${role}</span><span>${body.length} chars</span></div>
+      <div class="msg-body${long?' collapsed':''}">${esc(body)}</div>
+      ${long?'<div class="msg-toggle" onclick="this.previousElementSibling.classList.toggle(\'collapsed\');this.textContent=this.textContent===\'expand\'?\'collapse\':\'expand\'">expand</div>':''}
+    </div>`;
+    // Show tool_calls in assistant message
+    if(m.tool_calls){
+      for(const tc of m.tool_calls){
+        const fn=tc.function||{};
+        h+=`<div class="tc-block"><span class="tc-name">&#9881; ${fn.name}</span><pre>${esc(fn.arguments||'')}</pre></div>`;
+      }
+    }
+  }
+  h+=`</div></div>`;
+
+  // Response
+  h+=`<div class="dp-section"><h3>Response</h3>`;
+  if(msg.content){
+    h+=`<div class="resp-content">${esc(msg.content)}</div>`;
+  }
+  if(msg.tool_calls&&msg.tool_calls.length){
+    h+=`<div style="margin-top:8px"><b style="color:var(--yellow)">Tool Calls (${msg.tool_calls.length}):</b></div>`;
+    for(const tc of msg.tool_calls){
+      const fn=tc.function||{};
+      let args=fn.arguments||'';
+      try{args=JSON.stringify(JSON.parse(args),null,2)}catch(e){}
+      h+=`<div class="tc-block"><span class="tc-name">&#9881; ${fn.name}</span> <span style="color:var(--text-dim)">[${tc.id}]</span><pre>${esc(args)}</pre></div>`;
+    }
+  }
+  h+=`<div class="dp-kv" style="margin-top:8px"><span class="k">finish_reason</span><span class="v">${choice.finish_reason||''}</span></div>`;
+  h+=`</div>`;
+
+  // Tools schema (collapsible)
+  if(tools.length){
+    h+=`<div class="dp-section"><h3>Tools Schema (${tools.length})</h3>
+      <div class="msg-body collapsed" style="max-height:60px"><pre>${esc(JSON.stringify(tools,null,2))}</pre></div>
+      <div class="msg-toggle" onclick="this.previousElementSibling.classList.toggle('collapsed');this.textContent=this.textContent==='show'?'hide':'show'">show</div></div>`;
+  }
+
+  dp.innerHTML=h;
+}
+
+async function poll(){
+  try{
+    const r=await fetch('./api/events?offset='+lastLen);
+    if(!r.ok)return;
+    const d=await r.json();
+    if(d.events&&d.events.length>0){
+      for(const ev of d.events)processEvent(ev);
+      lastLen=d.total;
+      renderAgents();render();updateStats();updateCommMapIfOpen();
+    }
+  }catch(e){console.error(e)}
+}
+
+// === Data Loading Strategy ===
+// Use polling only. Simple, reliable, no SSE edge cases.
+// Poll every 800ms — fast enough for real-time feel, no dedup issues.
+// On first load, offset=0 fetches ALL historical events.
+setInterval(poll, 800);
+poll(); // immediate first fetch
+
+// ─── Communication Map (D3.js force graph) ──────────────────────────
+let commInterval=null;
+let commMapVersion=0; // bumped on every event batch to detect changes
+function showCommMap(){
+  document.getElementById('commOverlay').classList.add('show');
+  renderCommMapD3();
+  // Auto-refresh every 2s
+  commInterval=setInterval(renderCommMapD3,2000);
+}
+function hideCommMap(){
+  document.getElementById('commOverlay').classList.remove('show');
+  if(commInterval){clearInterval(commInterval);commInterval=null;}
+}
+function updateCommMapIfOpen(){
+  commMapVersion++;
+  if(document.getElementById('commOverlay').classList.contains('show')){
+    renderCommMapD3();
+  }
+}
+
+let commSim=null;
+function renderCommMapD3(){
+  const container=document.getElementById('commContainer');
+  const rect=container.getBoundingClientRect();
+  const W=rect.width||900, H=rect.height||600;
+
+  // Build graph data from events
+  const edgeMap={};
+  const nodeSet=new Set();
+  for(const ev of events){
+    if(ev.type==='send'){
+      const from=ev.data.from||ev.agent;
+      const to=ev.data.to||'';
+      if(!from||!to)continue;
+      nodeSet.add(from); nodeSet.add(to);
+      const key=from+'→'+to;
+      if(!edgeMap[key])edgeMap[key]={source:from,target:to,count:0,tokens:0};
+      edgeMap[key].count++;
+      edgeMap[key].tokens+=(ev.data.tokens||0);
+    }
+    if(ev.type==='agent_new') nodeSet.add(ev.agent);
+  }
+
+  // Track system messages per node (but don't add system as a node)
+  const sysMessages={}; // agentId -> {recv: count, tokens: count}
+  const allLinks=Object.values(edgeMap);
+  for(const l of allLinks){
+    if(l.source==='system'){sysMessages[l.target]=sysMessages[l.target]||{recv:0,tok:0};sysMessages[l.target].recv+=l.count;sysMessages[l.target].tok+=l.tokens;}
+    if(l.target==='system'){sysMessages[l.source]=sysMessages[l.source]||{recv:0,tok:0};sysMessages[l.source].recv+=l.count;sysMessages[l.source].tok+=l.tokens;}
+  }
+  // Filter out system node and system edges
+  nodeSet.delete('system');
+  const nodes=[...nodeSet].map(id=>({
+    id, status:agents[id]?agents[id].status:'unknown',
+    isSystem:false,
+    tokens:agents[id]?agents[id].tok:0,
+    task:agents[id]?agents[id].task:'',
+    sysMsg:sysMessages[id]||{recv:0,tok:0},
+  }));
+  const links=allLinks.filter(l=>l.source!=='system'&&l.target!=='system');
+
+  if(nodes.length===0){container.innerHTML='<div style="color:#8b949e;text-align:center;padding:60px;font-size:14px">Waiting for agents...</div>';return;}
+
+  // Stats
+  const totalMsgs=allLinks.reduce((s,l)=>s+l.count,0);
+  const totalTok=allLinks.reduce((s,l)=>s+l.tokens,0);
+  const sysMsgCount=allLinks.filter(l=>l.source==='system'||l.target==='system').reduce((s,l)=>s+l.count,0);
+  document.getElementById('commStats').innerHTML=`
+    <span>🤖 Agents: <b>${nodes.length}</b></span>
+    <span>🔗 Edges: <b>${links.length}</b> (peer-to-peer)</span>
+    <span>💬 Messages: <b>${totalMsgs}</b> (sys: ${sysMsgCount})</span>
+    <span>📊 Tokens: <b>${totalTok.toLocaleString()}</b></span>
+    <span>📐 Density: <b>${(links.length/(nodes.length*(nodes.length-1)||1)*100).toFixed(1)}%</b></span>
+  `;
+
+  // Re-create SVG if node count or edge data changed
+  const prevVersion=parseInt(container.dataset.mapVersion||'0');
+  const prevCount=parseInt(container.dataset.nodeCount||'0');
+  if(prevCount===nodes.length && prevVersion===commMapVersion && commSim) return;
+  container.dataset.nodeCount=nodes.length;
+  container.dataset.mapVersion=commMapVersion;
+  container.innerHTML='';
+
+  const svg=d3.select(container).append('svg').attr('width',W).attr('height',H)
+    .attr('viewBox',`0 0 ${W} ${H}`);
+
+  // Background
+  svg.append('rect').attr('width',W).attr('height',H).attr('fill','#0a0e14').attr('rx',12);
+
+  // Zoom support
+  const gRoot=svg.append('g').attr('class','zoom-root');
+  const zoom=d3.zoom().scaleExtent([0.15,5]).on('zoom',(e)=>{gRoot.attr('transform',e.transform);});
+  svg.call(zoom);
+
+  // Defs for arrows
+  const defs=svg.append('defs');
+  defs.append('marker').attr('id','arr-peer').attr('viewBox','0 -5 10 10')
+    .attr('refX',30).attr('refY',0).attr('markerWidth',5).attr('markerHeight',5).attr('orient','auto')
+    .append('path').attr('d','M0,-5L10,0L0,5').attr('fill','#bc8cff');
+  defs.append('marker').attr('id','arr-sys').attr('viewBox','0 -5 10 10')
+    .attr('refX',30).attr('refY',0).attr('markerWidth',5).attr('markerHeight',5).attr('orient','auto')
+    .append('path').attr('d','M0,-5L10,0L0,5').attr('fill','#f8514980');
+
+  const maxCount=Math.max(...links.map(l=>l.count),1);
+  const nodeRadius=Math.max(16, Math.min(28, 300/nodes.length));
+
+  // Force simulation — balanced: not too sparse, not too dense
+  const n=nodes.length;
+  const linkDist=Math.max(60, Math.min(180, 900/Math.sqrt(n)));
+  const charge=-Math.max(300, Math.min(1500, 4000/Math.sqrt(n)));
+  commSim=d3.forceSimulation(nodes)
+    .force('link',d3.forceLink(links).id(d=>d.id).distance(linkDist).strength(0.7))
+    .force('charge',d3.forceManyBody().strength(charge).distanceMax(500))
+    .force('center',d3.forceCenter(W/2,H/2).strength(0.05))
+    .force('collision',d3.forceCollide(nodeRadius+12))
+    .force('x',d3.forceX(W/2).strength(0.03))
+    .force('y',d3.forceY(H/2).strength(0.03))
+    .alphaDecay(0.02)
+    .velocityDecay(0.4);
+
+  // Edges
+  const link=gRoot.append('g').attr('class','links').selectAll('line').data(links).enter().append('line')
+    .attr('stroke',d=>{const s=typeof d.source==='object'?d.source.id:d.source;return s==='system'?'#f8514960':'#bc8cff';})
+    .attr('stroke-width',d=>Math.max(1,(d.count/maxCount)*6))
+    .attr('opacity',d=>0.3+0.6*(d.count/maxCount))
+    .attr('marker-end',d=>{const s=typeof d.source==='object'?d.source.id:d.source;return s==='system'?'url(#arr-sys)':'url(#arr-peer)';});
+
+  // Edge labels — prominent with background
+  const linkLabel=gRoot.append('g').selectAll('g').data(links.filter(l=>l.count>0)).enter().append('g');
+  linkLabel.append('rect').attr('rx',3).attr('ry',3)
+    .attr('fill','#161b22').attr('stroke','#30363d').attr('stroke-width',0.5)
+    .attr('width',d=>(d.count>1?`${d.count}×${d.tokens}t`:`${d.tokens}t`).length*6+8)
+    .attr('height',14).attr('x',d=>-(d.count>1?`${d.count}×${d.tokens}t`:`${d.tokens}t`).length*3-4).attr('y',-10);
+  linkLabel.append('text')
+    .attr('font-size',9).attr('fill','#c9d1d9').attr('text-anchor','middle').attr('dy',1)
+    .text(d=>d.count>1?`${d.count}× ${d.tokens}t`:`${d.tokens}t`);
+
+  // Nodes
+  const colors=['#58a6ff','#3fb950','#d29922','#bc8cff','#f778ba','#79c0ff','#d18616','#a5d6ff','#7ee787','#ffa657'];
+  const node=gRoot.append('g').attr('class','nodes').selectAll('g').data(nodes).enter().append('g')
+    .style('cursor','grab')
+    .call(d3.drag().on('start',(e,d)=>{if(!e.active)commSim.alphaTarget(0.3).restart();d.fx=d.x;d.fy=d.y;})
+      .on('drag',(e,d)=>{d.fx=e.x;d.fy=e.y;}).on('end',(e,d)=>{if(!e.active)commSim.alphaTarget(0);d.fx=null;d.fy=null;}));
+
+  const statusColor=d=>d.status==='done'?'#3fb950':d.status==='failed'?'#f85149':d.isSystem?'#f85149':'#58a6ff';
+  const nodeColor=(d,i)=>d.isSystem?'#f85149':colors[i%colors.length];
+
+  // Glow effect
+  node.append('circle').attr('r',nodeRadius+4).attr('fill','none')
+    .attr('stroke',(d,i)=>nodeColor(d,i)).attr('stroke-width',1).attr('opacity',0.3);
+
+  node.append('circle').attr('r',nodeRadius)
+    .attr('fill',(d,i)=>nodeColor(d,i)+'18')
+    .attr('stroke',statusColor).attr('stroke-width',2);
+
+  node.append('text').attr('text-anchor','middle').attr('dy',3)
+    .attr('font-size',Math.max(9,Math.min(12,180/nodes.length)))
+    .attr('font-weight','bold').attr('fill',(d,i)=>nodeColor(d,i))
+    .text(d=>d.id);
+
+  // Status indicator dot
+  node.append('circle').attr('cx',nodeRadius*0.7).attr('cy',-nodeRadius*0.7).attr('r',4)
+    .attr('fill',statusColor).attr('stroke','#0a0e14').attr('stroke-width',1);
+
+  node.append('title').text(d=>`${d.id}\nStatus: ${d.status}\nTask: ${(d.task||'').slice(0,60)}\nTokens: ${(d.tokens||0).toLocaleString()}\nSystem msgs: ${d.sysMsg.recv} (${d.sysMsg.tok}tok)`);
+
+  // System message badge (bottom, red/orange small text)
+  node.filter(d=>d.sysMsg.recv>0).append('text')
+    .attr('x',0).attr('y',nodeRadius+10)
+    .attr('font-size',7).attr('fill','#f8514990').attr('text-anchor','middle')
+    .text(d=>`⚡${d.sysMsg.recv}`);
+
+  // Message count badges on nodes
+  const msgSent={}, msgRecv={};
+  for(const l of links){
+    const s=typeof l.source==='object'?l.source.id:l.source;
+    const t=typeof l.target==='object'?l.target.id:l.target;
+    msgSent[s]=(msgSent[s]||0)+l.count;
+    msgRecv[t]=(msgRecv[t]||0)+l.count;
+  }
+  // Sent badge (top-left, purple)
+  node.filter(d=>(msgSent[d.id]||0)>0).append('text')
+    .attr('x',-nodeRadius-2).attr('y',-nodeRadius+2)
+    .attr('font-size',8).attr('fill','#bc8cff').attr('text-anchor','end')
+    .text(d=>`↑${msgSent[d.id]||0}`);
+  // Received badge (top-right, cyan)
+  node.filter(d=>(msgRecv[d.id]||0)>0).append('text')
+    .attr('x',nodeRadius+2).attr('y',-nodeRadius+2)
+    .attr('font-size',8).attr('fill','#79c0ff')
+    .text(d=>`↓${msgRecv[d.id]||0}`);
+
+  commSim.on('tick',()=>{
+    link.attr('x1',d=>d.source.x).attr('y1',d=>d.source.y).attr('x2',d=>d.target.x).attr('y2',d=>d.target.y);
+    linkLabel.attr('transform',d=>`translate(${(d.source.x+d.target.x)/2},${(d.source.y+d.target.y)/2-8})`);
+    node.attr('transform',d=>`translate(${d.x},${d.y})`);
+  });
+}
+</script>
+<script src="https://d3js.org/d3.v7.min.js"></script>
+<div class="comm-overlay" id="commOverlay">
+  <span class="close-btn" onclick="hideCommMap()">&#x2715;</span>
+  <h2>&#9993; Communication Map <span style="font-size:11px;color:var(--text-dim);font-weight:normal">(auto-refreshes every 3s)</span></h2>
+  <div id="commContainer"></div>
+  <div class="legend">🖱️ Drag nodes to rearrange · 🟣 Purple arrows = agent→agent · 🔴 Red arrows = system→agent · Thickness = frequency · Hover for details</div>
+  <div class="stats-row" id="commStats"></div>
+</div>
+</body>
+</html>

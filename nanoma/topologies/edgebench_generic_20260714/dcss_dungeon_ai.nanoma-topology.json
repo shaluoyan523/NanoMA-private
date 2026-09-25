@@ -1,0 +1,174 @@
+{
+  "schema_version": 2,
+  "source": "edgebench_multiagent_topology_simulator.html",
+  "task": {
+    "id": "dcss_dungeon_ai",
+    "title": "DCSS Dungeon AI",
+    "category": "Interactive Games & Simulators",
+    "plan": "P4",
+    "objective": "按 seed 和 policy 参数并行探索，Cartographer 汇总死亡原因，控制器根据失败类型重派。",
+    "streams": [
+      "保守探索与逃生 policy",
+      "战斗、技能与消耗品 policy",
+      "楼层推进和资源经济",
+      "Morgue 聚类与最佳 seed 重放"
+    ],
+    "gates": [
+      "每次死亡产出结构化 morgue",
+      "相同死因两次后更换 policy",
+      "最终策略在多 seed 上重放"
+    ],
+    "risk_flags": [
+      "A",
+      "M"
+    ],
+    "edgebench_cwd": "/home/dcss_agent",
+    "submit_paths": [
+      "my_bot.rc",
+      "my_bot_include.rc"
+    ]
+  },
+  "runtime": {
+    "budget_minutes": 120,
+    "root_role": "Root / Controller",
+    "root_source_writes": 0,
+    "max_live_agents": 6,
+    "max_concurrent_llm": 6,
+    "task_repo": "",
+    "source_isolation": "shared-tree-serial",
+    "merge_policy": "runtime-judge-gated",
+    "build_gate": "official-sforge-submit",
+    "best_green_gate": "judge-valid && score>=best",
+    "snapshot_enabled": true,
+    "snapshot_paths": [
+      "my_bot.rc",
+      "my_bot_include.rc"
+    ],
+    "services": {
+      "verification_gate": {
+        "owner": "runtime",
+        "argv": [
+          "sforge-submit"
+        ],
+        "shell": false,
+        "timeout_seconds": 1280,
+        "acceptance": "judge-valid-nondecreasing",
+        "score_direction": "maximize",
+        "always_run": true
+      }
+    },
+    "completion_checkpoint": "spawn-replay",
+    "nodes": [
+      {
+        "id": "explorer-a",
+        "role": "Explorer A",
+        "assignment": "保守探索与逃生 policy",
+        "guide": "只拥有当前工作流，在隔离环境中交付可验证结果。",
+        "spawn_parent": "root",
+        "depends_on": [],
+        "start_minute": 6,
+        "end_minute": 78,
+        "mode": "progress",
+        "progress_logic": "all",
+        "min_parent_turns": 2,
+        "min_parent_tool_calls": 3,
+        "min_parent_age_seconds": 90,
+        "read_only": false,
+        "allowed_paths": [
+          "*"
+        ],
+        "spawn_executor": "parent_agent",
+        "spawn_tool": "nanoma"
+      },
+      {
+        "id": "explorer-b",
+        "role": "Explorer B",
+        "assignment": "战斗、技能与消耗品 policy",
+        "guide": "只拥有当前工作流，在隔离环境中交付可验证结果。",
+        "spawn_parent": "root",
+        "depends_on": [],
+        "start_minute": 6,
+        "end_minute": 82,
+        "mode": "progress",
+        "progress_logic": "all",
+        "min_parent_turns": 2,
+        "min_parent_tool_calls": 3,
+        "min_parent_age_seconds": 90,
+        "read_only": false,
+        "allowed_paths": [
+          "*"
+        ],
+        "spawn_executor": "parent_agent",
+        "spawn_tool": "nanoma"
+      },
+      {
+        "id": "explorer-c",
+        "role": "Explorer C",
+        "assignment": "楼层推进和资源经济",
+        "guide": "只拥有当前工作流，在隔离环境中交付可验证结果。",
+        "spawn_parent": "root",
+        "depends_on": [],
+        "start_minute": 6,
+        "end_minute": 72,
+        "mode": "progress",
+        "progress_logic": "all",
+        "min_parent_turns": 2,
+        "min_parent_tool_calls": 3,
+        "min_parent_age_seconds": 90,
+        "read_only": false,
+        "allowed_paths": [
+          "*"
+        ],
+        "spawn_executor": "parent_agent",
+        "spawn_tool": "nanoma"
+      },
+      {
+        "id": "cartographer",
+        "role": "Cartographer",
+        "assignment": "Morgue 聚类与最佳 seed 重放",
+        "guide": "只拥有当前工作流，在隔离环境中交付可验证结果。",
+        "spawn_parent": "explorer-a",
+        "depends_on": [
+          "spawn-explorer-a",
+          "spawn-explorer-b",
+          "spawn-explorer-c"
+        ],
+        "start_minute": 12,
+        "end_minute": 100,
+        "mode": "settled",
+        "progress_logic": "all",
+        "min_parent_turns": 4,
+        "min_parent_tool_calls": 5,
+        "min_parent_age_seconds": 180,
+        "read_only": false,
+        "allowed_paths": [
+          "*"
+        ],
+        "spawn_executor": "parent_agent",
+        "spawn_tool": "nanoma"
+      },
+      {
+        "id": "replay",
+        "role": "Replay Verifier",
+        "assignment": "每次死亡产出结构化 morgue；相同死因两次后更换 policy；最终策略在多 seed 上重放",
+        "guide": "独立检查构建、功能、必需产物和 best-green 回归。",
+        "spawn_parent": "root",
+        "depends_on": [],
+        "start_minute": 78,
+        "end_minute": 118,
+        "mode": "settled",
+        "progress_logic": "all",
+        "min_parent_turns": 2,
+        "min_parent_tool_calls": 3,
+        "min_parent_age_seconds": 90,
+        "read_only": true,
+        "allowed_paths": [],
+        "spawn_executor": "parent_agent",
+        "spawn_tool": "nanoma"
+      }
+    ],
+    "checkpoint_action": "steer_parent_spawn_tool",
+    "spawn_execution": "parent_agent_via_nanoma_tool",
+    "runtime_creates_agents": false
+  }
+}

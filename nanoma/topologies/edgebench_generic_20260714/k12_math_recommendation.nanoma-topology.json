@@ -1,0 +1,161 @@
+{
+  "schema_version": 2,
+  "source": "edgebench_multiagent_topology_simulator.html",
+  "task": {
+    "id": "k12_math_recommendation",
+    "title": "K12 Math Recommendation",
+    "category": "Professional Knowledge Work",
+    "plan": "P6",
+    "objective": "减少同质 Producer，把知识追踪、推荐和泄漏审计设为互相制衡的角色。",
+    "streams": [
+      "Knowledge tracing 与学生状态",
+      "题目推荐和难度控制",
+      "离线指标、分群与冷启动",
+      "时间泄漏、标签泄漏和报告审计"
+    ],
+    "gates": [
+      "训练特征不使用未来交互",
+      "推荐覆盖能力和难度约束",
+      "报告指标可由产物复算"
+    ],
+    "risk_flags": [
+      "M"
+    ],
+    "edgebench_cwd": "/home/workspace",
+    "submit_paths": [
+      "train.py",
+      "infer.py",
+      "models",
+      "submission.json",
+      "requirements.txt",
+      "README.md"
+    ]
+  },
+  "runtime": {
+    "budget_minutes": 120,
+    "root_role": "Deliverable Owner",
+    "root_source_writes": 0,
+    "max_live_agents": 5,
+    "max_concurrent_llm": 5,
+    "task_repo": "",
+    "source_isolation": "shared-tree-serial",
+    "merge_policy": "runtime-judge-gated",
+    "build_gate": "official-sforge-submit",
+    "best_green_gate": "judge-valid && score>=best",
+    "snapshot_enabled": true,
+    "snapshot_paths": [
+      "train.py",
+      "infer.py",
+      "models",
+      "submission.json",
+      "requirements.txt",
+      "README.md"
+    ],
+    "services": {
+      "verification_gate": {
+        "owner": "runtime",
+        "argv": [
+          "sforge-submit"
+        ],
+        "shell": false,
+        "timeout_seconds": 1080,
+        "acceptance": "judge-valid-nondecreasing",
+        "score_direction": "maximize",
+        "always_run": true
+      }
+    },
+    "completion_checkpoint": "spawn-validator",
+    "nodes": [
+      {
+        "id": "producer-a",
+        "role": "Producer A",
+        "assignment": "Knowledge tracing 与学生状态",
+        "guide": "只拥有当前工作流，在隔离环境中交付可验证结果。",
+        "spawn_parent": "root",
+        "depends_on": [],
+        "start_minute": 6,
+        "end_minute": 78,
+        "mode": "progress",
+        "progress_logic": "all",
+        "min_parent_turns": 2,
+        "min_parent_tool_calls": 3,
+        "min_parent_age_seconds": 90,
+        "read_only": false,
+        "allowed_paths": [
+          "*"
+        ],
+        "spawn_executor": "parent_agent",
+        "spawn_tool": "nanoma"
+      },
+      {
+        "id": "producer-b",
+        "role": "Producer B",
+        "assignment": "题目推荐和难度控制",
+        "guide": "只拥有当前工作流，在隔离环境中交付可验证结果。",
+        "spawn_parent": "root",
+        "depends_on": [],
+        "start_minute": 6,
+        "end_minute": 78,
+        "mode": "progress",
+        "progress_logic": "all",
+        "min_parent_turns": 2,
+        "min_parent_tool_calls": 3,
+        "min_parent_age_seconds": 90,
+        "read_only": false,
+        "allowed_paths": [
+          "*"
+        ],
+        "spawn_executor": "parent_agent",
+        "spawn_tool": "nanoma"
+      },
+      {
+        "id": "auditor",
+        "role": "Rubric Auditor",
+        "assignment": "离线指标、分群与冷启动",
+        "guide": "只拥有当前工作流，在隔离环境中交付可验证结果。",
+        "spawn_parent": "root",
+        "depends_on": [],
+        "start_minute": 6,
+        "end_minute": 104,
+        "mode": "progress",
+        "progress_logic": "all",
+        "min_parent_turns": 2,
+        "min_parent_tool_calls": 3,
+        "min_parent_age_seconds": 90,
+        "read_only": false,
+        "allowed_paths": [
+          "*"
+        ],
+        "spawn_executor": "parent_agent",
+        "spawn_tool": "nanoma"
+      },
+      {
+        "id": "validator",
+        "role": "Artifact Validator",
+        "assignment": "时间泄漏、标签泄漏和报告审计",
+        "guide": "只拥有当前工作流，在隔离环境中交付可验证结果。",
+        "spawn_parent": "root",
+        "depends_on": [
+          "spawn-producer-a",
+          "spawn-producer-b"
+        ],
+        "start_minute": 10,
+        "end_minute": 118,
+        "mode": "settled",
+        "progress_logic": "all",
+        "min_parent_turns": 2,
+        "min_parent_tool_calls": 3,
+        "min_parent_age_seconds": 90,
+        "read_only": false,
+        "allowed_paths": [
+          "*"
+        ],
+        "spawn_executor": "parent_agent",
+        "spawn_tool": "nanoma"
+      }
+    ],
+    "checkpoint_action": "steer_parent_spawn_tool",
+    "spawn_execution": "parent_agent_via_nanoma_tool",
+    "runtime_creates_agents": false
+  }
+}

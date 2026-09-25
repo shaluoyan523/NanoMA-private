@@ -1,0 +1,158 @@
+{
+  "schema_version": 2,
+  "source": "edgebench_multiagent_topology_simulator.html",
+  "task": {
+    "id": "portfolio_risk_calibration",
+    "title": "Portfolio Risk Calibration",
+    "category": "Professional Knowledge Work",
+    "plan": "P6",
+    "objective": "代码、结果和报告并行生产，但 Artifact Validator 从第 5 分钟起持续检查 required files。",
+    "streams": [
+      "portfolio_optimizer.py 与优化逻辑",
+      "校准实验、结果表和图",
+      "风险假设与方法报告",
+      "Required files、可执行性和数值一致性"
+    ],
+    "gates": [
+      "portfolio_optimizer.py 存在且可执行",
+      "结果可由代码复算",
+      "required file 缺失时禁止 submit"
+    ],
+    "risk_flags": [
+      "A",
+      "V",
+      "C",
+      "M"
+    ],
+    "edgebench_cwd": "/home/workspace",
+    "submit_paths": [
+      "portfolio_optimizer.py",
+      "requirements.txt",
+      "backtest_results.json"
+    ]
+  },
+  "runtime": {
+    "budget_minutes": 120,
+    "root_role": "Deliverable Owner",
+    "root_source_writes": 0,
+    "max_live_agents": 5,
+    "max_concurrent_llm": 5,
+    "task_repo": "",
+    "source_isolation": "shared-tree-serial",
+    "merge_policy": "runtime-judge-gated",
+    "build_gate": "official-sforge-submit",
+    "best_green_gate": "judge-valid && score>=best",
+    "snapshot_enabled": true,
+    "snapshot_paths": [
+      "portfolio_optimizer.py",
+      "requirements.txt",
+      "backtest_results.json"
+    ],
+    "services": {
+      "verification_gate": {
+        "owner": "runtime",
+        "argv": [
+          "sforge-submit"
+        ],
+        "shell": false,
+        "timeout_seconds": 900,
+        "acceptance": "judge-valid-nondecreasing",
+        "score_direction": "maximize",
+        "always_run": true
+      }
+    },
+    "completion_checkpoint": "spawn-validator",
+    "nodes": [
+      {
+        "id": "producer-a",
+        "role": "Producer A",
+        "assignment": "portfolio_optimizer.py 与优化逻辑",
+        "guide": "只拥有当前工作流，在隔离环境中交付可验证结果。",
+        "spawn_parent": "root",
+        "depends_on": [],
+        "start_minute": 6,
+        "end_minute": 78,
+        "mode": "progress",
+        "progress_logic": "all",
+        "min_parent_turns": 2,
+        "min_parent_tool_calls": 3,
+        "min_parent_age_seconds": 90,
+        "read_only": false,
+        "allowed_paths": [
+          "*"
+        ],
+        "spawn_executor": "parent_agent",
+        "spawn_tool": "nanoma"
+      },
+      {
+        "id": "producer-b",
+        "role": "Producer B",
+        "assignment": "校准实验、结果表和图",
+        "guide": "只拥有当前工作流，在隔离环境中交付可验证结果。",
+        "spawn_parent": "root",
+        "depends_on": [],
+        "start_minute": 6,
+        "end_minute": 78,
+        "mode": "progress",
+        "progress_logic": "all",
+        "min_parent_turns": 2,
+        "min_parent_tool_calls": 3,
+        "min_parent_age_seconds": 90,
+        "read_only": false,
+        "allowed_paths": [
+          "*"
+        ],
+        "spawn_executor": "parent_agent",
+        "spawn_tool": "nanoma"
+      },
+      {
+        "id": "auditor",
+        "role": "Rubric Auditor",
+        "assignment": "风险假设与方法报告",
+        "guide": "只拥有当前工作流，在隔离环境中交付可验证结果。",
+        "spawn_parent": "root",
+        "depends_on": [],
+        "start_minute": 6,
+        "end_minute": 104,
+        "mode": "progress",
+        "progress_logic": "all",
+        "min_parent_turns": 2,
+        "min_parent_tool_calls": 3,
+        "min_parent_age_seconds": 90,
+        "read_only": false,
+        "allowed_paths": [
+          "*"
+        ],
+        "spawn_executor": "parent_agent",
+        "spawn_tool": "nanoma"
+      },
+      {
+        "id": "validator",
+        "role": "Artifact Validator",
+        "assignment": "Required files、可执行性和数值一致性",
+        "guide": "只拥有当前工作流，在隔离环境中交付可验证结果。",
+        "spawn_parent": "root",
+        "depends_on": [
+          "spawn-producer-a",
+          "spawn-producer-b"
+        ],
+        "start_minute": 10,
+        "end_minute": 118,
+        "mode": "settled",
+        "progress_logic": "all",
+        "min_parent_turns": 2,
+        "min_parent_tool_calls": 3,
+        "min_parent_age_seconds": 90,
+        "read_only": false,
+        "allowed_paths": [
+          "*"
+        ],
+        "spawn_executor": "parent_agent",
+        "spawn_tool": "nanoma"
+      }
+    ],
+    "checkpoint_action": "steer_parent_spawn_tool",
+    "spawn_execution": "parent_agent_via_nanoma_tool",
+    "runtime_creates_agents": false
+  }
+}

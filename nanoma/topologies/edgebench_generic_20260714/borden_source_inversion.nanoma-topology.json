@@ -1,0 +1,152 @@
+{
+  "schema_version": 2,
+  "source": "edgebench_multiagent_topology_simulator.html",
+  "task": {
+    "id": "borden_source_inversion",
+    "title": "Borden Source Inversion",
+    "category": "Scientific Problems & ML",
+    "plan": "P5",
+    "objective": "前 10 分钟并行检验 forward model、损失变换和正则化假设，避免末段才展开。",
+    "streams": [
+      "Forward operator 与边界条件校准",
+      "稳健损失和数据变换",
+      "源项正则化与参数化",
+      "合成恢复测试和数值审计"
+    ],
+    "gates": [
+      "10 分钟内首个生产性 spawn",
+      "合成源可被稳定恢复",
+      "所有候选按同一误差尺度比较"
+    ],
+    "risk_flags": [
+      "A",
+      "M"
+    ],
+    "edgebench_cwd": "/home/workspace/borden_inverse",
+    "submit_paths": [
+      "."
+    ]
+  },
+  "runtime": {
+    "budget_minutes": 120,
+    "root_role": "Experiment Manager",
+    "root_source_writes": 0,
+    "max_live_agents": 5,
+    "max_concurrent_llm": 5,
+    "task_repo": "",
+    "source_isolation": "shared-tree-serial",
+    "merge_policy": "runtime-judge-gated",
+    "build_gate": "official-sforge-submit",
+    "best_green_gate": "judge-valid && score>=best",
+    "snapshot_enabled": true,
+    "snapshot_paths": [
+      "."
+    ],
+    "services": {
+      "verification_gate": {
+        "owner": "runtime",
+        "argv": [
+          "sforge-submit"
+        ],
+        "shell": false,
+        "timeout_seconds": 900,
+        "acceptance": "judge-valid-nondecreasing",
+        "score_direction": "maximize",
+        "always_run": true
+      }
+    },
+    "completion_checkpoint": "",
+    "nodes": [
+      {
+        "id": "model-a",
+        "role": "Model Worker A",
+        "assignment": "Forward operator 与边界条件校准",
+        "guide": "只拥有当前工作流，在隔离环境中交付可验证结果。",
+        "spawn_parent": "root",
+        "depends_on": [],
+        "start_minute": 7,
+        "end_minute": 78,
+        "mode": "progress",
+        "progress_logic": "all",
+        "min_parent_turns": 2,
+        "min_parent_tool_calls": 3,
+        "min_parent_age_seconds": 90,
+        "read_only": false,
+        "allowed_paths": [
+          "*"
+        ],
+        "spawn_executor": "parent_agent",
+        "spawn_tool": "nanoma"
+      },
+      {
+        "id": "model-b",
+        "role": "Model Worker B",
+        "assignment": "稳健损失和数据变换",
+        "guide": "只拥有当前工作流，在隔离环境中交付可验证结果。",
+        "spawn_parent": "root",
+        "depends_on": [],
+        "start_minute": 7,
+        "end_minute": 82,
+        "mode": "progress",
+        "progress_logic": "all",
+        "min_parent_turns": 2,
+        "min_parent_tool_calls": 3,
+        "min_parent_age_seconds": 90,
+        "read_only": false,
+        "allowed_paths": [
+          "*"
+        ],
+        "spawn_executor": "parent_agent",
+        "spawn_tool": "nanoma"
+      },
+      {
+        "id": "auditor",
+        "role": "Data / Numerics Auditor",
+        "assignment": "源项正则化与参数化",
+        "guide": "只拥有当前工作流，在隔离环境中交付可验证结果。",
+        "spawn_parent": "root",
+        "depends_on": [],
+        "start_minute": 7,
+        "end_minute": 100,
+        "mode": "progress",
+        "progress_logic": "all",
+        "min_parent_turns": 2,
+        "min_parent_tool_calls": 3,
+        "min_parent_age_seconds": 90,
+        "read_only": false,
+        "allowed_paths": [
+          "*"
+        ],
+        "spawn_executor": "parent_agent",
+        "spawn_tool": "nanoma"
+      },
+      {
+        "id": "selector",
+        "role": "Checkpoint Selector",
+        "assignment": "合成恢复测试和数值审计",
+        "guide": "只拥有当前工作流，在隔离环境中交付可验证结果。",
+        "spawn_parent": "root",
+        "depends_on": [
+          "spawn-model-a",
+          "spawn-model-b"
+        ],
+        "start_minute": 54,
+        "end_minute": 118,
+        "mode": "settled",
+        "progress_logic": "all",
+        "min_parent_turns": 2,
+        "min_parent_tool_calls": 3,
+        "min_parent_age_seconds": 90,
+        "read_only": false,
+        "allowed_paths": [
+          "*"
+        ],
+        "spawn_executor": "parent_agent",
+        "spawn_tool": "nanoma"
+      }
+    ],
+    "checkpoint_action": "steer_parent_spawn_tool",
+    "spawn_execution": "parent_agent_via_nanoma_tool",
+    "runtime_creates_agents": false
+  }
+}

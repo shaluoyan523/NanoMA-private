@@ -1,0 +1,616 @@
+{
+  "generated_at": "2026-07-14T14:33:30.382Z",
+  "tasks": [
+    {
+      "task_id": "ad_placement_optimization",
+      "plan": "P2",
+      "output": "/tmp/edgebench_topologies_after_update/ad_placement_optimization.nanoma-topology.json",
+      "nodes": 5,
+      "snapshot_enabled": true,
+      "snapshot_paths": [
+        "solution.cpp"
+      ],
+      "gate_timeout_seconds": 900
+    },
+    {
+      "task_id": "anchorhead_text_adventure",
+      "plan": "P4",
+      "output": "/tmp/edgebench_topologies_after_update/anchorhead_text_adventure.nanoma-topology.json",
+      "nodes": 5,
+      "snapshot_enabled": false,
+      "snapshot_paths": [],
+      "gate_timeout_seconds": 900
+    },
+    {
+      "task_id": "ann_vector_search_qps",
+      "plan": "P2",
+      "output": "/tmp/edgebench_topologies_after_update/ann_vector_search_qps.nanoma-topology.json",
+      "nodes": 5,
+      "snapshot_enabled": true,
+      "snapshot_paths": [
+        "ann_benchmarks/algorithms/custom"
+      ],
+      "gate_timeout_seconds": 7980
+    },
+    {
+      "task_id": "apple_incremental_game",
+      "plan": "P2",
+      "output": "/tmp/edgebench_topologies_after_update/apple_incremental_game.nanoma-topology.json",
+      "nodes": 5,
+      "snapshot_enabled": true,
+      "snapshot_paths": [
+        "solution.py"
+      ],
+      "gate_timeout_seconds": 900
+    },
+    {
+      "task_id": "arc_compiler_runtime",
+      "plan": "P1",
+      "output": "/tmp/edgebench_topologies_after_update/arc_compiler_runtime.nanoma-topology.json",
+      "nodes": 6,
+      "snapshot_enabled": true,
+      "snapshot_paths": [
+        "compiler/src"
+      ],
+      "gate_timeout_seconds": 1680
+    },
+    {
+      "task_id": "bipedalwalker_locomotion_rl",
+      "plan": "P5",
+      "output": "/tmp/edgebench_topologies_after_update/bipedalwalker_locomotion_rl.nanoma-topology.json",
+      "nodes": 4,
+      "snapshot_enabled": true,
+      "snapshot_paths": [
+        "submission"
+      ],
+      "gate_timeout_seconds": 1080
+    },
+    {
+      "task_id": "borden_source_inversion",
+      "plan": "P5",
+      "output": "/tmp/edgebench_topologies_after_update/borden_source_inversion.nanoma-topology.json",
+      "nodes": 4,
+      "snapshot_enabled": true,
+      "snapshot_paths": [
+        "."
+      ],
+      "gate_timeout_seconds": 900
+    },
+    {
+      "task_id": "carleson_formalization",
+      "plan": "P3",
+      "output": "/tmp/edgebench_topologies_after_update/carleson_formalization.nanoma-topology.json",
+      "nodes": 8,
+      "snapshot_enabled": true,
+      "snapshot_paths": [
+        "se-bmk-intern/carleson"
+      ],
+      "gate_timeout_seconds": 2580
+    },
+    {
+      "task_id": "college_english_exam_bank",
+      "plan": "P6",
+      "output": "/tmp/edgebench_topologies_after_update/college_english_exam_bank.nanoma-topology.json",
+      "nodes": 4,
+      "snapshot_enabled": true,
+      "snapshot_paths": [
+        "A卷原卷.docx",
+        "A卷原卷.pdf",
+        "A卷答案和评分细则.docx",
+        "A卷答案和评分细则.pdf",
+        "B卷原卷.docx",
+        "B卷原卷.pdf",
+        "B卷答案和评分细则.docx",
+        "B卷答案和评分细则.pdf",
+        "C卷原卷.docx",
+        "C卷原卷.pdf",
+        "C卷答案和评分细则.docx",
+        "C卷答案和评分细则.pdf",
+        "D卷原卷.docx",
+        "D卷原卷.pdf",
+        "D卷答案和评分细则.docx",
+        "D卷答案和评分细则.pdf",
+        "E卷原卷.docx",
+        "E卷原卷.pdf",
+        "E卷答案和评分细则.docx",
+        "E卷答案和评分细则.pdf",
+        "五套组卷蓝图表.xlsx",
+        "套间重复率自检表.xlsx"
+      ],
+      "gate_timeout_seconds": 1080
+    },
+    {
+      "task_id": "cta_risk_budget_optimization",
+      "plan": "P6",
+      "output": "/tmp/edgebench_topologies_after_update/cta_risk_budget_optimization.nanoma-topology.json",
+      "nodes": 4,
+      "snapshot_enabled": true,
+      "snapshot_paths": [
+        "run.py",
+        "main.py",
+        "config.json",
+        "config.yaml",
+        "nav_history.csv",
+        "signal_matrix.csv",
+        "positions.csv",
+        "trades.csv",
+        "risk_budget_allocation.csv",
+        "performance_report.md",
+        "performance_report.xlsx",
+        "stress_test_report.md",
+        "stress_test_results.xlsx",
+        "sensitivity_analysis_report.md",
+        "sensitivity_analysis.xlsx",
+        "diagnostics.json",
+        "outputs"
+      ],
+      "gate_timeout_seconds": 900
+    },
+    {
+      "task_id": "dabic_gravity_inversion",
+      "plan": "P5",
+      "output": "/tmp/edgebench_topologies_after_update/dabic_gravity_inversion.nanoma-topology.json",
+      "nodes": 4,
+      "snapshot_enabled": true,
+      "snapshot_paths": [
+        "outputs"
+      ],
+      "gate_timeout_seconds": 21780
+    },
+    {
+      "task_id": "dcss_dungeon_ai",
+      "plan": "P4",
+      "output": "/tmp/edgebench_topologies_after_update/dcss_dungeon_ai.nanoma-topology.json",
+      "nodes": 5,
+      "snapshot_enabled": true,
+      "snapshot_paths": [
+        "my_bot.rc",
+        "my_bot_include.rc"
+      ],
+      "gate_timeout_seconds": 1280
+    },
+    {
+      "task_id": "equivalence_class_divide_and_conquer",
+      "plan": "P2",
+      "output": "/tmp/edgebench_topologies_after_update/equivalence_class_divide_and_conquer.nanoma-topology.json",
+      "nodes": 5,
+      "snapshot_enabled": true,
+      "snapshot_paths": [
+        "T1.cpp",
+        "T2.cpp",
+        "T3.cpp",
+        "T4.cpp",
+        "T5.cpp",
+        "T6.cpp"
+      ],
+      "gate_timeout_seconds": 1080
+    },
+    {
+      "task_id": "exchange_core_throughput",
+      "plan": "P2",
+      "output": "/tmp/edgebench_topologies_after_update/exchange_core_throughput.nanoma-topology.json",
+      "nodes": 5,
+      "snapshot_enabled": true,
+      "snapshot_paths": [
+        "src/main",
+        "pom.xml",
+        ".mvn"
+      ],
+      "gate_timeout_seconds": 2580
+    },
+    {
+      "task_id": "ffmpeg_swscale_reimplementation",
+      "plan": "P1",
+      "output": "/tmp/edgebench_topologies_after_update/ffmpeg_swscale_reimplementation.nanoma-topology.json",
+      "nodes": 6,
+      "snapshot_enabled": true,
+      "snapshot_paths": [
+        "."
+      ],
+      "gate_timeout_seconds": 5580
+    },
+    {
+      "task_id": "flt_regular_formalization",
+      "plan": "P3",
+      "output": "/tmp/edgebench_topologies_after_update/flt_regular_formalization.nanoma-topology.json",
+      "nodes": 8,
+      "snapshot_enabled": true,
+      "snapshot_paths": [
+        "se-bmk-intern/FltRegular"
+      ],
+      "gate_timeout_seconds": 2580
+    },
+    {
+      "task_id": "git_rewrite_in_zig",
+      "plan": "P1",
+      "output": "/tmp/edgebench_topologies_after_update/git_rewrite_in_zig.nanoma-topology.json",
+      "nodes": 6,
+      "snapshot_enabled": true,
+      "snapshot_paths": [
+        "."
+      ],
+      "gate_timeout_seconds": 7380
+    },
+    {
+      "task_id": "graph_node_classification",
+      "plan": "P5",
+      "output": "/tmp/edgebench_topologies_after_update/graph_node_classification.nanoma-topology.json",
+      "nodes": 4,
+      "snapshot_enabled": true,
+      "snapshot_paths": [
+        "solution/solution.py"
+      ],
+      "gate_timeout_seconds": 1980
+    },
+    {
+      "task_id": "grid_turing_robot",
+      "plan": "P2",
+      "output": "/tmp/edgebench_topologies_after_update/grid_turing_robot.nanoma-topology.json",
+      "nodes": 5,
+      "snapshot_enabled": true,
+      "snapshot_paths": [
+        "solution.py"
+      ],
+      "gate_timeout_seconds": 900
+    },
+    {
+      "task_id": "integer_compression_codec",
+      "plan": "P1",
+      "output": "/tmp/edgebench_topologies_after_update/integer_compression_codec.nanoma-topology.json",
+      "nodes": 6,
+      "snapshot_enabled": true,
+      "snapshot_paths": [
+        "include",
+        "src",
+        "Makefile"
+      ],
+      "gate_timeout_seconds": 2580
+    },
+    {
+      "task_id": "jagua_nesting_optimization",
+      "plan": "P2",
+      "output": "/tmp/edgebench_topologies_after_update/jagua_nesting_optimization.nanoma-topology.json",
+      "nodes": 5,
+      "snapshot_enabled": true,
+      "snapshot_paths": [
+        "lbf/src",
+        "jagua-rs/src",
+        "lbf/Cargo.toml",
+        "jagua-rs/Cargo.toml",
+        "Cargo.toml"
+      ],
+      "gate_timeout_seconds": 1380
+    },
+    {
+      "task_id": "juliet_vulnerability_analyzer",
+      "plan": "P1",
+      "output": "/tmp/edgebench_topologies_after_update/juliet_vulnerability_analyzer.nanoma-topology.json",
+      "nodes": 6,
+      "snapshot_enabled": true,
+      "snapshot_paths": [
+        "."
+      ],
+      "gate_timeout_seconds": 900
+    },
+    {
+      "task_id": "k12_math_recommendation",
+      "plan": "P6",
+      "output": "/tmp/edgebench_topologies_after_update/k12_math_recommendation.nanoma-topology.json",
+      "nodes": 4,
+      "snapshot_enabled": true,
+      "snapshot_paths": [
+        "train.py",
+        "infer.py",
+        "models",
+        "submission.json",
+        "requirements.txt",
+        "README.md"
+      ],
+      "gate_timeout_seconds": 1080
+    },
+    {
+      "task_id": "lean_analysis_proofs",
+      "plan": "P3",
+      "output": "/tmp/edgebench_topologies_after_update/lean_analysis_proofs.nanoma-topology.json",
+      "nodes": 8,
+      "snapshot_enabled": true,
+      "snapshot_paths": [
+        "se-bmk-intern/analysis"
+      ],
+      "gate_timeout_seconds": 2580
+    },
+    {
+      "task_id": "molecular_self_assembly",
+      "plan": "P2",
+      "output": "/tmp/edgebench_topologies_after_update/molecular_self_assembly.nanoma-topology.json",
+      "nodes": 5,
+      "snapshot_enabled": true,
+      "snapshot_paths": [
+        "solution.py"
+      ],
+      "gate_timeout_seconds": 900
+    },
+    {
+      "task_id": "nethack_dungeon_agent",
+      "plan": "P4",
+      "output": "/tmp/edgebench_topologies_after_update/nethack_dungeon_agent.nanoma-topology.json",
+      "nodes": 5,
+      "snapshot_enabled": true,
+      "snapshot_paths": [
+        "agent.py"
+      ],
+      "gate_timeout_seconds": 3780
+    },
+    {
+      "task_id": "new_foundations_consistency",
+      "plan": "P3",
+      "output": "/tmp/edgebench_topologies_after_update/new_foundations_consistency.nanoma-topology.json",
+      "nodes": 8,
+      "snapshot_enabled": true,
+      "snapshot_paths": [
+        "se-bmk-intern/con-nf"
+      ],
+      "gate_timeout_seconds": 2580
+    },
+    {
+      "task_id": "openrct2_theme_park_ai",
+      "plan": "P4",
+      "output": "/tmp/edgebench_topologies_after_update/openrct2_theme_park_ai.nanoma-topology.json",
+      "nodes": 5,
+      "snapshot_enabled": true,
+      "snapshot_paths": [
+        "my_plugin.js"
+      ],
+      "gate_timeout_seconds": 2580
+    },
+    {
+      "task_id": "openttd_transport_ai",
+      "plan": "P4",
+      "output": "/tmp/edgebench_topologies_after_update/openttd_transport_ai.nanoma-topology.json",
+      "nodes": 5,
+      "snapshot_enabled": true,
+      "snapshot_paths": [
+        "my_ai"
+      ],
+      "gate_timeout_seconds": 3780
+    },
+    {
+      "task_id": "order_addition_permutation_optimization",
+      "plan": "P2",
+      "output": "/tmp/edgebench_topologies_after_update/order_addition_permutation_optimization.nanoma-topology.json",
+      "nodes": 5,
+      "snapshot_enabled": true,
+      "snapshot_paths": [
+        "."
+      ],
+      "gate_timeout_seconds": 900
+    },
+    {
+      "task_id": "ordinal_notation_well_foundedness",
+      "plan": "P3",
+      "output": "/tmp/edgebench_topologies_after_update/ordinal_notation_well_foundedness.nanoma-topology.json",
+      "nodes": 8,
+      "snapshot_enabled": true,
+      "snapshot_paths": [
+        "."
+      ],
+      "gate_timeout_seconds": 7380
+    },
+    {
+      "task_id": "pfr_formalization",
+      "plan": "P3",
+      "output": "/tmp/edgebench_topologies_after_update/pfr_formalization.nanoma-topology.json",
+      "nodes": 8,
+      "snapshot_enabled": true,
+      "snapshot_paths": [
+        "se-bmk-intern/pfr"
+      ],
+      "gate_timeout_seconds": 2580
+    },
+    {
+      "task_id": "portfolio_risk_calibration",
+      "plan": "P6",
+      "output": "/tmp/edgebench_topologies_after_update/portfolio_risk_calibration.nanoma-topology.json",
+      "nodes": 4,
+      "snapshot_enabled": true,
+      "snapshot_paths": [
+        "portfolio_optimizer.py",
+        "requirements.txt",
+        "backtest_results.json"
+      ],
+      "gate_timeout_seconds": 900
+    },
+    {
+      "task_id": "rust_multicrate_reconstruction",
+      "plan": "P1",
+      "output": "/tmp/edgebench_topologies_after_update/rust_multicrate_reconstruction.nanoma-topology.json",
+      "nodes": 6,
+      "snapshot_enabled": true,
+      "snapshot_paths": [
+        "agent-start"
+      ],
+      "gate_timeout_seconds": 3780
+    },
+    {
+      "task_id": "schemathesis_config_modernization",
+      "plan": "P1",
+      "output": "/tmp/edgebench_topologies_after_update/schemathesis_config_modernization.nanoma-topology.json",
+      "nodes": 6,
+      "snapshot_enabled": true,
+      "snapshot_paths": [
+        "."
+      ],
+      "gate_timeout_seconds": 1980
+    },
+    {
+      "task_id": "schemathesis_datagen_pipeline",
+      "plan": "P1",
+      "output": "/tmp/edgebench_topologies_after_update/schemathesis_datagen_pipeline.nanoma-topology.json",
+      "nodes": 6,
+      "snapshot_enabled": true,
+      "snapshot_paths": [
+        "."
+      ],
+      "gate_timeout_seconds": 1980
+    },
+    {
+      "task_id": "schemathesis_reporting_observability",
+      "plan": "P1",
+      "output": "/tmp/edgebench_topologies_after_update/schemathesis_reporting_observability.nanoma-topology.json",
+      "nodes": 6,
+      "snapshot_enabled": true,
+      "snapshot_paths": [
+        "."
+      ],
+      "gate_timeout_seconds": 1980
+    },
+    {
+      "task_id": "smt_solver",
+      "plan": "P2",
+      "output": "/tmp/edgebench_topologies_after_update/smt_solver.nanoma-topology.json",
+      "nodes": 5,
+      "snapshot_enabled": true,
+      "snapshot_paths": [
+        "build.sh",
+        "solve",
+        "src"
+      ],
+      "gate_timeout_seconds": 7380
+    },
+    {
+      "task_id": "sphere_eversion_formalization",
+      "plan": "P3",
+      "output": "/tmp/edgebench_topologies_after_update/sphere_eversion_formalization.nanoma-topology.json",
+      "nodes": 8,
+      "snapshot_enabled": true,
+      "snapshot_paths": [
+        "se-bmk-intern/sphere-eversion"
+      ],
+      "gate_timeout_seconds": 2580
+    },
+    {
+      "task_id": "treant_forest",
+      "plan": "P2",
+      "output": "/tmp/edgebench_topologies_after_update/treant_forest.nanoma-topology.json",
+      "nodes": 5,
+      "snapshot_enabled": true,
+      "snapshot_paths": [
+        "solution.py"
+      ],
+      "gate_timeout_seconds": 1050
+    },
+    {
+      "task_id": "tree_block_partitioning",
+      "plan": "P2",
+      "output": "/tmp/edgebench_topologies_after_update/tree_block_partitioning.nanoma-topology.json",
+      "nodes": 5,
+      "snapshot_enabled": true,
+      "snapshot_paths": [
+        "T1.cpp",
+        "T2.cpp",
+        "T3.cpp",
+        "T4.cpp",
+        "T5.cpp",
+        "T6.cpp"
+      ],
+      "gate_timeout_seconds": 900
+    },
+    {
+      "task_id": "triangulation_coloring_optimization",
+      "plan": "P2",
+      "output": "/tmp/edgebench_topologies_after_update/triangulation_coloring_optimization.nanoma-topology.json",
+      "nodes": 5,
+      "snapshot_enabled": true,
+      "snapshot_paths": [
+        "solution.py"
+      ],
+      "gate_timeout_seconds": 1380
+    },
+    {
+      "task_id": "trinity_text_adventure",
+      "plan": "P4",
+      "output": "/tmp/edgebench_topologies_after_update/trinity_text_adventure.nanoma-topology.json",
+      "nodes": 5,
+      "snapshot_enabled": false,
+      "snapshot_paths": [],
+      "gate_timeout_seconds": 900
+    },
+    {
+      "task_id": "tryst_text_adventure",
+      "plan": "P4",
+      "output": "/tmp/edgebench_topologies_after_update/tryst_text_adventure.nanoma-topology.json",
+      "nodes": 5,
+      "snapshot_enabled": false,
+      "snapshot_paths": [],
+      "gate_timeout_seconds": 900
+    },
+    {
+      "task_id": "vehicle_routing_time_windows",
+      "plan": "P2",
+      "output": "/tmp/edgebench_topologies_after_update/vehicle_routing_time_windows.nanoma-topology.json",
+      "nodes": 5,
+      "snapshot_enabled": true,
+      "snapshot_paths": [
+        "src",
+        "include",
+        "Makefile"
+      ],
+      "gate_timeout_seconds": 1380
+    },
+    {
+      "task_id": "vibrating_path_graph_coloring",
+      "plan": "P2",
+      "output": "/tmp/edgebench_topologies_after_update/vibrating_path_graph_coloring.nanoma-topology.json",
+      "nodes": 5,
+      "snapshot_enabled": true,
+      "snapshot_paths": [
+        "solution.py"
+      ],
+      "gate_timeout_seconds": 900
+    },
+    {
+      "task_id": "vliw_kernel_optimization",
+      "plan": "P2",
+      "output": "/tmp/edgebench_topologies_after_update/vliw_kernel_optimization.nanoma-topology.json",
+      "nodes": 5,
+      "snapshot_enabled": true,
+      "snapshot_paths": [
+        "solution.py"
+      ],
+      "gate_timeout_seconds": 900
+    },
+    {
+      "task_id": "warehouse_forklift_routing",
+      "plan": "P4",
+      "output": "/tmp/edgebench_topologies_after_update/warehouse_forklift_routing.nanoma-topology.json",
+      "nodes": 5,
+      "snapshot_enabled": true,
+      "snapshot_paths": [
+        "solution.py"
+      ],
+      "gate_timeout_seconds": 3780
+    },
+    {
+      "task_id": "wesnoth_tactical_ai",
+      "plan": "P4",
+      "output": "/tmp/edgebench_topologies_after_update/wesnoth_tactical_ai.nanoma-topology.json",
+      "nodes": 5,
+      "snapshot_enabled": true,
+      "snapshot_paths": [
+        "."
+      ],
+      "gate_timeout_seconds": 1080
+    },
+    {
+      "task_id": "wireless_electricity_layout",
+      "plan": "P2",
+      "output": "/tmp/edgebench_topologies_after_update/wireless_electricity_layout.nanoma-topology.json",
+      "nodes": 5,
+      "snapshot_enabled": true,
+      "snapshot_paths": [
+        "solution.cpp"
+      ],
+      "gate_timeout_seconds": 900
+    }
+  ]
+}

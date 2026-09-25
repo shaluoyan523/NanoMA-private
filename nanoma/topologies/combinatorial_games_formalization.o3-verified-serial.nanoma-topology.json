@@ -1,0 +1,200 @@
+{
+  "schema_version": 2,
+  "source": "edgebench_multiagent_topology_simulator.html",
+  "task": {
+    "id": "combinatorial_games_formalization",
+    "objective": "Protect the recovered Player, Functor, and Small score floor, then improve only through serial Runtime-verified proof batches.",
+    "gates": [
+      "Runtime executes lake build directly without a shell pipeline",
+      "Root cannot edit benchmark source files",
+      "Only one source writer is active at a time",
+      "A failed writer or build restores the previous verified green snapshot"
+    ]
+  },
+  "runtime": {
+    "budget_minutes": 120,
+    "root_role": "Read-only Green Branch Manager",
+    "root_source_writes": 0,
+    "max_live_agents": 8,
+    "max_concurrent_llm": 5,
+    "task_repo": "/home/workspace/se-bmk-intern/combinatorial-games",
+    "completion_checkpoint": "spawn-final-auditor",
+    "services": {
+      "build_gate": {
+        "owner": "runtime",
+        "argv": [
+          "lake",
+          "build"
+        ],
+        "shell": false,
+        "accept_exit_codes": [
+          0
+        ],
+        "reject_pipelines": true
+      }
+    },
+    "nodes": [
+      {
+        "id": "baseline-mapper",
+        "role": "Baseline Mapper",
+        "assignment": "Read the seeded green tree, inventory remaining sorries in Player.lean, Functor.lean, Small.lean, and the instRepr regression. Send a ranked declaration list to Root and finish without editing source.",
+        "guide": "Prefer exact declaration names, dependency impact, and focused build commands. Do not propose risky Dyadic, Surreal, Classes, Order, Pow, or Ordinal edits.",
+        "spawn_parent": "root",
+        "depends_on": [],
+        "start_minute": 0,
+        "end_minute": 10,
+        "mode": "progress",
+        "progress_logic": "all",
+        "min_parent_turns": 0,
+        "min_parent_tool_calls": 0,
+        "min_parent_age_seconds": 0,
+        "read_only": true,
+        "allowed_paths": [],
+        "spawn_executor": "parent_agent",
+        "spawn_tool": "nanoma"
+      },
+      {
+        "id": "proof-lead",
+        "role": "Proof Wave Lead",
+        "assignment": "Coordinate the serial writer chain, preserve the seeded score floor, and report each Runtime gate outcome. Do not edit source or submit.",
+        "guide": "Wait for children, insist on one small proof batch per writer, and stop a route after its Runtime build is rejected.",
+        "spawn_parent": "root",
+        "depends_on": [
+          "spawn-baseline-mapper"
+        ],
+        "start_minute": 5,
+        "end_minute": 100,
+        "mode": "settled",
+        "progress_logic": "all",
+        "min_parent_turns": 0,
+        "min_parent_tool_calls": 0,
+        "min_parent_age_seconds": 0,
+        "read_only": true,
+        "allowed_paths": [],
+        "spawn_executor": "parent_agent",
+        "spawn_tool": "nanoma"
+      },
+      {
+        "id": "pf-worker",
+        "role": "Player and Functor Incremental Worker",
+        "assignment": "Starting from the recovered green proofs, solve a small set of remaining high-impact sorries in Player.lean and Functor.lean. Do not rewrite already solved declarations. Run focused builds and finish so Runtime can execute the authoritative full build.",
+        "guide": "Use short existing lemmas and preserve every declaration signature. Make no edits outside the two owned files.",
+        "spawn_parent": "proof-lead",
+        "depends_on": [
+          "spawn-proof-lead"
+        ],
+        "start_minute": 8,
+        "end_minute": 35,
+        "mode": "progress",
+        "progress_logic": "all",
+        "min_parent_turns": 1,
+        "min_parent_tool_calls": 1,
+        "min_parent_age_seconds": 30,
+        "read_only": false,
+        "allowed_paths": [
+          "CombinatorialGames/Game/Player.lean",
+          "CombinatorialGames/Game/Functor.lean"
+        ],
+        "spawn_executor": "parent_agent",
+        "spawn_tool": "nanoma"
+      },
+      {
+        "id": "small-worker",
+        "role": "Small Leaf Incremental Worker",
+        "assignment": "After the Player and Functor candidate is accepted or restored, solve only remaining easy sorries in Mathlib/Small.lean. Preserve signatures, run the focused build, and finish for Runtime validation.",
+        "guide": "Do not touch Dyadic or any Game or Surreal file. Prefer one minimal proof batch over broad rewriting.",
+        "spawn_parent": "proof-lead",
+        "depends_on": [
+          "spawn-pf-worker"
+        ],
+        "start_minute": 35,
+        "end_minute": 50,
+        "mode": "settled",
+        "progress_logic": "all",
+        "min_parent_turns": 0,
+        "min_parent_tool_calls": 0,
+        "min_parent_age_seconds": 0,
+        "read_only": false,
+        "allowed_paths": [
+          "CombinatorialGames/Mathlib/Small.lean"
+        ],
+        "spawn_executor": "parent_agent",
+        "spawn_tool": "nanoma"
+      },
+      {
+        "id": "regression-worker",
+        "role": "Domineering Regression Worker",
+        "assignment": "Inspect and repair only the known IGame.Domineering.instRepr declaration regression in Game/Specific/Domineering.lean. If no signature-preserving repair is justified, make no source change and report evidence.",
+        "guide": "One regression, one minimal patch. Do not broaden scope to IGame.lean, Classes.lean, or Order.lean.",
+        "spawn_parent": "proof-lead",
+        "depends_on": [
+          "spawn-small-worker"
+        ],
+        "start_minute": 50,
+        "end_minute": 65,
+        "mode": "settled",
+        "progress_logic": "all",
+        "min_parent_turns": 0,
+        "min_parent_tool_calls": 0,
+        "min_parent_age_seconds": 0,
+        "read_only": false,
+        "allowed_paths": [
+          "CombinatorialGames/Game/Specific/Domineering.lean"
+        ],
+        "spawn_executor": "parent_agent",
+        "spawn_tool": "nanoma"
+      },
+      {
+        "id": "pf-polisher",
+        "role": "High-yield Proof Polisher",
+        "assignment": "Use the remaining budget for one final conservative pass over Player.lean and Functor.lean. Keep the current green proofs intact and attempt only declarations with a short, locally supported proof.",
+        "guide": "Stop after a focused build failure or two unproductive targets. Runtime, not this agent, decides whether the batch is accepted.",
+        "spawn_parent": "proof-lead",
+        "depends_on": [
+          "spawn-regression-worker"
+        ],
+        "start_minute": 65,
+        "end_minute": 88,
+        "mode": "settled",
+        "progress_logic": "all",
+        "min_parent_turns": 0,
+        "min_parent_tool_calls": 0,
+        "min_parent_age_seconds": 0,
+        "read_only": false,
+        "allowed_paths": [
+          "CombinatorialGames/Game/Player.lean",
+          "CombinatorialGames/Game/Functor.lean"
+        ],
+        "spawn_executor": "parent_agent",
+        "spawn_tool": "nanoma"
+      },
+      {
+        "id": "final-auditor",
+        "role": "Final Clean Auditor",
+        "assignment": "After every writer is terminal and Runtime has accepted or restored each batch, run a read-only full build and inspect git diff for out-of-scope changes. Report whether the current tree matches the last Runtime-verified green state.",
+        "guide": "Do not edit or submit. Report exact commands, exit codes, changed files, and any unresolved risk to Root.",
+        "spawn_parent": "root",
+        "depends_on": [
+          "spawn-pf-worker",
+          "spawn-small-worker",
+          "spawn-regression-worker",
+          "spawn-pf-polisher"
+        ],
+        "start_minute": 88,
+        "end_minute": 105,
+        "mode": "settled",
+        "progress_logic": "all",
+        "min_parent_turns": 0,
+        "min_parent_tool_calls": 0,
+        "min_parent_age_seconds": 0,
+        "read_only": true,
+        "allowed_paths": [],
+        "spawn_executor": "parent_agent",
+        "spawn_tool": "nanoma"
+      }
+    ],
+    "checkpoint_action": "steer_parent_spawn_tool",
+    "spawn_execution": "parent_agent_via_nanoma_tool",
+    "runtime_creates_agents": false
+  }
+}
